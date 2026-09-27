@@ -1,0 +1,66 @@
+/* 基础深色背景设置 */
+body {
+    background-color: #121212; /* 极客深灰 */
+    color: #e0e0e0;            /* 柔和白文字 */
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+}
+
+/* 按钮容器 */
+div:first-of-type {
+    margin-bottom: 30px;
+}
+
+/* 炫酷暗黑按钮 */
+#next {
+    background-color: #333;
+    color: #00ffcc;           /* 科技感青色 */
+    border: 1px solid #444;
+    padding: 12px 30px;
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+    border-radius: 8px;
+    transition: all 0.3s ease;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+}
+
+#next:hover {
+    background-color: #00ffcc;
+    color: #121212;
+    box-shadow: 0 0 15px rgba(0, 255, 204, 0.4);
+    transform: translateY(-2px);
+}
+
+#next:active {
+    transform: translateY(0);
+}
+
+/* 图片展示区域（网格布局） */
+#img {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 20px;
+    width: 100%;
+    max-width: 1200px;
+}
+
+/* 图片样式 */
+#img img {
+    width: 100%;
+    height: auto;
+    border-radius: 12px;
+    border: 2px solid #222;
+    transition: transform 0.4s ease, border-color 0.3s ease;
+    background-color: #1e1e1e; /* 占位色 */
+}
+
+#img img:hover {
+    transform: scale(1.05);
+    border-color: #00ffcc;
+}
+

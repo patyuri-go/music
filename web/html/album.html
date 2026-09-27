@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Album</title>
+  <link href="/web/css/album.css" rel="stylesheet">
+</head>
+<body>
+  <div id="app">
+    <header id="header">
+      <img id="cover" src="" alt="cover">
+      <div id="header-info">
+        <div id="album-name"></div>
+        <div id="artist-name"></div>
+        <div id="year"></div>
+      </div>
+    </header>
+
+    <ol id="track-list"></ol>
+
+    <div id="player">
+      <div id="player-info">
+        <div id="player-title"></div>
+        <div id="player-artist"></div>
+      </div>
+      <button id="play-btn">▶</button>
+      <input id="progress" type="range" min="0" max="100" value="0">
+      <span id="time"></span>
+    </div>
+  </div>
+
+  <script src="/web/js/album.js"></script>
+</body>
+</html>

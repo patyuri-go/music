@@ -1,0 +1,157 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: #121212;
+  color: #e0e0e0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  padding-bottom: 100px;
+}
+
+#app {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+#header {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 30px;
+}
+
+#cover {
+  width: 200px;
+  height: 200px;
+  object-fit: cover;
+  background: #222;
+  flex-shrink: 0;
+}
+
+#header-info {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+}
+
+#album-name {
+  font-size: 24px;
+  font-weight: bold;
+}
+
+#artist-name {
+  font-size: 18px;
+  color: #aaa;
+}
+
+#year {
+  font-size: 14px;
+  color: #666;
+}
+
+#track-list {
+  list-style: none;
+}
+
+#track-list li {
+  display: flex;
+  align-items: center;
+  padding: 10px;
+  border-bottom: 1px solid #222;
+  gap: 12px;
+}
+
+#track-list li:hover {
+  background: #1a1a1a;
+}
+
+.track-num {
+  width: 30px;
+  text-align: right;
+  color: #666;
+}
+
+.track-title {
+  flex: 1;
+  cursor: pointer;
+}
+
+.track-title:hover {
+  color: #fff;
+}
+
+.track-duration {
+  color: #666;
+  font-size: 14px;
+}
+
+.play-btn {
+  background: none;
+  border: none;
+  color: #e0e0e0;
+  cursor: pointer;
+  font-size: 16px;
+  width: 30px;
+}
+
+#player {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: #1a1a1a;
+  border-top: 1px solid #333;
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 15px;
+}
+
+#player-info {
+  flex: 1;
+  min-width: 0;
+}
+
+#player-title {
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#player-artist {
+  font-size: 12px;
+  color: #888;
+}
+
+#play-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  background: #333;
+  color: #e0e0e0;
+  font-size: 18px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+#play-btn:hover {
+  background: #444;
+}
+
+#progress {
+  flex: 1;
+  cursor: pointer;
+}
+
+#time {
+  font-size: 12px;
+  color: #888;
+  min-width: 80px;
+  text-align: right;
+}

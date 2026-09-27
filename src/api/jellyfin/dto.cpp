@@ -1,0 +1,317 @@
+#include "dto.h"
+
+#include "ids.h"
+
+#include <algorithm>
+
+namespace jellyfin {
+namespace {
+
+std::string isoTime(const std::string &db_time) {
+  if (db_time.empty()) {
+    return std::string();
+  }
+  std::string out = db_time;
+  std::replace(out.begin(), out.end(), ' ', 'T');
+  return out;
+}
+
+crow::json::wvalue nameGuidPair(const std::string &name, const std::string &id) {
+  crow::json::wvalue pair;
+  pair["Name"] = name;
+  pair["Id"] = id;
+  return pair;
+}
+
+void setImageTag(crow::json::wvalue &item, const std::string &tag) {
+  if (tag.empty()) {
+    return;
+  }
+  crow::json::wvalue tags;
+  tags["Primary"] = tag;
+  item["ImageTags"] = std::move(tags);
+}
+
+} // namespace
+
+crow::json::wvalue userData(const repo::Track &t) {
+  crow::json::wvalue r;
+  r["PlaybackPositionTicks"] = 0;
+  r["PlayCount"] = t.play_count;
+  r["IsFavorite"] = false;
+  r["Played"] = t.play_count > 0;
+  r["Key"] = makeId(kKindTrack, t.id);
+  if (!t.last_played.empty()) {
+    r["LastPlayedDate"] = isoTime(t.last_played);
+  }
+  r["Rating"] = t.rating;
+  return r;
+}
+
+crow::json::wvalue trackItem(
+    const repo::Track &t, const std::string &albumName,
+    const std::vector<std::pair<std::string, int>> &trackArtists,
+    const std::vector<std::pair<std::string, int>> &albumArtists, int year,
+    const std::string &imageTag,
+    const std::vector<std::pair<std::string, int>> &genres,
+    bool hasLyrics) {
+  crow::json::wvalue r;
+  const std::string trackName =
+      t.title.empty() ? ("Track " + std::to_string(t.id)) : t.title;
+  r["Name"] = trackName;
+  r["ServerId"] = serverId();
+  r["Id"] = makeId(kKindTrack, t.id);
+  r["Etag"] = makeId(kKindTrack, t.id);
+  r["DateCreated"] = isoTime(t.added_at);
+  r["Container"] = t.format;
+  r["Path"] = t.path;
+  r["RunTimeTicks"] = static_cast<long long>(t.duration_ms) * 10000LL;
+  r["ProductionYear"] = year;
+  r["IndexNumber"] = t.track_no;
+  r["ParentIndexNumber"] = t.disc_no;
+  r["SortName"] = t.title;
+  r["Type"] = "Audio";
+  r["MediaType"] = "Audio";
+  r["IsFolder"] = false;
+  r["CanDownload"] = true;
+  r["PlayAccess"] = "Full";
+  if (hasLyrics) {
+    r["HasLyrics"] = true;
+  }
+  if (t.album_id > 0) {
+    r["AlbumId"] = makeId(kKindAlbum, t.album_id);
+    r["ParentId"] = makeId(kKindAlbum, t.album_id);
+  }
+  if (!albumName.empty()) {
+    r["Album"] = albumName;
+  }
+  {
+    crow::json::wvalue::list names;
+    crow::json::wvalue::list items;
+    for (const auto &p : trackArtists) {
+      names.emplace_back(p.first);
+      items.push_back(nameGuidPair(p.first, makeId(kKindArtist, p.second)));
+    }
+    if (!names.empty()) {
+      r["Artists"] = crow::json::wvalue(names);
+      r["ArtistItems"] = crow::json::wvalue(items);
+    }
+    const auto &albumList = albumArtists.empty() ? trackArtists : albumArtists;
+    crow::json::wvalue::list albItems;
+    for (const auto &p : albumList) {
+      albItems.push_back(nameGuidPair(p.first, makeId(kKindArtist, p.second)));
+    }
+    if (!albumList.empty()) {
+      r["AlbumArtist"] = albumList.front().first;
+      r["AlbumArtists"] = crow::json::wvalue(albItems);
+    }
+  }
+  crow::json::wvalue::list genreNames;
+  crow::json::wvalue::list genreItems;
+  for (const auto &g : genres) {
+    genreNames.emplace_back(g.first);
+    genreItems.push_back(nameGuidPair(g.first, makeId(kKindGenre, g.second)));
+  }
+  r["Genres"] = crow::json::wvalue(genreNames);
+  r["GenreItems"] = crow::json::wvalue(genreItems);
+  {
+    const std::string trackGuid = makeId(kKindTrack, t.id);
+    const long long bitrate_bps = static_cast<long long>(t.bitrate) * 1000LL;
+    crow::json::wvalue stream;
+    stream["Type"] = "Audio";
+    stream["Codec"] = t.format;
+    stream["Index"] = 0;
+    stream["IsDefault"] = true;
+    stream["BitRate"] = bitrate_bps;
+    stream["Channels"] = t.channels;
+    stream["SampleRate"] = t.sample_rate;
+    if (t.channels == 1) {
+      stream["ChannelLayout"] = "mono";
+    } else if (t.channels == 2) {
+      stream["ChannelLayout"] = "stereo";
+    }
+    crow::json::wvalue::list streams;
+    streams.push_back(std::move(stream));
+
+    crow::json::wvalue source;
+    source["Id"] = trackGuid;
+    source["Name"] = trackName;
+    source["Path"] = t.path;
+    source["Container"] = t.format;
+    source["Size"] = static_cast<long long>(t.size_bytes);
+    source["Bitrate"] = bitrate_bps;
+    source["RunTimeTicks"] = static_cast<long long>(t.duration_ms) * 10000LL;
+    source["SupportsDirectPlay"] = true;
+    source["SupportsDirectStream"] = true;
+    source["SupportsTranscoding"] = false;
+    source["IsRemote"] = true;
+    source["Type"] = "Default";
+    source["MediaStreams"] = crow::json::wvalue(streams);
+    source["DirectStreamUrl"] = "/Audio/" + trackGuid +
+                                "/stream?static=true&mediaSourceId=" +
+                                trackGuid;
+    crow::json::wvalue::list sources;
+    sources.push_back(std::move(source));
+    r["MediaSources"] = crow::json::wvalue(sources);
+    r["MediaSourceCount"] = 1;
+  }
+  setImageTag(r, imageTag);
+  r["UserData"] = userData(t);
+  return r;
+}
+
+crow::json::wvalue albumItem(
+    const repo::Album &a,
+    const std::vector<std::pair<std::string, int>> &albumArtists, int songCount,
+    const std::string &imageTag, long long runtimeTicks) {
+  crow::json::wvalue r;
+  r["Name"] = a.name;
+  r["ServerId"] = serverId();
+  r["Id"] = makeId(kKindAlbum, a.id);
+  r["Etag"] = makeId(kKindAlbum, a.id);
+  r["Type"] = "MusicAlbum";
+  r["MediaType"] = "Audio";
+  r["IsFolder"] = true;
+  if (!albumArtists.empty()) {
+    r["AlbumArtist"] = albumArtists.front().first;
+  }
+  r["ProductionYear"] = a.year;
+  r["ChildCount"] = songCount;
+  r["SongCount"] = songCount;
+  r["RecursiveItemCount"] = songCount;
+  if (runtimeTicks > 0) {
+    r["RunTimeTicks"] = runtimeTicks;
+    r["CumulativeRunTimeTicks"] = runtimeTicks;
+  }
+  if (!albumArtists.empty()) {
+    crow::json::wvalue::list names;
+    crow::json::wvalue::list items;
+    for (const auto &p : albumArtists) {
+      names.emplace_back(p.first);
+      items.push_back(nameGuidPair(p.first, makeId(kKindArtist, p.second)));
+    }
+    r["Artists"] = crow::json::wvalue(names);
+    r["AlbumArtists"] = crow::json::wvalue(items);
+    r["ArtistItems"] = crow::json::wvalue(items);
+  }
+  r["Genres"] = crow::json::wvalue::list{};
+  r["GenreItems"] = crow::json::wvalue::list{};
+  setImageTag(r, imageTag);
+  crow::json::wvalue ud;
+  ud["PlaybackPositionTicks"] = 0;
+  ud["PlayCount"] = 0;
+  ud["IsFavorite"] = false;
+  ud["Played"] = false;
+  r["UserData"] = std::move(ud);
+  return r;
+}
+
+crow::json::wvalue artistItem(const repo::Artist &a, int albumCount,
+                              const std::string &imageTag) {
+  crow::json::wvalue r;
+  r["Name"] = a.name;
+  r["ServerId"] = serverId();
+  r["Id"] = makeId(kKindArtist, a.id);
+  r["Etag"] = makeId(kKindArtist, a.id);
+  r["Type"] = "MusicArtist";
+  r["IsFolder"] = true;
+  r["AlbumCount"] = albumCount;
+  r["ChildCount"] = albumCount;
+  r["SortName"] = a.sort_name.empty() ? a.name : a.sort_name;
+  setImageTag(r, imageTag);
+  return r;
+}
+
+crow::json::wvalue genreItem(int id, const std::string &name) {
+  crow::json::wvalue r;
+  r["Name"] = name;
+  r["ServerId"] = serverId();
+  r["Id"] = makeId(kKindGenre, id);
+  r["Type"] = "MusicGenre";
+  r["IsFolder"] = true;
+  return r;
+}
+
+crow::json::wvalue userDto() {
+  crow::json::wvalue r;
+  r["Name"] = userName();
+  r["ServerId"] = serverId();
+  r["ServerName"] = serverName();
+  r["Id"] = userId();
+  r["HasPassword"] = false;
+  r["HasConfiguredPassword"] = false;
+  r["HasConfiguredEasyPassword"] = false;
+  r["EnableAutoLogin"] = true;
+
+  crow::json::wvalue config;
+  config["AudioLanguagePreference"] = "";
+  config["PlayDefaultAudioTrack"] = true;
+  config["SubtitleLanguagePreference"] = "";
+  config["DisplayMissingEpisodes"] = false;
+  config["SubtitleMode"] = "Default";
+  config["DisplayCollectionsView"] = false;
+  config["EnableLocalPassword"] = false;
+  config["HidePlayedInLatest"] = false;
+  config["RememberAudioSelections"] = true;
+  config["RememberSubtitleSelections"] = true;
+  config["EnableNextEpisodeAutoPlay"] = false;
+  r["Configuration"] = std::move(config);
+
+  crow::json::wvalue policy;
+  policy["IsAdministrator"] = true;
+  policy["IsHidden"] = false;
+  policy["IsDisabled"] = false;
+  policy["EnableMediaPlayback"] = true;
+  policy["EnableAudioPlaybackTranscoding"] = true;
+  policy["EnableVideoPlaybackTranscoding"] = false;
+  policy["EnablePlaybackRemuxing"] = true;
+  policy["EnableContentDownloading"] = true;
+  policy["EnableAllFolders"] = true;
+  policy["EnableAllDevices"] = true;
+  policy["EnableAllChannels"] = true;
+  policy["EnableRemoteAccess"] = true;
+  policy["EnableSharedDeviceControl"] = true;
+  policy["EnableUserPreferenceAccess"] = true;
+  policy["EnableLiveTvAccess"] = false;
+  policy["EnableLiveTvManagement"] = false;
+  policy["EnableContentDeletion"] = false;
+  policy["EnableSyncTranscoding"] = false;
+  policy["EnableMediaConversion"] = false;
+  policy["InvalidLoginAttemptCount"] = 0;
+  policy["LoginAttemptsBeforeLockout"] = -1;
+  policy["MaxActiveSessions"] = 0;
+  policy["AuthenticationProviderId"] = "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider";
+  policy["PasswordResetProviderId"] = "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
+  r["Policy"] = std::move(policy);
+  return r;
+}
+
+crow::json::wvalue sessionInfo(const std::string &client,
+                               const std::string &device) {
+  crow::json::wvalue r;
+  r["Id"] = "musicd-session";
+  r["UserId"] = userId();
+  r["UserName"] = userName();
+  r["Client"] = client.empty() ? "musicd" : client;
+  r["DeviceName"] = device.empty() ? "musicd" : device;
+  r["ApplicationVersion"] = "1.0.0";
+  r["ServerId"] = serverId();
+  r["IsActive"] = true;
+  r["SupportsMediaControl"] = true;
+  r["SupportsRemoteControl"] = false;
+  r["PlayableMediaTypes"] = crow::json::wvalue::list{};
+  r["NowPlayingQueue"] = crow::json::wvalue::list{};
+  r["SupportedCommands"] = crow::json::wvalue::list{};
+  return r;
+}
+
+crow::json::wvalue queryResult(std::vector<crow::json::wvalue> items, int total,
+                               int startIndex) {
+  crow::json::wvalue r;
+  r["Items"] = std::move(items);
+  r["TotalRecordCount"] = total;
+  r["StartIndex"] = startIndex;
+  return r;
+}
+
+} // namespace jellyfin

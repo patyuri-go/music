@@ -1,0 +1,24 @@
+build
+temp
+web/img
+.cache
+.opencode
+Jellyfinapi.json
+# P0：构建产物与运行期数据不入库
+/compile_commands.json
+/img
+/musicd
+*.db
+*.db-wal
+*.db-shm
+config.json
+
+# 本地测试媒体库
+/test_music
+
+# 运行期数据：播放列表 JSON
+/playlists
+# 测试可执行文件
+/playlist_test
+/lyrics_test
+/artists_test

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Music Library (Database)</title>
+  <link href="/web/css/library.css" rel="stylesheet">
+</head>
+<body>
+  <div id="app">
+    <header id="header">
+      <h1>Music Library</h1>
+      <div id="header-actions">
+        <a id="editor-link" href="/web/html/root.html">File Editor</a>
+        <button id="refresh-btn">Refresh</button>
+      </div>
+    </header>
+
+    <div id="main">
+      <div id="sidebar">
+        <div id="tree-header">Album Artists</div>
+        <div id="tree-search">
+          <input type="text" id="search-box" placeholder="Search artists, albums, songs\u2026" autocomplete="off">
+        </div>
+        <ul id="tree"></ul>
+        <div id="tree-status"></div>
+      </div>
+
+      <div id="content">
+        <div id="no-selection" class="placeholder">
+          Select an album artist, album or track
+        </div>
+        <div id="detail" class="hidden"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/web/js/library.js"></script>
+</body>
+</html>

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Media Library Editor</title>
+  <link href="/web/css/root.css" rel="stylesheet">
+</head>
+<body>
+  <div id="app">
+    <header id="header">
+      <h1>Media Library Editor</h1>
+      <div id="header-actions">
+        <button id="refresh-btn">Refresh</button>
+      </div>
+    </header>
+
+    <div id="main">
+      <div id="sidebar">
+        <div id="roots-panel">
+          <h3>Roots</h3>
+          <ul id="roots-list"></ul>
+          <button id="add-root-open-btn">+ Add Root Storage</button>
+          <div id="add-root-result"></div>
+        </div>
+        <div id="browse-panel">
+          <div id="breadcrumb"></div>
+          <div id="filter-bar">
+            <label>Show
+              <select id="filter-status">
+                <option value="all">All</option>
+                <option value="both">In DB + on disk</option>
+                <option value="db">In DB only (missing)</option>
+                <option value="disk">On disk only (new)</option>
+              </select>
+            </label>
+          </div>
+          <div id="file-list"></div>
+        </div>
+        <div id="batch-actions">
+          <button id="batch-scan-btn" disabled>Import New</button>
+          <button id="batch-sync-from-btn" disabled>File → DB</button>
+          <button id="batch-sync-to-btn" disabled>DB → File</button>
+          <button id="batch-delete-btn" class="danger" disabled>Delete Index</button>
+        </div>
+      </div>
+
+      <div id="content">
+        <div id="no-selection" class="placeholder">
+          Select a file to view metadata
+        </div>
+        <div id="meta-panel" class="hidden">
+          <div id="meta-header">
+            <h2 id="file-name"></h2>
+            <span id="file-path"></span>
+          </div>
+          <div id="meta-sections">
+            <div class="meta-section">
+              <h3>Database Metadata</h3>
+              <form id="db-meta-form">
+                <label>Title <input type="text" id="db-title"></label>
+                <label>Artist <input type="text" id="db-artist" placeholder="multiple: ; or /"></label>
+                <label>Album <input type="text" id="db-album"></label>
+                <label>Album Artist <input type="text" id="db-album-artist" placeholder="multiple: ; or /"></label>
+                <label>Track No <input type="number" id="db-track-no" min="0"></label>
+                <label>Disc No <input type="number" id="db-disc-no" min="1"></label>
+                <label>Year <input type="number" id="db-year" min="0"></label>
+                <label>Genre <input type="text" id="db-genre"></label>
+                <label>Rating <input type="number" id="db-rating" min="0" max="5"></label>
+                <button type="submit">Save to DB</button>
+              </form>
+            </div>
+            <div class="meta-section" id="album-section">
+              <h3>Album</h3>
+              <label>Album Name <input type="text" id="album-name"></label>
+              <label>Album Artists <input type="text" id="album-artists" placeholder="multiple: ; or /"></label>
+              <label>Album Year <input type="number" id="album-year" min="0"></label>
+              <button id="album-update-btn">Update Album</button>
+              <div id="album-result"></div>
+            </div>
+            <div class="meta-section">
+              <h3>File Metadata</h3>
+              <div id="file-meta-display"></div>
+              <button id="sync-from-file-btn">Overwrite DB from File</button>
+              <button id="sync-to-file-btn">Write DB to File</button>
+            </div>
+            <div class="meta-section">
+              <h3>Lyrics</h3>
+              <textarea id="db-lyrics" placeholder="Paste lyrics here (LRC or plain text)…"></textarea>
+              <button id="lyrics-save-btn">Save Lyrics to DB</button>
+              <div id="lyrics-result"></div>
+            </div>
+          </div>
+          <div id="diff-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="root-modal" class="modal hidden">
+    <div class="modal-box">
+      <h3>Add Root Storage</h3>
+      <form id="add-root-form">
+        <label>Type
+          <select id="root-type">
+            <option value="local">Local Path</option>
+            <option value="webdav">WebDAV</option>
+          </select>
+        </label>
+        <label>Name
+          <input type="text" id="root-name" placeholder="Display name (optional)">
+        </label>
+        <label id="root-path-label">Path
+          <input type="text" id="new-root-path" placeholder="/path/to/music">
+        </label>
+        <div id="dav-fields" class="hidden">
+          <label>URL
+            <input type="text" id="dav-url" placeholder="https://host/dav/music/">
+          </label>
+          <label>Username
+            <input type="text" id="dav-user" autocomplete="off">
+          </label>
+          <label>Password
+            <input type="password" id="dav-pass" autocomplete="new-password">
+          </label>
+        </div>
+        <div id="root-modal-error" class="error"></div>
+        <div class="modal-actions">
+          <button type="button" id="root-modal-cancel">Cancel</button>
+          <button type="submit">Add</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/web/js/root.js"></script>
+</body>
+</html>
