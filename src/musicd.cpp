@@ -8,6 +8,7 @@
 #include "database.h"
 #include "db.h"
 #include "http_util.h"
+#include "image_cache.h"
 #include "jellyfin.h"
 #include "metadata.h"
 #include "api/webdav/webdav.h"
@@ -814,6 +815,19 @@ int main(int argc, char *argv[]) {
 
   const auto &cfg = config::get();
 
+  image_cache::Options cache_options;
+  cache_options.enabled = cfg.image_cache.enabled;
+  cache_options.dir = cfg.image_cache.dir;
+  cache_options.max_bytes = cfg.image_cache.max_bytes;
+  cache_options.max_file_bytes = cfg.image_cache.max_file_bytes;
+  cache_options.ttl_days = cfg.image_cache.ttl_days;
+  cache_options.gc_interval_seconds = cfg.image_cache.gc_interval_seconds;
+  cache_options.revalidate_seconds = cfg.image_cache.revalidate_seconds;
+  std::string cache_error;
+  if (!image_cache::init(cache_options, &cache_error)) {
+    std::cerr << "[image_cache] disabled: " << cache_error << std::endl;
+  }
+
   crow::SimpleApp app;
   app.loglevel(crow::LogLevel::WARNING);
 
@@ -1469,14 +1483,13 @@ int main(int argc, char *argv[]) {
       return jsonResponse(404, "{\"erro\":true}");
     }
     const std::string cover_real = storage::resolve(album->cover_path);
-    if (webdav::isWebdavUrl(cover_real)) {
-      return http_util::serveImage(cover_real);
+    if (!webdav::isWebdavUrl(cover_real)) {
+      fs::path cover(cover_real);
+      if (!fs::exists(cover) || !isUnderAnyRoot(cover)) {
+        return jsonResponse(404, "{\"erro\":true}");
+      }
     }
-    fs::path cover(cover_real);
-    if (!fs::exists(cover) || !isUnderAnyRoot(cover)) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    return serveFile(cover, "");
+    return http_util::serveImage(album->cover_path);
   });
 
   CROW_ROUTE(app, "/api/track/<int>/file")([](const crow::request &req, int id) {
@@ -2195,5 +2208,6 @@ int main(int argc, char *argv[]) {
   if (jellyfin_thread.joinable()) {
     jellyfin_thread.join();
   }
+  image_cache::shutdown();
   return 0;
 }

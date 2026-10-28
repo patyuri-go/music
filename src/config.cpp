@@ -120,6 +120,41 @@ const Config &load(const std::string &file) {
     if (json.has("playlist_dir")) {
       loaded.playlist_dir = json["playlist_dir"].s();
     }
+    if (json.has("image_cache")) {
+      const auto &cache = json["image_cache"];
+      if (cache.has("enabled")) {
+        loaded.image_cache.enabled = cache["enabled"].b();
+      }
+      if (cache.has("dir")) {
+        loaded.image_cache.dir = cache["dir"].s();
+      }
+      if (cache.has("max_bytes")) {
+        const long long value = cache["max_bytes"].i();
+        if (value >= 0) {
+          loaded.image_cache.max_bytes =
+              static_cast<std::uintmax_t>(value);
+        }
+      }
+      if (cache.has("max_file_bytes")) {
+        const long long value = cache["max_file_bytes"].i();
+        if (value >= 0) {
+          loaded.image_cache.max_file_bytes =
+              static_cast<std::uintmax_t>(value);
+        }
+      }
+      if (cache.has("ttl_days")) {
+        loaded.image_cache.ttl_days =
+            static_cast<int>(cache["ttl_days"].i());
+      }
+      if (cache.has("gc_interval_seconds")) {
+        loaded.image_cache.gc_interval_seconds =
+            static_cast<int>(cache["gc_interval_seconds"].i());
+      }
+      if (cache.has("revalidate_seconds")) {
+        loaded.image_cache.revalidate_seconds =
+            static_cast<int>(cache["revalidate_seconds"].i());
+      }
+    }
     if (json.has("webdav")) {
       const auto &wd = json["webdav"];
       if (wd.has("enabled")) {
@@ -229,6 +264,18 @@ const Config &load(const std::string &file) {
   if (loaded.scan_threads < 1 || loaded.scan_threads > 256) {
     throw std::runtime_error("scan_threads 超出范围 (1-256): " +
                              std::to_string(loaded.scan_threads));
+  }
+  if (loaded.image_cache.dir.empty()) {
+    throw std::runtime_error("image_cache.dir 不能为空");
+  }
+  if (loaded.image_cache.ttl_days < 0) {
+    throw std::runtime_error("image_cache.ttl_days 不能为负数");
+  }
+  if (loaded.image_cache.gc_interval_seconds < 1) {
+    throw std::runtime_error("image_cache.gc_interval_seconds 必须为正数");
+  }
+  if (loaded.image_cache.revalidate_seconds < 0) {
+    throw std::runtime_error("image_cache.revalidate_seconds 不能为负数");
   }
 
   g_config = loaded;

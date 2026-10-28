@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <optional>
 #include <string>
 
@@ -26,5 +27,9 @@ std::string toVirtual(const repo::ScanRoot &root, const std::string &real_path);
 // Resolve a virtual path by looking up its root name.  Falls back to returning
 // the input unchanged when no matching root exists.
 std::string resolve(const std::string &virtual_path);
+
+// Return true when target (after weakly_canonical) is inside one of the
+// configured scan roots.
+bool isUnderAnyRoot(const std::filesystem::path &target);
 
 } // namespace storage

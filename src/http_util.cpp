@@ -1,5 +1,7 @@
 #include "http_util.h"
 
+#include "crow/logging.h"
+
 #include <algorithm>
 #include <fstream>
 #include <iostream>
@@ -8,6 +10,8 @@
 
 #include "api/webdav/webdav.h"
 #include "crow/stream_response.h"
+#include "image_cache.h"
+#include "storage.h"
 
 namespace http_util {
 
@@ -236,8 +240,21 @@ crow::response serveResource(const std::string &location,
   return res;
 }
 
-crow::response serveImage(const std::string &location) {
-  // 原图直接流式转发：不缓存、不整块读入内存（本地与 WebDAV 均分块）。
+crow::response serveImage(const std::string &virtual_path,
+                          const std::string &variant) {
+  if (auto *cache = image_cache::get()) {
+    std::string error;
+    if (const auto hit = cache->ensure(virtual_path, variant, &error)) {
+      return serveFile(*hit, "");
+    }
+    CROW_LOG_DEBUG << "[image_cache] ensure failed for " << virtual_path
+                   << ": " << error;
+  }
+  const std::string location = storage::resolve(virtual_path);
+  if (!webdav::isWebdavUrl(location) &&
+      !storage::isUnderAnyRoot(fs::path(location))) {
+    return jsonResponse(404, "{\"erro\":true}");
+  }
   return serveResource(location, "");
 }
 

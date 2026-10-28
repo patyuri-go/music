@@ -1204,7 +1204,7 @@ crow::response handleImage(const std::string &idstr) {
     }
     static thread_local std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<std::size_t> dist(0, covers.size() - 1);
-    return http_util::serveImage(storage::resolve(covers[dist(rng)]));
+    return http_util::serveImage(covers[dist(rng)]);
   }
   int kind = 0;
   int id = 0;
@@ -1215,7 +1215,7 @@ crow::response handleImage(const std::string &idstr) {
   if (cover.empty()) {
     return http_util::jsonResponse(404, "{}");
   }
-  return http_util::serveImage(storage::resolve(cover));
+  return http_util::serveImage(cover);
 }
 
 crow::response handleStream(const crow::request &req,

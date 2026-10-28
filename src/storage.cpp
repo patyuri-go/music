@@ -174,4 +174,33 @@ std::string resolve(const std::string &virtual_path) {
   return toReal(*root, virtual_path);
 }
 
+bool isUnderAnyRoot(const fs::path &target) {
+  std::error_code ec;
+  const fs::path canonical = fs::weakly_canonical(target, ec);
+  if (ec) {
+    return false;
+  }
+  repo::ScanRootRepo roots(config::get().db_path.string());
+  for (const auto &root : roots.list()) {
+    fs::path base = fs::weakly_canonical(root.path, ec);
+    if (ec) {
+      continue;
+    }
+    const fs::path rel = canonical.lexically_relative(base);
+    if (!rel.empty() && rel.native().rfind("..", 0) != 0) {
+      bool escaped = false;
+      for (const auto &part : rel) {
+        if (part == "..") {
+          escaped = true;
+          break;
+        }
+      }
+      if (!escaped) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 } // namespace storage

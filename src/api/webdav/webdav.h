@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,14 @@ struct Response {
   std::string header(const std::string &key) const;
 };
 
+/// 轻量元数据探测结果（HEAD 失败时由 Range GET 回退得到）。
+struct Metadata {
+  long long length = -1;
+  std::string last_modified;
+  std::string content_type;
+  std::string etag;
+};
+
 /// 流式读取句柄：保持与远端的连接，逐块读取响应体（不整块进内存）。
 struct Stream {
   std::function<long long(char *buf, std::size_t n)> read;
@@ -66,6 +75,7 @@ public:
 
   Response head(const std::string &path);
   Response getRange(const std::string &path, long long offset, long long length);
+  std::optional<Metadata> probe(const std::string &path);
   Response getAll(const std::string &path);
   Response put(const std::string &path, const std::string &data);
   Response move(const std::string &from, const std::string &to);

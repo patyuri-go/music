@@ -21,8 +21,9 @@ crow::response serveFile(const fs::path &path, const std::string &req_range);
 crow::response serveResource(const std::string &location,
                              const std::string &req_range);
 
-/// 图片专用：本地或 WebDAV 原图直接流式转发（不缓存、不整块读入内存）。
-crow::response serveImage(const std::string &location);
+/// 图片专用：按虚拟路径读取，优先走图片缓存；未命中回退到流式转发。
+crow::response serveImage(const std::string &virtual_path,
+                          const std::string &variant = "original");
 
 } // namespace http_util
 

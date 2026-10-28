@@ -538,6 +538,63 @@ Response Client::propfind(const std::string &path, int depth) {
                  "</D:propfind>");
 }
 
+std::optional<Metadata> Client::probe(const std::string &path) {
+  auto nonNegative = [](const std::string &value) -> long long {
+    if (value.empty()) {
+      return -1;
+    }
+    char *end = nullptr;
+    const long long parsed = std::strtoll(value.c_str(), &end, 10);
+    if (end == value.c_str() || parsed < 0) {
+      return -1;
+    }
+    return parsed;
+  };
+
+  Metadata metadata;
+  const Response head_response = head(path);
+  if (head_response.status >= 200 && head_response.status < 300) {
+    metadata.length = nonNegative(head_response.header("content-length"));
+    metadata.last_modified = head_response.header("last-modified");
+    metadata.content_type = head_response.header("content-type");
+    metadata.etag = head_response.header("etag");
+    if (metadata.length >= 0) {
+      return metadata;
+    }
+  }
+
+  Stream stream = openStream(base_, path, {"Range: bytes=0-0"});
+  if (stream.status != 200 && stream.status != 206) {
+    if (stream.close) {
+      stream.close();
+    }
+    return std::nullopt;
+  }
+  auto streamHeader = [&stream](const char *key) {
+    const auto it = stream.headers.find(key);
+    return it == stream.headers.end() ? std::string() : it->second;
+  };
+  metadata.last_modified = streamHeader("last-modified");
+  metadata.content_type = streamHeader("content-type");
+  metadata.etag = streamHeader("etag");
+  if (stream.status == 206) {
+    const std::string range = streamHeader("content-range");
+    const std::size_t slash = range.find('/');
+    if (slash != std::string::npos) {
+      metadata.length = nonNegative(range.substr(slash + 1));
+    }
+  } else {
+    metadata.length = nonNegative(streamHeader("content-length"));
+  }
+  if (stream.close) {
+    stream.close();
+  }
+  if (metadata.length < 0) {
+    return std::nullopt;
+  }
+  return metadata;
+}
+
 long long Client::contentLength(const std::string &path) {
   Response h = head(path);
   if (h.status >= 200 && h.status < 300) {

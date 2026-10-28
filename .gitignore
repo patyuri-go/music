@@ -4,6 +4,7 @@ web/img
 .cache
 .opencode
 Jellyfinapi.json
+document
 # P0：构建产物与运行期数据不入库
 /compile_commands.json
 /img
@@ -16,8 +17,9 @@ config.json
 # 本地测试媒体库
 /test_music
 
-# 运行期数据：播放列表 JSON
+# 运行期数据
 /playlists
+/img_tmp
 # 测试可执行文件
 /playlist_test
 /lyrics_test

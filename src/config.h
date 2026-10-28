@@ -1,6 +1,7 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -12,6 +13,16 @@ struct WebdavRoot {
   std::string url;
   std::string user;
   std::string pass;
+};
+
+struct ImageCacheConfig {
+  bool enabled{true};
+  fs::path dir{"./img_tmp"};
+  std::uintmax_t max_bytes{2ull * 1024 * 1024 * 1024};
+  std::uintmax_t max_file_bytes{20ull * 1024 * 1024};
+  int ttl_days{30};
+  int gc_interval_seconds{3600};
+  int revalidate_seconds{300};
 };
 
 struct Config {
@@ -30,6 +41,7 @@ struct Config {
   bool webdav_enabled{false};
   std::vector<WebdavRoot> webdav_roots;
   fs::path playlist_dir{"./playlists"};
+  ImageCacheConfig image_cache;
 };
 
 const Config &get();

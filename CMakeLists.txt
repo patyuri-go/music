@@ -12,6 +12,7 @@ add_executable(musicd
   ./src/db.cpp
   ./src/schema.cpp
   ./src/storage.cpp
+  ./src/image_cache.cpp
   ./src/database.cpp
   ./src/service.cpp
   ./src/metadata.cpp
