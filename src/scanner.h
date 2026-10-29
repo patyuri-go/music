@@ -43,7 +43,7 @@ struct JobStatus {
   std::string error;
 };
 
-void startScan(ProgressCb cb = nullptr);
+void startScan(ProgressCb cb = {});
 void stopScan();
 Progress status();
 void scanDir(int root_id, const std::string &dir_path);

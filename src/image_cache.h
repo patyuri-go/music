@@ -6,6 +6,7 @@
 #include <deque>
 #include <filesystem>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -38,14 +39,13 @@ public:
   ImageCache(const ImageCache &) = delete;
   ImageCache &operator=(const ImageCache &) = delete;
 
-  bool init(std::string *error = nullptr);
+  bool init(std::string &error);
   void shutdown();
   bool enabled() const;
 
   std::optional<std::filesystem::path>
-  ensure(const std::string &virtual_path,
-         const std::string &variant = "original",
-         std::string *error = nullptr);
+  ensure(const std::string &virtual_path, const std::string &variant,
+         std::string &error);
 
   void gc();
   Stats stats() const;
@@ -107,14 +107,13 @@ private:
 
   bool downloadToTemp(const std::string &resolved_location,
                       const std::filesystem::path &tmp_path,
-                      std::string *image_id, std::uintmax_t *bytes,
-                      std::string *error);
-  bool hashLocalFile(const std::filesystem::path &path,
-                     std::string *image_id, std::uintmax_t *bytes,
-                     std::string *error);
+                      std::string &image_id, std::uintmax_t &bytes,
+                      std::string &error);
+  bool hashLocalFile(const std::filesystem::path &path, std::string &image_id,
+                     std::uintmax_t &bytes, std::string &error);
   std::optional<std::filesystem::path>
   fetchAndStore(const std::string &virtual_path, const std::string &variant,
-                const std::string &resolved_location, std::string *error);
+                const std::string &resolved_location, std::string &error);
 
   void scheduleRevalidation(const Row &row,
                             const std::string &virtual_path,
@@ -153,8 +152,8 @@ private:
   std::thread gc_thread_;
 };
 
-bool init(const Options &opt, std::string *error = nullptr);
+bool init(const Options &opt, std::string &error);
 void shutdown();
-ImageCache *get();
+std::shared_ptr<ImageCache> get();
 
 } // namespace image_cache

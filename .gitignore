@@ -5,6 +5,7 @@ web/img
 .opencode
 Jellyfinapi.json
 document
+opencode.json
 # P0：构建产物与运行期数据不入库
 /compile_commands.json
 /img

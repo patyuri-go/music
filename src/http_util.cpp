@@ -242,9 +242,9 @@ crow::response serveResource(const std::string &location,
 
 crow::response serveImage(const std::string &virtual_path,
                           const std::string &variant) {
-  if (auto *cache = image_cache::get()) {
+  if (auto cache = image_cache::get()) {
     std::string error;
-    if (const auto hit = cache->ensure(virtual_path, variant, &error)) {
+    if (const auto hit = cache->ensure(virtual_path, variant, error)) {
       return serveFile(*hit, "");
     }
     CROW_LOG_DEBUG << "[image_cache] ensure failed for " << virtual_path

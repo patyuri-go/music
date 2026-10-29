@@ -18,7 +18,7 @@ namespace crow {
 inline response streamedResponse(int code, std::string content_type,
                                  long long length,
                                  std::function<bool(std::string &)> producer,
-                                 std::function<void()> closer = nullptr) {
+                                 std::function<void()> closer = {}) {
   response res;
   res.code = code;
   if (!content_type.empty()) {

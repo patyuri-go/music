@@ -775,7 +775,7 @@ Stream openStream(const Url &base, const std::string &path,
         return Stream{};
       }
       setTimeout(*stream, 30);
-      s = openOnStream(stream, ioc, nullptr, req);
+      s = openOnStream(stream, ioc, {}, req);
     }
     if (s.status == 0) {
       return Stream{};

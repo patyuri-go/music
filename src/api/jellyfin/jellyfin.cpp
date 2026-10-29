@@ -9,6 +9,9 @@
 #include "schema.h"
 #include "storage.h"
 #include "api/playlist/playlist.h"
+#include "media_library/library_runtime.h"
+#include "media_library/local_library.h"
+#include "media_library/snapshot.h"
 
 #include "crow/app.h"
 #include "crow/http_request.h"
@@ -23,6 +26,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -36,6 +41,33 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr const char *kVersion = "10.10.7";
+
+// Library 对象由 main() 创建；9000 与 5666 共用同一个实例。
+media_library::LocalLibrary &library() { return media_library::library(); }
+
+int compat_id_of(const media_library::SourceRef &ref) {
+  const auto internal = library().internal_id_of(ref);
+  return internal ? *internal : 0;
+}
+
+std::vector<std::pair<std::string, int>> artist_pairs_of(
+    const std::vector<media_library::ArtistLink> &links) {
+  std::vector<std::pair<std::string, int>> out;
+  for (const auto &link : links) {
+    out.emplace_back(link.name, compat_id_of(link.ref));
+  }
+  return out;
+}
+
+std::vector<std::pair<std::string, int>> album_artist_pairs_of(
+    const std::vector<media_library::AlbumArtistLink> &links) {
+  std::vector<std::pair<std::string, int>> out;
+  for (const auto &link : links) {
+    out.emplace_back(link.name, compat_id_of(link.ref));
+  }
+  return out;
+}
+
 
 std::string lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(),
@@ -51,10 +83,10 @@ std::string trimCopy(const std::string &s) {
 
 // 同时按原样与全小写注册路由，兼容 ASP.NET 的大小写不敏感路由。
 struct RouteReg {
-  crow::SimpleApp *app;
+  crow::SimpleApp &app;
   std::string path;
   std::function<void(crow::DynamicRule &)> apply_methods;
-  RouteReg(crow::SimpleApp *a, std::string p) : app(a), path(std::move(p)) {}
+  RouteReg(crow::SimpleApp &a, std::string p) : app(a), path(std::move(p)) {}
   template <typename... M> RouteReg &methods(M... m) {
     apply_methods = [m...](crow::DynamicRule &r) { r.methods(m...); };
     return *this;
@@ -62,7 +94,7 @@ struct RouteReg {
   template <typename F> void operator()(F f) {
     // 路由匹配已由 crow::case_insensitive_routing() 全局开启大小写不敏感，
     // 这里只需按原样注册一次。
-    auto &r = app->route_dynamic(path);
+    auto &r = app.route_dynamic(path);
     if (apply_methods) apply_methods(r);
     r(f);
   }
@@ -132,350 +164,6 @@ crow::response emptyList() {
   crow::json::wvalue arr;
   arr = crow::json::wvalue::list{};
   return json(200, arr);
-}
-
-// ---------------------------------------------------------------- 数据访问
-
-SQLite::Database &db() { return db::conn(config::get().db_path.string()); }
-
-std::string text(SQLite::Statement &q, int col) {
-  return q.getColumn(col).isNull() ? std::string() : q.getColumn(col).getText();
-}
-
-std::vector<int> parseCsvInts(const std::string &csv) {
-  std::vector<int> out;
-  std::size_t start = 0;
-  while (start < csv.size()) {
-    const std::size_t comma = csv.find(',', start);
-    const std::string part =
-        (comma == std::string::npos) ? csv.substr(start)
-                                     : csv.substr(start, comma - start);
-    if (!part.empty()) {
-      out.push_back(std::stoi(part));
-    }
-    if (comma == std::string::npos) {
-      break;
-    }
-    start = comma + 1;
-  }
-  return out;
-}
-
-int firstArtistId(const std::vector<int> &ids) {
-  return ids.empty() ? 0 : ids.front();
-}
-
-bool hasArtistId(const std::vector<int> &ids, int id) {
-  for (const int x : ids) {
-    if (x == id) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// 读取 track 行：t.* 之后追加一列（按 position 的 artist_id 逗号串）。
-repo::Track readTrackRow(SQLite::Statement &q) {
-  repo::Track t;
-  t.id = q.getColumn(0).getInt();
-  t.root_id = q.getColumn(1).getInt();
-  t.path = text(q, 2);
-  t.title = text(q, 3);
-  t.album_id = q.getColumn(4).getInt();
-  t.disc_no = q.getColumn(5).getInt();
-  t.track_no = q.getColumn(6).getInt();
-  t.duration_ms = q.getColumn(7).getInt();
-  t.bitrate = q.getColumn(8).getInt();
-  t.sample_rate = q.getColumn(9).getInt();
-  t.channels = q.getColumn(10).getInt();
-  t.format = text(q, 11);
-  t.size_bytes = q.getColumn(12).getInt64();
-  t.mtime = q.getColumn(13).getInt64();
-  t.added_at = text(q, 14);
-  t.play_count = q.getColumn(15).getInt();
-  t.last_played = text(q, 16);
-  t.rating = q.getColumn(17).getInt();
-  t.artist_ids = parseCsvInts(text(q, 18));
-  return t;
-}
-
-struct GenreRow {
-  int id = 0;
-  std::string name;
-};
-
-struct Catalog {
-  std::unordered_map<int, repo::Album> albums;
-  std::unordered_map<int, std::string> artistNames;
-  std::unordered_map<int, int> albumTrackCount;
-  std::unordered_map<int, long long> albumDurationMs;
-  std::unordered_map<int, int> artistAlbumCount;
-  std::unordered_map<int, std::vector<std::pair<std::string, int>>> trackGenres;
-  std::unordered_map<int, std::vector<int>> trackArtists;
-  std::unordered_map<int, std::vector<int>> albumArtists;
-  std::unordered_set<int> tracksWithLyrics;
-};
-
-Catalog loadCatalog() {
-  Catalog c;
-  {
-    SQLite::Statement q(db(), "SELECT id,name,year,cover_path FROM album");
-    while (q.executeStep()) {
-      repo::Album a;
-      a.id = q.getColumn(0).getInt();
-      a.name = text(q, 1);
-      a.year = q.getColumn(2).getInt();
-      a.cover_path = text(q, 3);
-      c.albums.emplace(a.id, a);
-    }
-  }
-  {
-    SQLite::Statement q(db(), "SELECT id,name FROM artist");
-    while (q.executeStep()) {
-      c.artistNames.emplace(q.getColumn(0).getInt(), text(q, 1));
-    }
-  }
-  {
-    SQLite::Statement q(db(), "SELECT album_id, COUNT(*) FROM track WHERE "
-                              "album_id > 0 GROUP BY album_id");
-    while (q.executeStep()) {
-      c.albumTrackCount[q.getColumn(0).getInt()] = q.getColumn(1).getInt();
-    }
-  }
-  {
-    SQLite::Statement q(db(), "SELECT album_id, SUM(duration_ms) FROM track WHERE "
-                              "album_id > 0 GROUP BY album_id");
-    while (q.executeStep()) {
-      c.albumDurationMs[q.getColumn(0).getInt()] = q.getColumn(1).getInt64();
-    }
-  }
-  {
-    SQLite::Statement q(db(), "SELECT aa.artist_id, COUNT(*) FROM album_artist "
-                              "aa GROUP BY aa.artist_id");
-    while (q.executeStep()) {
-      c.artistAlbumCount[q.getColumn(0).getInt()] = q.getColumn(1).getInt();
-    }
-  }
-  {
-    SQLite::Statement q(db(), "SELECT tg.track_id, g.id, g.name FROM track_genre "
-                              "tg JOIN genre g ON g.id = tg.genre_id ORDER BY "
-                              "g.name");
-    while (q.executeStep()) {
-      c.trackGenres[q.getColumn(0).getInt()].emplace_back(text(q, 2),
-                                                          q.getColumn(1).getInt());
-    }
-  }
-  {
-    SQLite::Statement q(db(), "SELECT track_id, artist_id FROM track_artist "
-                              "ORDER BY track_id, position");
-    while (q.executeStep()) {
-      c.trackArtists[q.getColumn(0).getInt()].push_back(q.getColumn(1).getInt());
-    }
-  }
-  {
-    SQLite::Statement q(db(), "SELECT album_id, artist_id FROM album_artist "
-                              "ORDER BY album_id, position");
-    while (q.executeStep()) {
-      c.albumArtists[q.getColumn(0).getInt()].push_back(q.getColumn(1).getInt());
-    }
-  }
-  for (auto &kv : c.albums) {
-    const auto it = c.albumArtists.find(kv.first);
-    if (it != c.albumArtists.end()) {
-      kv.second.artist_ids = it->second;
-    }
-  }
-  {
-    SQLite::Statement q(db(), "SELECT track_id FROM track_lyrics WHERE text <> ''");
-    while (q.executeStep()) {
-      c.tracksWithLyrics.insert(q.getColumn(0).getInt());
-    }
-  }
-  return c;
-}
-
-std::string albumNameOf(const Catalog &c, int album_id) {
-  const auto it = c.albums.find(album_id);
-  return it == c.albums.end() ? std::string() : it->second.name;
-}
-
-std::string artistNameOf(const Catalog &c, int artist_id) {
-  const auto it = c.artistNames.find(artist_id);
-  return it == c.artistNames.end() ? std::string() : it->second;
-}
-
-std::vector<std::pair<std::string, int>>
-artistPairs(const Catalog &c, const std::vector<int> &ids) {
-  std::vector<std::pair<std::string, int>> out;
-  for (const int id : ids) {
-    const auto it = c.artistNames.find(id);
-    if (it != c.artistNames.end() && !it->second.empty()) {
-      out.emplace_back(it->second, id);
-    }
-  }
-  return out;
-}
-
-std::vector<int> trackArtistIds(const Catalog &c, int track_id) {
-  const auto it = c.trackArtists.find(track_id);
-  return it == c.trackArtists.end() ? std::vector<int>{} : it->second;
-}
-
-std::vector<int> albumArtistIds(const Catalog &c, int album_id) {
-  const auto it = c.albumArtists.find(album_id);
-  return it == c.albumArtists.end() ? std::vector<int>{} : it->second;
-}
-
-int albumYearOf(const Catalog &c, int album_id) {
-  const auto it = c.albums.find(album_id);
-  return it == c.albums.end() ? 0 : it->second.year;
-}
-
-long long albumDurationOf(const Catalog &c, int album_id) {
-  const auto it = c.albumDurationMs.find(album_id);
-  return it == c.albumDurationMs.end() ? 0 : it->second;
-}
-
-std::string trackImageTag(const Catalog &c, const repo::Track &t) {
-  const auto it = c.albums.find(t.album_id);
-  if (it != c.albums.end() && !it->second.cover_path.empty()) {
-    return "1";
-  }
-  return "";
-}
-
-std::string artistImageTag(const Catalog &c, int artist_id) {
-  for (const auto &kv : c.albums) {
-    if (hasArtistId(kv.second.artist_ids, artist_id) &&
-        !kv.second.cover_path.empty()) {
-      return "1";
-    }
-  }
-  return "";
-}
-
-std::vector<repo::Track> allTracks() {
-  std::vector<repo::Track> out;
-  SQLite::Statement q(db(),
-                      "SELECT t.*, (SELECT group_concat(artist_id, ',') FROM "
-                      "track_artist WHERE track_id = t.id) FROM track t "
-                      "ORDER BY t.album_id, t.disc_no, t.track_no");
-  while (q.executeStep()) {
-    out.push_back(readTrackRow(q));
-  }
-  return out;
-}
-
-std::vector<repo::Track> tracksByArtist(int artist_id) {
-  std::vector<repo::Track> out;
-  SQLite::Statement q(
-      db(), "SELECT t.*, (SELECT group_concat(artist_id, ',') FROM "
-            "track_artist WHERE track_id = t.id) FROM track t JOIN "
-            "track_artist ta ON ta.track_id = t.id WHERE ta.artist_id = ? "
-            "ORDER BY t.album_id, t.disc_no, t.track_no");
-  q.bind(1, artist_id);
-  while (q.executeStep()) {
-    out.push_back(readTrackRow(q));
-  }
-  return out;
-}
-
-std::vector<repo::Track> tracksByGenre(int genre_id) {
-  std::vector<repo::Track> out;
-  SQLite::Statement q(
-      db(),
-      "SELECT t.*, (SELECT group_concat(artist_id, ',') FROM track_artist "
-      "WHERE track_id = t.id) FROM track t JOIN track_genre tg ON t.id = "
-      "tg.track_id WHERE tg.genre_id = ? ORDER BY t.album_id, t.disc_no, "
-      "t.track_no");
-  q.bind(1, genre_id);
-  while (q.executeStep()) {
-    out.push_back(readTrackRow(q));
-  }
-  return out;
-}
-
-std::vector<repo::Album> allAlbums() {
-  std::vector<repo::Album> out;
-  SQLite::Statement q(
-      db(), "SELECT a.id, a.name, a.year, a.cover_path, "
-            "(SELECT group_concat(artist_id, ',') FROM album_artist "
-            "WHERE album_id = a.id) FROM album a WHERE a.name <> '' "
-            "ORDER BY a.name");
-  while (q.executeStep()) {
-    repo::Album a;
-    a.id = q.getColumn(0).getInt();
-    a.name = text(q, 1);
-    a.year = q.getColumn(2).getInt();
-    a.cover_path = text(q, 3);
-    a.artist_ids = parseCsvInts(text(q, 4));
-    out.push_back(a);
-  }
-  return out;
-}
-
-std::vector<repo::Artist> allArtists() {
-  std::vector<repo::Artist> out;
-  SQLite::Statement q(db(),
-                      "SELECT id,name,sort_name FROM artist WHERE name <> '' "
-                      "ORDER BY name");
-  while (q.executeStep()) {
-    repo::Artist a;
-    a.id = q.getColumn(0).getInt();
-    a.name = text(q, 1);
-    a.sort_name = text(q, 2);
-    out.push_back(a);
-  }
-  return out;
-}
-
-std::vector<GenreRow> allGenres() {
-  std::vector<GenreRow> out;
-  SQLite::Statement q(db(), "SELECT id,name FROM genre ORDER BY name");
-  while (q.executeStep()) {
-    GenreRow g;
-    g.id = q.getColumn(0).getInt();
-    g.name = text(q, 1);
-    out.push_back(g);
-  }
-  return out;
-}
-
-std::string genreName(int id) {
-  SQLite::Statement q(db(), "SELECT name FROM genre WHERE id = ?");
-  q.bind(1, id);
-  if (q.executeStep()) {
-    return text(q, 0);
-  }
-  return "";
-}
-
-std::string coverPathFor(int kind, int id) {
-  const std::string path = config::get().db_path.string();
-  if (kind == kKindAlbum) {
-    repo::AlbumRepo ar(path);
-    auto a = ar.byId(id);
-    return a ? a->cover_path : std::string();
-  }
-  if (kind == kKindTrack) {
-    repo::TrackRepo tr(path);
-    auto t = tr.byId(id);
-    if (!t || t->album_id <= 0) {
-      return "";
-    }
-    repo::AlbumRepo ar(path);
-    auto a = ar.byId(t->album_id);
-    return a ? a->cover_path : std::string();
-  }
-  if (kind == kKindArtist) {
-    repo::AlbumRepo ar(path);
-    for (const auto &a : ar.byArtist(id)) {
-      if (!a.cover_path.empty()) {
-        return a.cover_path;
-      }
-    }
-  }
-  return "";
 }
 
 // ------------------------------------------------------------------ 排序/分页
@@ -629,60 +317,109 @@ crow::response respondItems(std::vector<Sortable> &items,
   return json(200, queryResult(std::move(out), total, from));
 }
 
-Sortable makeTrack(const Catalog &c, const repo::Track &t) {
+// ------------------------------------------------- 快照到 Jellyfin DTO 的映射
+
+// 快照只携带统一领域模型；兼容层负责把 SourceRef 映射回对外 ID。
+std::vector<int> artist_compat_ids(
+    const std::vector<media_library::ArtistLink> &links) {
+  std::vector<int> out;
+  for (const auto &link : links) {
+    out.push_back(compat_id_of(link.ref));
+  }
+  return out;
+}
+
+std::vector<int> album_artist_compat_ids(
+    const std::vector<media_library::AlbumArtistLink> &links) {
+  std::vector<int> out;
+  for (const auto &link : links) {
+    out.push_back(compat_id_of(link.ref));
+  }
+  return out;
+}
+
+std::vector<std::pair<std::string, int>> genre_pairs(
+    const media_library::CatalogSnapshot &snap, int track_id) {
+  std::vector<std::pair<std::string, int>> out;
+  const auto it = snap.track_genres.find(track_id);
+  if (it == snap.track_genres.end()) {
+    return out;
+  }
+  for (const auto &genre : it->second) {
+    out.emplace_back(genre.name, genre.internal_id);
+  }
+  return out;
+}
+
+Sortable itemForTrack(const media_library::CatalogSnapshot &snap,
+                      std::size_t index) {
+  const auto &track = snap.tracks[index];
+  const int track_id = snap.track_internal_ids[index];
   Sortable s;
-  s.sortKey = t.title;
-  s.addedAt = t.added_at;
-  s.year = albumYearOf(c, t.album_id);
-  static const std::vector<std::pair<std::string, int>> kNoGenres;
-  const auto git = c.trackGenres.find(t.id);
-  const auto &genres = git == c.trackGenres.end() ? kNoGenres : git->second;
-  const std::string albumName = albumNameOf(c, t.album_id);
-  const auto trackArtists = artistPairs(c, trackArtistIds(c, t.id));
-  const auto albumArtists = artistPairs(c, albumArtistIds(c, t.album_id));
-  s.albumKey = albumName;
-  s.artistKey = trackArtists.empty() ? std::string() : trackArtists.front().first;
-  s.playCount = t.play_count;
-  s.lastPlayed = t.last_played;
-  s.discNo = t.disc_no;
-  s.trackNo = t.track_no;
-  s.dto = trackItem(t, albumName, trackArtists, albumArtists, s.year,
-                    trackImageTag(c, t), genres,
-                    c.tracksWithLyrics.count(t.id) != 0);
+  s.sortKey = track.title;
+  s.addedAt = track.user_data.added_at;
+  s.year = track.year.value_or(0);
+  s.albumKey = track.album ? track.album->title : std::string();
+  const auto trackArtists = artist_pairs_of(track.artists);
+  s.artistKey =
+      trackArtists.empty() ? std::string() : trackArtists.front().first;
+  s.playCount = track.user_data.play_count;
+  s.lastPlayed = track.user_data.last_played;
+  s.discNo = track.disc_no.value_or(0);
+  s.trackNo = track.track_no.value_or(0);
+  std::string filePath;
+  const auto path_it = snap.track_paths.find(track_id);
+  if (path_it != snap.track_paths.end()) {
+    filePath = path_it->second;
+  }
+  s.dto = trackItem(track, track_id, track.album ? compat_id_of(track.album->ref) : 0,
+                    s.albumKey, filePath, trackArtists,
+                    album_artist_pairs_of(track.album_artists),
+                    genre_pairs(snap, track_id));
   return s;
 }
 
-Sortable makeAlbum(const Catalog &c, const repo::Album &a) {
+Sortable itemForAlbum(const media_library::CatalogSnapshot &snap,
+                      std::size_t index) {
+  const auto &album = snap.albums[index];
+  const int album_id = snap.album_internal_ids[index];
   Sortable s;
-  s.sortKey = a.name;
-  s.year = a.year;
+  s.sortKey = album.title;
+  s.year = album.year.value_or(0);
   int count = 0;
-  const auto it = c.albumTrackCount.find(a.id);
-  if (it != c.albumTrackCount.end()) {
+  const auto count_it = snap.album_track_count.find(album_id);
+  if (count_it != snap.album_track_count.end()) {
+    count = count_it->second;
+  }
+  long long durationMs = 0;
+  const auto duration_it = snap.album_duration_ms.find(album_id);
+  if (duration_it != snap.album_duration_ms.end()) {
+    durationMs = duration_it->second;
+  }
+  s.dto = albumItem(album, album_id, album_artist_pairs_of(album.artists), count,
+                    album.artwork ? "1" : "", durationMs * 10000LL);
+  return s;
+}
+
+Sortable itemForArtist(const media_library::CatalogSnapshot &snap,
+                       std::size_t index) {
+  const auto &artist = snap.artists[index];
+  const int artist_id = snap.artist_internal_ids[index];
+  Sortable s;
+  s.sortKey = artist.sort_name.empty() ? artist.name : artist.sort_name;
+  int count = 0;
+  const auto it = snap.artist_album_count.find(artist_id);
+  if (it != snap.artist_album_count.end()) {
     count = it->second;
   }
-  s.dto = albumItem(a, artistPairs(c, albumArtistIds(c, a.id)), count,
-                    a.cover_path.empty() ? "" : "1",
-                    albumDurationOf(c, a.id) * 10000LL);
+  s.dto = artistItem(artist, artist_id, count, artist.artwork ? "1" : "");
   return s;
 }
 
-Sortable makeArtist(const Catalog &c, const repo::Artist &a) {
+Sortable itemForGenre(const media_library::GenreEntry &genre) {
   Sortable s;
-  s.sortKey = a.sort_name.empty() ? a.name : a.sort_name;
-  int count = 0;
-  const auto it = c.artistAlbumCount.find(a.id);
-  if (it != c.artistAlbumCount.end()) {
-    count = it->second;
-  }
-  s.dto = artistItem(a, count, artistImageTag(c, a.id));
-  return s;
-}
-
-Sortable makeGenre(int id, const std::string &name) {
-  Sortable s;
-  s.sortKey = name;
-  s.dto = genreItem(id, name);
+  s.sortKey = genre.name;
+  s.dto = genreItem(genre.internal_id, genre.name);
   return s;
 }
 
@@ -883,7 +620,7 @@ crow::response handleItems(const crow::request &req) {
   int pid = 0;
   const bool hasParent = parseId(parent, pk, pid);
 
-  Catalog c = loadCatalog();
+  const media_library::CatalogSnapshot snap = library().snapshot();
 
   enum class Mode { Tracks, Albums, Artists, Genres, Playlists };
   Mode mode = Mode::Albums;
@@ -912,40 +649,105 @@ crow::response handleItems(const crow::request &req) {
     }
   }
 
+  const auto internal_of = [](const media_library::SourceRef &ref) {
+    const auto value = library().internal_id_of(ref);
+    return value ? *value : 0;
+  };
+  const auto has_artist = [&](const std::vector<media_library::ArtistLink> &links,
+                              int id) {
+    for (const auto &link : links) {
+      if (internal_of(link.ref) == id) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const auto has_album_artist =
+      [&](const std::vector<media_library::AlbumArtistLink> &links, int id) {
+        for (const auto &link : links) {
+          if (internal_of(link.ref) == id) {
+            return true;
+          }
+        }
+        return false;
+      };
+  const auto parse_any = [](const std::vector<std::string> &values, int kind) {
+    std::vector<int> out;
+    for (const auto &text : values) {
+      int k = 0;
+      int v = 0;
+      if (parseId(text, k, v) && k == kind) {
+        out.push_back(v);
+      }
+    }
+    return out;
+  };
+  const auto contains_id = [](const std::vector<int> &ids, int id) {
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+  };
+
   std::vector<Sortable> items;
   if (mode == Mode::Tracks) {
-    std::vector<repo::Track> tracks;
-    if (hasParent && pk == kKindAlbum) {
-      repo::TrackRepo tr(config::get().db_path.string());
-      tracks = tr.byAlbum(pid);
-    } else if (hasParent && pk == kKindArtist) {
-      tracks = tracksByArtist(pid);
-    } else if (hasParent && pk == kKindGenre) {
-      tracks = tracksByGenre(pid);
-    } else {
-      tracks = allTracks();
-    }
-    for (auto &t : tracks) {
+    const std::vector<int> album_ids = parse_any(wantAlbumIds, kKindAlbum);
+    const std::vector<int> artist_ids = parse_any(wantArtistIds, kKindArtist);
+    const std::vector<int> contrib_ids = parse_any(wantContribArtists, kKindArtist);
+    const std::vector<int> album_artist_ids =
+        parse_any(wantAlbumArtistIds, kKindArtist);
+    const std::vector<int> genre_ids = parse_any(wantGenreIds, kKindGenre);
+    for (std::size_t i = 0; i < snap.tracks.size(); ++i) {
+      const auto &t = snap.tracks[i];
+      const int track_id = snap.track_internal_ids[i];
+      if (hasParent && pk == kKindAlbum) {
+        if (!t.album || internal_of(t.album->ref) != pid) {
+          continue;
+        }
+      } else if (hasParent && pk == kKindArtist) {
+        if (!has_artist(t.artists, pid)) {
+          continue;
+        }
+      } else if (hasParent && pk == kKindGenre) {
+        bool matched = false;
+        const auto git = snap.track_genres.find(track_id);
+        if (git != snap.track_genres.end()) {
+          for (const auto &genre : git->second) {
+            if (genre.internal_id == pid) {
+              matched = true;
+              break;
+            }
+          }
+        }
+        if (!matched) {
+          continue;
+        }
+      }
       if (!search.empty() && lower(t.title).find(search) == std::string::npos) {
         continue;
       }
-      if (isPlayed && t.play_count <= 0) {
+      const int play_count = t.user_data.play_count;
+      if (isPlayed && play_count <= 0) {
         continue;
       }
-      if (!nameStartsWith.empty() && lower(t.title).rfind(nameStartsWith, 0) != 0) {
+      if (!nameStartsWith.empty() &&
+          lower(t.title).rfind(nameStartsWith, 0) != 0) {
         continue;
       }
-      if (wantPlayed && t.play_count <= 0) {
+      if (wantPlayed && play_count <= 0) {
         continue;
       }
-      if (wantUnplayed && t.play_count > 0) {
+      if (wantUnplayed && play_count > 0) {
         continue;
       }
-      if (!wantAlbumIds.empty()) {
+      if (!album_ids.empty()) {
+        const int album_id = t.album ? internal_of(t.album->ref) : 0;
+        if (!contains_id(album_ids, album_id)) {
+          continue;
+        }
+      }
+      if (!artist_ids.empty() || !contrib_ids.empty()) {
+        const auto &list = artist_ids.empty() ? contrib_ids : artist_ids;
         bool ok = false;
-        for (auto &s : wantAlbumIds) {
-          int k = 0, v = 0;
-          if (parseId(s, k, v) && k == kKindAlbum && v == t.album_id) {
+        for (const int id : list) {
+          if (has_artist(t.artists, id) || has_album_artist(t.album_artists, id)) {
             ok = true;
             break;
           }
@@ -954,28 +756,10 @@ crow::response handleItems(const crow::request &req) {
           continue;
         }
       }
-      if (!wantArtistIds.empty() || !wantContribArtists.empty()) {
+      if (!album_artist_ids.empty()) {
         bool ok = false;
-        const auto &list = wantArtistIds.empty() ? wantContribArtists : wantArtistIds;
-        const std::vector<int> aaids = albumArtistIds(c, t.album_id);
-        for (auto &s : list) {
-          int k = 0, v = 0;
-          if (parseId(s, k, v) && k == kKindArtist &&
-              (hasArtistId(t.artist_ids, v) || hasArtistId(aaids, v))) {
-            ok = true;
-            break;
-          }
-        }
-        if (!ok) {
-          continue;
-        }
-      }
-      if (!wantAlbumArtistIds.empty()) {
-        bool ok = false;
-        const std::vector<int> aaids = albumArtistIds(c, t.album_id);
-        for (auto &s : wantAlbumArtistIds) {
-          int k = 0, v = 0;
-          if (parseId(s, k, v) && k == kKindArtist && hasArtistId(aaids, v)) {
+        for (const int id : album_artist_ids) {
+          if (has_album_artist(t.album_artists, id)) {
             ok = true;
             break;
           }
@@ -985,25 +769,19 @@ crow::response handleItems(const crow::request &req) {
         }
       }
       if (!wantYears.empty()) {
-        const int y = albumYearOf(c, t.album_id);
-        bool ok = false;
-        for (auto &s : wantYears) {
-          if (s == std::to_string(y)) {
-            ok = true;
-            break;
-          }
-        }
-        if (!ok) {
+        const std::string year = std::to_string(t.year.value_or(0));
+        if (std::find(wantYears.begin(), wantYears.end(), year) ==
+            wantYears.end()) {
           continue;
         }
       }
-      if (!wantGenres.empty() || !wantGenreIds.empty()) {
+      if (!wantGenres.empty() || !genre_ids.empty()) {
         bool ok = false;
-        const auto git = c.trackGenres.find(t.id);
-        if (git != c.trackGenres.end()) {
-          for (auto &g : git->second) {
-            for (auto &want : wantGenres) {
-              if (lower(g.first) == lower(want)) {
+        const auto git = snap.track_genres.find(track_id);
+        if (git != snap.track_genres.end()) {
+          for (const auto &genre : git->second) {
+            for (const auto &want : wantGenres) {
+              if (lower(genre.name) == lower(want)) {
                 ok = true;
                 break;
               }
@@ -1011,14 +789,8 @@ crow::response handleItems(const crow::request &req) {
             if (ok) {
               break;
             }
-            for (auto &s : wantGenreIds) {
-              int k = 0, v = 0;
-              if (parseId(s, k, v) && k == kKindGenre && v == g.second) {
-                ok = true;
-                break;
-              }
-            }
-            if (ok) {
+            if (contains_id(genre_ids, genre.internal_id)) {
+              ok = true;
               break;
             }
           }
@@ -1027,27 +799,28 @@ crow::response handleItems(const crow::request &req) {
           continue;
         }
       }
-      items.push_back(makeTrack(c, t));
+      items.push_back(itemForTrack(snap, i));
     }
   } else if (mode == Mode::Albums) {
-    std::vector<repo::Album> albums;
-    if (hasParent && pk == kKindArtist) {
-      repo::AlbumRepo ar(config::get().db_path.string());
-      albums = ar.byArtist(pid);
-    } else {
-      albums = allAlbums();
-    }
-    for (auto &a : albums) {
-      if (!search.empty() && lower(a.name).find(search) == std::string::npos) {
+    const std::vector<int> artist_ids = parse_any(wantArtistIds, kKindArtist);
+    const std::vector<int> album_artist_ids =
+        parse_any(wantAlbumArtistIds, kKindArtist);
+    for (std::size_t i = 0; i < snap.albums.size(); ++i) {
+      const auto &a = snap.albums[i];
+      if (hasParent && pk == kKindArtist) {
+        if (!has_album_artist(a.artists, pid)) {
+          continue;
+        }
+      }
+      if (!search.empty() && lower(a.title).find(search) == std::string::npos) {
         continue;
       }
-      if (!wantArtistIds.empty() || !wantAlbumArtistIds.empty()) {
-        bool ok = false;
+      if (!artist_ids.empty() || !album_artist_ids.empty()) {
         const auto &list =
-            wantArtistIds.empty() ? wantAlbumArtistIds : wantArtistIds;
-        for (auto &s : list) {
-          int k = 0, v = 0;
-          if (parseId(s, k, v) && k == kKindArtist && hasArtistId(a.artist_ids, v)) {
+            artist_ids.empty() ? album_artist_ids : artist_ids;
+        bool ok = false;
+        for (const int id : list) {
+          if (has_album_artist(a.artists, id)) {
             ok = true;
             break;
           }
@@ -1056,21 +829,22 @@ crow::response handleItems(const crow::request &req) {
           continue;
         }
       }
-      items.push_back(makeAlbum(c, a));
+      items.push_back(itemForAlbum(snap, i));
     }
   } else if (mode == Mode::Artists) {
-    for (auto &a : allArtists()) {
+    for (std::size_t i = 0; i < snap.artists.size(); ++i) {
+      const auto &a = snap.artists[i];
       if (!search.empty() && lower(a.name).find(search) == std::string::npos) {
         continue;
       }
-      items.push_back(makeArtist(c, a));
+      items.push_back(itemForArtist(snap, i));
     }
   } else if (mode == Mode::Genres) {
-    for (auto &g : allGenres()) {
+    for (const auto &g : snap.genres) {
       if (!search.empty() && lower(g.name).find(search) == std::string::npos) {
         continue;
       }
-      items.push_back(makeGenre(g.id, g.name));
+      items.push_back(itemForGenre(g));
     }
   } else {
     for (const auto &p : playlist::list()) {
@@ -1086,26 +860,41 @@ crow::response handleItems(const crow::request &req) {
 crow::response handleLatest(const crow::request &req) {
   const std::string include = qs(req, "includeItemTypes");
   const int limit = qsInt(req, "limit", 20);
-  Catalog c = loadCatalog();
+  const int cap = limit > 0 ? limit : 20;
+  const media_library::CatalogSnapshot snap = library().snapshot();
   std::vector<crow::json::wvalue> out;
   if (listHas(include, "Audio")) {
-    repo::TrackRepo tr(config::get().db_path.string());
-    for (auto &t : tr.recent(0, limit > 0 ? limit : 20)) {
-      out.push_back(makeTrack(c, t).dto);
+    std::vector<std::size_t> order(snap.tracks.size());
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      order[i] = i;
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&](std::size_t a, std::size_t b) {
+                       const auto &x = snap.tracks[a].user_data.added_at;
+                       const auto &y = snap.tracks[b].user_data.added_at;
+                       if (x != y) {
+                         return x > y;
+                       }
+                       return snap.track_internal_ids[a] >
+                              snap.track_internal_ids[b];
+                     });
+    for (std::size_t i = 0; i < order.size() && static_cast<int>(i) < cap;
+         ++i) {
+      out.push_back(itemForTrack(snap, order[i]).dto);
     }
   } else {
-    auto albums = allAlbums();
-    std::sort(albums.begin(), albums.end(),
-              [](const repo::Album &a, const repo::Album &b) {
-                return a.id > b.id;
-              });
-    int n = 0;
-    for (auto &a : albums) {
-      if (limit > 0 && n >= limit) {
-        break;
-      }
-      out.push_back(makeAlbum(c, a).dto);
-      ++n;
+    std::vector<std::size_t> order(snap.albums.size());
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      order[i] = i;
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&](std::size_t a, std::size_t b) {
+                       return snap.album_internal_ids[a] >
+                              snap.album_internal_ids[b];
+                     });
+    for (std::size_t i = 0; i < order.size() && static_cast<int>(i) < cap;
+         ++i) {
+      out.push_back(itemForAlbum(snap, order[i]).dto);
     }
   }
   crow::json::wvalue arr;
@@ -1125,55 +914,87 @@ crow::response handleItem(const std::string &idstr) {
   if (!parseId(idstr, kind, id)) {
     return http_util::jsonResponse(404, "{}");
   }
-  Catalog c = loadCatalog();
   crow::json::wvalue dto;
   bool found = false;
-  const std::string path = config::get().db_path.string();
   if (kind == kKindTrack) {
-    repo::TrackRepo tr(path);
-    auto t = tr.byId(id);
-    if (t) {
-      static const std::vector<std::pair<std::string, int>> kNoGenres;
-      const auto git = c.trackGenres.find(t->id);
-      const auto &genres = git == c.trackGenres.end() ? kNoGenres : git->second;
-      dto = trackItem(*t, albumNameOf(c, t->album_id),
-                      artistPairs(c, trackArtistIds(c, t->id)),
-                      artistPairs(c, albumArtistIds(c, t->album_id)),
-                      albumYearOf(c, t->album_id), trackImageTag(c, *t), genres,
-                      c.tracksWithLyrics.count(t->id) != 0);
-      found = true;
+    const auto ref =
+        library().ref_for_compat(media_library::EntityType::Track, id);
+    if (ref) {
+      const auto result = library().get_track(*ref, {});
+      if (result.ok()) {
+        const auto &t = result.value();
+        const int albumId = t.album ? compat_id_of(t.album->ref) : 0;
+        const auto source = library().resolve_playback(*ref, {});
+        const std::string filePath =
+            source.ok() ? source.value().internal_locator : std::string();
+        std::vector<std::pair<std::string, int>> genres;
+        if (!t.genres.empty()) {
+          const media_library::CatalogSnapshot snap = library().snapshot();
+          for (const auto &name : t.genres) {
+            int genreId = 0;
+            for (const auto &g : snap.genres) {
+              if (g.name == name) {
+                genreId = g.internal_id;
+                break;
+              }
+            }
+            genres.emplace_back(name, genreId);
+          }
+        }
+        dto = trackItem(t, id, albumId,
+                        t.album ? t.album->title : std::string(), filePath,
+                        artist_pairs_of(t.artists),
+                        album_artist_pairs_of(t.album_artists), genres);
+        found = true;
+      }
     }
   } else if (kind == kKindAlbum) {
-    repo::AlbumRepo ar(path);
-    auto a = ar.byId(id);
-    if (a) {
-      int count = 0;
-      const auto it = c.albumTrackCount.find(id);
-      if (it != c.albumTrackCount.end()) {
-        count = it->second;
+    const auto ref =
+        library().ref_for_compat(media_library::EntityType::Album, id);
+    if (ref) {
+      const auto result = library().get_album(*ref, {});
+      if (result.ok()) {
+        const auto &a = result.value();
+        int count = 0;
+        long long runtimeMs = 0;
+        const auto tracks =
+            library().list_album_tracks(*ref, {std::nullopt, 1000000}, {});
+        if (tracks.ok()) {
+          count = static_cast<int>(tracks.value().items.size());
+          for (const auto &track : tracks.value().items) {
+            runtimeMs += track.duration_ms.value_or(0);
+          }
+        }
+        dto = albumItem(a, id, album_artist_pairs_of(a.artists), count,
+                        a.artwork ? "1" : "", runtimeMs * 10000LL);
+        found = true;
       }
-      dto = albumItem(*a, artistPairs(c, albumArtistIds(c, id)), count,
-                      a->cover_path.empty() ? "" : "1",
-                      albumDurationOf(c, id) * 10000LL);
-      found = true;
     }
   } else if (kind == kKindArtist) {
-    repo::ArtistRepo ar(path);
-    auto a = ar.byId(id);
-    if (a) {
-      int count = 0;
-      const auto it = c.artistAlbumCount.find(id);
-      if (it != c.artistAlbumCount.end()) {
-        count = it->second;
+    const auto ref =
+        library().ref_for_compat(media_library::EntityType::Artist, id);
+    if (ref) {
+      const auto result = library().get_artist(*ref, {});
+      if (result.ok()) {
+        const auto &a = result.value();
+        int count = 0;
+        const auto albums =
+            library().list_artist_albums(*ref, {std::nullopt, 1000000}, {});
+        if (albums.ok()) {
+          count = static_cast<int>(albums.value().items.size());
+        }
+        dto = artistItem(a, id, count, a.artwork ? "1" : "");
+        found = true;
       }
-      dto = artistItem(*a, count, artistImageTag(c, id));
-      found = true;
     }
   } else if (kind == kKindGenre) {
-    const std::string name = genreName(id);
-    if (!name.empty()) {
-      dto = genreItem(id, name);
-      found = true;
+    const media_library::CatalogSnapshot snap = library().snapshot();
+    for (const auto &g : snap.genres) {
+      if (g.internal_id == id) {
+        dto = genreItem(id, g.name);
+        found = true;
+        break;
+      }
     }
   } else if (kind == kKindView) {
     dto = musicView();
@@ -1194,7 +1015,16 @@ crow::response handleImage(const std::string &idstr) {
       if (!s.matched) {
         continue;
       }
-      std::string cover = coverPathFor(kKindTrack, s.track_id);
+      std::string cover;
+      const auto trackRef =
+          library().ref_for_compat(media_library::EntityType::Track,
+                                   s.track_id);
+      if (trackRef) {
+        const auto artwork = library().artwork_path(*trackRef);
+        if (artwork) {
+          cover = *artwork;
+        }
+      }
       if (!cover.empty()) {
         covers.push_back(std::move(cover));
       }
@@ -1211,11 +1041,26 @@ crow::response handleImage(const std::string &idstr) {
   if (!parseId(idstr, kind, id)) {
     return http_util::jsonResponse(404, "{}");
   }
-  const std::string cover = coverPathFor(kind, id);
-  if (cover.empty()) {
+  std::optional<media_library::EntityType> entityType;
+  if (kind == kKindTrack) {
+    entityType = media_library::EntityType::Track;
+  } else if (kind == kKindAlbum) {
+    entityType = media_library::EntityType::Album;
+  } else if (kind == kKindArtist) {
+    entityType = media_library::EntityType::Artist;
+  }
+  if (!entityType) {
     return http_util::jsonResponse(404, "{}");
   }
-  return http_util::serveImage(cover);
+  const auto ref = library().ref_for_compat(*entityType, id);
+  if (!ref) {
+    return http_util::jsonResponse(404, "{}");
+  }
+  const auto artwork = library().artwork_path(*ref);
+  if (!artwork) {
+    return http_util::jsonResponse(404, "{}");
+  }
+  return http_util::serveImage(*artwork);
 }
 
 crow::response handleStream(const crow::request &req,
@@ -1225,12 +1070,15 @@ crow::response handleStream(const crow::request &req,
   if (!parseId(idstr, kind, id) || kind != kKindTrack) {
     return http_util::jsonResponse(404, "{}");
   }
-  repo::TrackRepo tr(config::get().db_path.string());
-  auto t = tr.byId(id);
-  if (!t) {
+  const auto ref = library().ref_for_compat(media_library::EntityType::Track, id);
+  if (!ref) {
     return http_util::jsonResponse(404, "{}");
   }
-  return http_util::serveResource(storage::resolve(t->path),
+  const auto source = library().resolve_playback(*ref, {});
+  if (!source.ok()) {
+    return http_util::jsonResponse(404, "{}");
+  }
+  return http_util::serveResource(source.value().internal_locator,
                                   req.get_header_value("Range"));
 }
 
@@ -1324,7 +1172,8 @@ bool parseLrcTimestamp(const std::string &s, long long &ms) {
   return true;
 }
 
-crow::json::wvalue buildLyricDto(const repo::Track &t,
+crow::json::wvalue buildLyricDto(const std::string &title,
+                                 long long duration_ms,
                                  const std::string &lyrics, bool synced,
                                  const std::string &artist,
                                  const std::string &album) {
@@ -1391,7 +1240,7 @@ crow::json::wvalue buildLyricDto(const repo::Track &t,
   }
 
   crow::json::wvalue meta;
-  meta["Title"] = t.title;
+  meta["Title"] = title;
   if (!artist.empty()) {
     meta["Artist"] = artist;
   }
@@ -1404,7 +1253,7 @@ crow::json::wvalue buildLyricDto(const repo::Track &t,
   if (!version.empty()) {
     meta["Version"] = version;
   }
-  meta["Length"] = static_cast<long long>(t.duration_ms) * 10000LL;
+  meta["Length"] = duration_ms * 10000LL;
   meta["IsSynced"] = synced;
   r["Metadata"] = std::move(meta);
   r["Lyrics"] = crow::json::wvalue(lines);
@@ -1417,30 +1266,29 @@ crow::response handleLyrics(const std::string &idstr) {
   if (!parseId(idstr, kind, id) || kind != kKindTrack) {
     return http_util::jsonResponse(404, "{}");
   }
-  repo::TrackRepo tr(config::get().db_path.string());
-  auto t = tr.byId(id);
-  if (!t) {
+  const auto ref = library().ref_for_compat(media_library::EntityType::Track, id);
+  if (!ref) {
     return http_util::jsonResponse(404, "{}");
   }
-  std::string lyrics;
-  bool synced = false;
-  {
-    SQLite::Statement q(db(), schema::sql::kTrackLyricsByTrackId);
-    q.bind(1, id);
-    if (q.executeStep()) {
-      lyrics = text(q, 0);
-      synced = q.getColumn(1).getInt() != 0;
-    }
-  }
-  if (lyrics.empty()) {
+  const auto lyricsResult = library().get_lyrics(*ref, {});
+  const auto trackResult = library().get_track(*ref, {});
+  if (!lyricsResult.ok() || !trackResult.ok()) {
     return http_util::jsonResponse(404, "{}");
   }
-  Catalog c = loadCatalog();
-  const std::vector<int> artists = trackArtistIds(c, t->id);
+  const auto &lyrics = lyricsResult.value();
+  const std::string plain = lyrics.plain_text.value_or(std::string());
+  if (plain.empty()) {
+    return http_util::jsonResponse(404, "{}");
+  }
+  const auto &track = trackResult.value();
   const std::string artist =
-      artists.empty() ? std::string() : artistNameOf(c, artists.front());
-  return json(200, buildLyricDto(*t, lyrics, synced, artist,
-                                 albumNameOf(c, t->album_id)));
+      track.artists.empty() ? std::string() : track.artists.front().name;
+  const std::string album =
+      track.album ? track.album->title : std::string();
+  return json(200, buildLyricDto(track.title, track.duration_ms.value_or(0),
+                                 plain,
+                                 lyrics.mode != media_library::LyricsMode::Unsynced,
+                                 artist, album));
 }
 
 crow::response handleArtists(const crow::request &req,
@@ -1450,18 +1298,20 @@ crow::response handleArtists(const crow::request &req,
   const int limit = qsInt(req, "limit", 0);
   const std::string sortBy = qs(req, "sortBy");
   const std::string order = qs(req, "sortOrder");
-  Catalog c = loadCatalog();
+  const media_library::CatalogSnapshot snap = library().snapshot();
   std::vector<Sortable> items;
-  for (auto &a : allArtists()) {
+  for (std::size_t i = 0; i < snap.artists.size(); ++i) {
+    const auto &a = snap.artists[i];
     // AlbumArtists must not include plain (track-only) artists.
     if (album_only &&
-        c.artistAlbumCount.find(a.id) == c.artistAlbumCount.end()) {
+        snap.artist_album_count.find(snap.artist_internal_ids[i]) ==
+            snap.artist_album_count.end()) {
       continue;
     }
     if (!search.empty() && lower(a.name).find(search) == std::string::npos) {
       continue;
     }
-    items.push_back(makeArtist(c, a));
+    items.push_back(itemForArtist(snap, i));
   }
   return respondItems(items, sortBy, order, startIndex, limit);
 }
@@ -1470,21 +1320,23 @@ crow::response handleGenres(const crow::request &req) {
   const std::string search = lower(qs(req, "searchTerm"));
   const int startIndex = qsInt(req, "startIndex", 0);
   const int limit = qsInt(req, "limit", 0);
+  const media_library::CatalogSnapshot snap = library().snapshot();
   std::vector<Sortable> items;
-  for (auto &g : allGenres()) {
+  for (const auto &g : snap.genres) {
     if (!search.empty() && lower(g.name).find(search) == std::string::npos) {
       continue;
     }
-    items.push_back(makeGenre(g.id, g.name));
+    items.push_back(itemForGenre(g));
   }
   return respondItems(items, "", "Ascending", startIndex, limit);
 }
 
 crow::response handleMusicGenreByName(const std::string &name) {
   const std::string want = lower(name);
-  for (auto &g : allGenres()) {
+  const media_library::CatalogSnapshot snap = library().snapshot();
+  for (const auto &g : snap.genres) {
     if (lower(g.name) == want) {
-      return json(200, genreItem(g.id, g.name));
+      return json(200, genreItem(g.internal_id, g.name));
     }
   }
   return http_util::jsonResponse(404, "{}");
@@ -1498,22 +1350,29 @@ crow::response handlePlaybackInfo(const crow::request &, const std::string &idst
   if (!parseId(idstr, kind, id) || kind != kKindTrack) {
     return http_util::jsonResponse(404, "{}");
   }
-  repo::TrackRepo tr(config::get().db_path.string());
-  auto t = tr.byId(id);
-  if (!t) {
+  const auto ref = library().ref_for_compat(media_library::EntityType::Track, id);
+  if (!ref) {
     return http_util::jsonResponse(404, "{}");
   }
+  const auto result = library().get_track(*ref, {});
+  const auto source = library().resolve_playback(*ref, {});
+  if (!result.ok() || !source.ok()) {
+    return http_util::jsonResponse(404, "{}");
+  }
+  const auto &t = result.value();
+  const long long durationMs = t.duration_ms.value_or(0);
+  const int bitrateKbps = t.audio.bitrate_kbps.value_or(0);
   const std::string url =
       "/Audio/" + idstr + "/stream?static=true&mediaSourceId=" + idstr;
-  const long long bitrate_bps = static_cast<long long>(t->bitrate) * 1000LL;
+  const long long bitrate_bps = static_cast<long long>(bitrateKbps) * 1000LL;
   crow::json::wvalue src;
   src["Id"] = idstr;
-  src["Name"] = t->title;
-  src["Path"] = t->path;
-  src["Container"] = t->format;
-  src["Size"] = static_cast<long long>(t->size_bytes);
+  src["Name"] = t.title;
+  src["Path"] = source.value().internal_locator;
+  src["Container"] = t.audio.format;
+  src["Size"] = t.audio.size_bytes.value_or(0);
   src["Bitrate"] = bitrate_bps;
-  src["RunTimeTicks"] = static_cast<long long>(t->duration_ms) * 10000LL;
+  src["RunTimeTicks"] = durationMs * 10000LL;
   src["SupportsDirectPlay"] = true;
   src["SupportsDirectStream"] = true;
   src["SupportsTranscoding"] = false;
@@ -1524,11 +1383,11 @@ crow::response handlePlaybackInfo(const crow::request &, const std::string &idst
 
   crow::json::wvalue stream;
   stream["Type"] = "Audio";
-  stream["Codec"] = t->format;
+  stream["Codec"] = t.audio.format;
   stream["Index"] = 0;
   stream["IsDefault"] = true;
-  stream["Channels"] = t->channels;
-  stream["SampleRate"] = t->sample_rate;
+  stream["Channels"] = t.audio.channels.value_or(0);
+  stream["SampleRate"] = t.audio.sample_rate.value_or(0);
   stream["BitRate"] = bitrate_bps;
   crow::json::wvalue::list streams;
   streams.emplace_back(std::move(stream));
@@ -1556,25 +1415,63 @@ crow::response handleSimilar(const std::string &idstr) {
   std::vector<Sortable> items;
   int kind = 0, id = 0;
   if (parseId(idstr, kind, id) && kind == kKindTrack) {
-    repo::TrackRepo tr(config::get().db_path.string());
-    auto t = tr.byId(id);
-    if (t) {
-      Catalog c = loadCatalog();
-      std::unordered_map<int, bool> seen;
-      seen[id] = true;
-      auto addList = [&](const std::vector<repo::Track> &list) {
-        for (auto &x : list) {
-          if (items.size() >= 20) return;
-          if (seen.count(x.id)) continue;
-          seen[x.id] = true;
-          items.push_back(makeTrack(c, x));
+    const media_library::CatalogSnapshot snap = library().snapshot();
+    std::size_t origin = snap.tracks.size();
+    for (std::size_t i = 0; i < snap.track_internal_ids.size(); ++i) {
+      if (snap.track_internal_ids[i] == id) {
+        origin = i;
+        break;
+      }
+    }
+    if (origin < snap.tracks.size()) {
+      const int album_id = snap.tracks[origin].album
+                               ? compat_id_of(snap.tracks[origin].album->ref)
+                               : 0;
+      std::unordered_set<int> want_genres;
+      const auto genres = snap.track_genres.find(id);
+      if (genres != snap.track_genres.end()) {
+        for (const auto &g : genres->second) {
+          want_genres.insert(g.internal_id);
         }
+      }
+      std::unordered_set<int> seen{id};
+      constexpr std::size_t kLimit = 20;
+      auto add_track = [&](std::size_t index) {
+        if (items.size() >= kLimit) {
+          return;
+        }
+        const int track_id = snap.track_internal_ids[index];
+        if (!seen.insert(track_id).second) {
+          return;
+        }
+        items.push_back(itemForTrack(snap, index));
       };
-      if (t->album_id > 0) addList(tr.byAlbum(t->album_id));
-      SQLite::Statement gq(db(), "SELECT genre_id FROM track_genre WHERE track_id = ?");
-      gq.bind(1, id);
-      while (gq.executeStep() && items.size() < 20) {
-        addList(tracksByGenre(gq.getColumn(0).getInt()));
+      if (album_id > 0) {
+        for (std::size_t i = 0; i < snap.tracks.size() && items.size() < kLimit;
+             ++i) {
+          const auto &other = snap.tracks[i];
+          if (other.album && compat_id_of(other.album->ref) == album_id) {
+            add_track(i);
+          }
+        }
+      }
+      for (std::size_t i = 0; i < snap.tracks.size() && items.size() < kLimit;
+           ++i) {
+        const int track_id = snap.track_internal_ids[i];
+        const auto genres_it = snap.track_genres.find(track_id);
+        if (genres_it == snap.track_genres.end()) {
+          continue;
+        }
+        bool shares = false;
+        for (const auto &g : genres_it->second) {
+          if (want_genres.count(g.internal_id) != 0) {
+            shares = true;
+            break;
+          }
+        }
+        if (shares) {
+          add_track(i);
+        }
       }
     }
   }
@@ -1587,12 +1484,15 @@ crow::response handleDownload(const crow::request &req, const std::string &idstr
   if (!parseId(idstr, kind, id) || kind != kKindTrack) {
     return http_util::jsonResponse(404, "{}");
   }
-  repo::TrackRepo tr(config::get().db_path.string());
-  auto t = tr.byId(id);
-  if (!t) {
+  const auto ref = library().ref_for_compat(media_library::EntityType::Track, id);
+  if (!ref) {
     return http_util::jsonResponse(404, "{}");
   }
-  return http_util::serveResource(storage::resolve(t->path),
+  const auto source = library().resolve_playback(*ref, {});
+  if (!source.ok()) {
+    return http_util::jsonResponse(404, "{}");
+  }
+  return http_util::serveResource(source.value().internal_locator,
                                   req.get_header_value("Range"));
 }
 
@@ -1614,19 +1514,40 @@ crow::response handleSearchHints(const crow::request &req) {
     hints.emplace_back(std::move(h));
   };
   if (!term.empty()) {
-    repo::TrackRepo tr(config::get().db_path.string());
-    for (auto &t : tr.search(term, cap)) {
-      push(makeId(kKindTrack, t.id),
-           t.title.empty() ? ("Track " + std::to_string(t.id)) : t.title, "Audio");
-    }
-    for (auto &a : allAlbums()) {
-      if (lower(a.name).find(lterm) != std::string::npos) {
-        push(makeId(kKindAlbum, a.id), a.name, "MusicAlbum");
+    const media_library::CatalogSnapshot snap = library().snapshot();
+    std::vector<std::size_t> track_hits;
+    for (std::size_t i = 0; i < snap.tracks.size(); ++i) {
+      if (lower(snap.tracks[i].title).find(lterm) != std::string::npos) {
+        track_hits.push_back(i);
       }
     }
-    for (auto &a : allArtists()) {
+    std::stable_sort(track_hits.begin(), track_hits.end(),
+                     [&](std::size_t a, std::size_t b) {
+                       return snap.tracks[a].user_data.added_at >
+                              snap.tracks[b].user_data.added_at;
+                     });
+    for (const std::size_t i : track_hits) {
+      if ((int)hints.size() >= cap) break;
+      const auto &t = snap.tracks[i];
+      const int track_id = snap.track_internal_ids[i];
+      push(makeId(kKindTrack, track_id),
+           t.title.empty() ? ("Track " + std::to_string(track_id)) : t.title,
+           "Audio");
+    }
+    for (std::size_t i = 0; i < snap.albums.size() && (int)hints.size() < cap;
+         ++i) {
+      const auto &a = snap.albums[i];
+      if (lower(a.title).find(lterm) != std::string::npos) {
+        push(makeId(kKindAlbum, snap.album_internal_ids[i]), a.title,
+             "MusicAlbum");
+      }
+    }
+    for (std::size_t i = 0; i < snap.artists.size() && (int)hints.size() < cap;
+         ++i) {
+      const auto &a = snap.artists[i];
       if (lower(a.name).find(lterm) != std::string::npos) {
-        push(makeId(kKindArtist, a.id), a.name, "MusicArtist");
+        push(makeId(kKindArtist, snap.artist_internal_ids[i]), a.name,
+             "MusicArtist");
       }
     }
   }
@@ -1638,11 +1559,12 @@ crow::response handleSearchHints(const crow::request &req) {
 
 // 过滤选项：真实流派与年份。
 crow::response handleFilters(const crow::request &) {
+  const media_library::CatalogSnapshot snap = library().snapshot();
   crow::json::wvalue::list genres;
-  for (auto &g : allGenres()) genres.emplace_back(g.name);
+  for (const auto &g : snap.genres) genres.emplace_back(g.name);
   std::vector<int> years;
-  for (auto &a : allAlbums()) {
-    if (a.year > 0) years.push_back(a.year);
+  for (const auto &a : snap.albums) {
+    if (a.year && *a.year > 0) years.push_back(*a.year);
   }
   std::sort(years.begin(), years.end());
   years.erase(std::unique(years.begin(), years.end()), years.end());
@@ -1659,67 +1581,111 @@ crow::response handleFilters(const crow::request &) {
 // 按名字（或 GUID）取单个艺术家。
 crow::response handleArtistByName(const std::string &raw) {
   int kind = 0, id = 0;
-  Catalog c = loadCatalog();
+  const media_library::CatalogSnapshot snap = library().snapshot();
+  std::optional<std::size_t> index;
   if (parseId(raw, kind, id) && kind == kKindArtist) {
-    repo::ArtistRepo ar(config::get().db_path.string());
-    auto a = ar.byId(id);
-    if (a) return json(200, makeArtist(c, *a).dto);
+    for (std::size_t i = 0; i < snap.artist_internal_ids.size(); ++i) {
+      if (snap.artist_internal_ids[i] == id) {
+        index = i;
+        break;
+      }
+    }
+  } else {
+    const std::string name = http_util::urlDecode(raw);
+    for (std::size_t i = 0; i < snap.artists.size(); ++i) {
+      if (snap.artists[i].name == name) {
+        index = i;
+        break;
+      }
+    }
+  }
+  if (!index) {
     return http_util::jsonResponse(404, "{}");
   }
-  SQLite::Statement q(db(), "SELECT id, name, sort_name FROM artist WHERE name = ? LIMIT 1");
-  q.bind(1, http_util::urlDecode(raw));
-  if (q.executeStep()) {
-    repo::Artist a;
-    a.id = q.getColumn(0).getInt();
-    a.name = text(q, 1);
-    a.sort_name = text(q, 2);
-    return json(200, makeArtist(c, a).dto);
-  }
-  return http_util::jsonResponse(404, "{}");
+  return json(200, itemForArtist(snap, *index).dto);
 }
 
 // 相似艺术家：与本艺术家共享流派的其它艺术家。
 crow::response handleArtistSimilar(const std::string &raw) {
   int kind = 0, id = 0;
-  int artistId = -1;
+  const media_library::CatalogSnapshot snap = library().snapshot();
+  int artist_id = -1;
   if (parseId(raw, kind, id) && kind == kKindArtist) {
-    artistId = id;
+    artist_id = id;
   } else {
-    SQLite::Statement q(db(), "SELECT id FROM artist WHERE name = ? LIMIT 1");
-    q.bind(1, http_util::urlDecode(raw));
-    if (q.executeStep()) { artistId = q.getColumn(0).getInt(); }
-  }
-  if (artistId < 0) { return http_util::jsonResponse(404, "{}"); }
-
-  std::vector<int> genreIds;
-  SQLite::Statement gq(db(),
-      "SELECT DISTINCT tg.genre_id FROM track t "
-      "JOIN track_genre tg ON tg.track_id = t.id "
-      "JOIN track_artist ta ON ta.track_id = t.id WHERE ta.artist_id = ?");
-  gq.bind(1, artistId);
-  while (gq.executeStep()) { genreIds.push_back(gq.getColumn(0).getInt()); }
-
-  std::vector<int> artistIds;
-  std::unordered_map<int, bool> seen;
-  seen[artistId] = true;
-  for (int gid : genreIds) {
-    for (auto &t : tracksByGenre(gid)) {
-      for (const int aid : t.artist_ids) {
-        if (aid <= 0 || seen.count(aid)) { continue; }
-        seen[aid] = true;
-        artistIds.push_back(aid);
+    const std::string name = http_util::urlDecode(raw);
+    for (std::size_t i = 0; i < snap.artists.size(); ++i) {
+      if (snap.artists[i].name == name) {
+        artist_id = snap.artist_internal_ids[i];
+        break;
       }
-      if (artistIds.size() >= 20) { break; }
     }
-    if (artistIds.size() >= 20) { break; }
+  }
+  if (artist_id < 0) {
+    return http_util::jsonResponse(404, "{}");
   }
 
-  Catalog c = loadCatalog();
-  repo::ArtistRepo ar(config::get().db_path.string());
+  std::unordered_set<int> genre_ids;
+  for (std::size_t i = 0; i < snap.tracks.size(); ++i) {
+    const int track_id = snap.track_internal_ids[i];
+    bool by_artist = false;
+    for (const auto &link : snap.tracks[i].artists) {
+      if (compat_id_of(link.ref) == artist_id) {
+        by_artist = true;
+        break;
+      }
+    }
+    if (!by_artist) {
+      continue;
+    }
+    const auto genres = snap.track_genres.find(track_id);
+    if (genres == snap.track_genres.end()) {
+      continue;
+    }
+    for (const auto &g : genres->second) {
+      genre_ids.insert(g.internal_id);
+    }
+  }
+
+  std::vector<int> artist_ids;
+  std::unordered_set<int> seen{artist_id};
+  constexpr std::size_t kLimit = 20;
+  for (std::size_t i = 0; i < snap.tracks.size() && artist_ids.size() < kLimit;
+       ++i) {
+    const auto genres = snap.track_genres.find(snap.track_internal_ids[i]);
+    if (genres == snap.track_genres.end()) {
+      continue;
+    }
+    bool shares = false;
+    for (const auto &g : genres->second) {
+      if (genre_ids.count(g.internal_id) != 0) {
+        shares = true;
+        break;
+      }
+    }
+    if (!shares) {
+      continue;
+    }
+    for (const auto &link : snap.tracks[i].artists) {
+      const int aid = compat_id_of(link.ref);
+      if (aid <= 0 || !seen.insert(aid).second) {
+        continue;
+      }
+      artist_ids.push_back(aid);
+      if (artist_ids.size() >= kLimit) {
+        break;
+      }
+    }
+  }
+
   std::vector<Sortable> items;
-  for (int aid : artistIds) {
-    auto a = ar.byId(aid);
-    if (a) { items.push_back(makeArtist(c, *a)); }
+  for (const int aid : artist_ids) {
+    for (std::size_t i = 0; i < snap.artist_internal_ids.size(); ++i) {
+      if (snap.artist_internal_ids[i] == aid) {
+        items.push_back(itemForArtist(snap, i));
+        break;
+      }
+    }
   }
   return respondItems(items, "", "Ascending", 0, 0);
 }
@@ -1811,20 +1777,24 @@ crow::response handlePlaylistItems(const std::string &idstr) {
   if (!playlist::get(idstr, p)) {
     return http_util::jsonResponse(404, "{}");
   }
-  Catalog c = loadCatalog();
-  repo::TrackRepo tr(config::get().db_path.string());
+  const media_library::CatalogSnapshot snap = library().snapshot();
+  std::unordered_map<int, std::size_t> index_of;
+  for (std::size_t i = 0; i < snap.track_internal_ids.size(); ++i) {
+    index_of.emplace(snap.track_internal_ids[i], i);
+  }
   std::vector<Sortable> items;
   for (const auto &s : p.songs) {
     if (!s.matched) {
       continue;
     }
-    auto t = tr.byId(s.track_id);
-    if (t) {
-      Sortable item = makeTrack(c, *t);
-      item.dto["PlaylistItemId"] = makeId(kKindTrack, t->id);
-      item.dto["CanDelete"] = true;
-      items.push_back(std::move(item));
+    const auto it = index_of.find(s.track_id);
+    if (it == index_of.end()) {
+      continue;
     }
+    Sortable item = itemForTrack(snap, it->second);
+    item.dto["PlaylistItemId"] = makeId(kKindTrack, s.track_id);
+    item.dto["CanDelete"] = true;
+    items.push_back(std::move(item));
   }
   return respondItems(items, "", "Ascending", 0, 0);
 }
@@ -1844,7 +1814,7 @@ crow::response handleCreatePlaylist(const crow::request &req) {
   appendBodyIds(body, "Ids", ids);
   std::string err;
   for (int tid : ids) {
-    playlist::addTrack(p.id, tid, &err);
+    playlist::addTrack(p.id, tid, err);
   }
   crow::json::wvalue r;
   r["Id"] = p.id;
@@ -1863,7 +1833,7 @@ crow::response handleAddToPlaylist(const crow::request &req,
   appendBodyIds(body, "Ids", ids);
   std::string err;
   for (int tid : ids) {
-    playlist::addTrack(idstr, tid, &err);
+    playlist::addTrack(idstr, tid, err);
   }
   return crow::response(204);
 }
@@ -1909,7 +1879,7 @@ crow::response handleUpdatePlaylist(const crow::request &req,
     playlist::clear(idstr);
     std::string err;
     for (int tid : ids) {
-      playlist::addTrack(idstr, tid, &err);
+      playlist::addTrack(idstr, tid, err);
     }
   }
   return crow::response(204);
@@ -1925,7 +1895,7 @@ crow::response handleDeletePlaylist(const std::string &idstr) {
 
 } // namespace
 
-#define JF_ROUTE(app, url) RouteReg(&(app), (url))
+#define JF_ROUTE(app, url) RouteReg((app), (url))
 
 void run(const config::Config &cfg) {
   setServerName(cfg.jellyfin_server_name);

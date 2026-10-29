@@ -19,6 +19,10 @@ add_executable(musicd
   ./src/scanner.cpp
   ./src/http_util.cpp
   ./src/musicd.cpp
+  ./src/media_library/source_ref.cpp
+  ./src/media_library/entity_store.cpp
+  ./src/media_library/local_library.cpp
+  ./src/media_library/library_runtime.cpp
   ./src/api/jellyfin/ids.cpp
   ./src/api/jellyfin/dto.cpp
   ./src/api/jellyfin/jellyfin.cpp

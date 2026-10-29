@@ -160,6 +160,195 @@ crow::json::wvalue trackItem(
   return r;
 }
 
+crow::json::wvalue trackItem(
+    const media_library::Track &t, int trackId, int albumId,
+    const std::string &albumName, const std::string &filePath,
+    const std::vector<std::pair<std::string, int>> &trackArtists,
+    const std::vector<std::pair<std::string, int>> &albumArtists,
+    const std::vector<std::pair<std::string, int>> &genres) {
+  crow::json::wvalue r;
+  const std::string trackName =
+      t.title.empty() ? ("Track " + std::to_string(trackId)) : t.title;
+  const std::string trackGuid = makeId(kKindTrack, trackId);
+  const long long durationMs = t.duration_ms.value_or(0);
+  const int bitrateKbps = t.audio.bitrate_kbps.value_or(0);
+  const int channels = t.audio.channels.value_or(0);
+  const int sampleRate = t.audio.sample_rate.value_or(0);
+  const long long sizeBytes = t.audio.size_bytes.value_or(0);
+  const long long bitrateBps = static_cast<long long>(bitrateKbps) * 1000LL;
+  r["Name"] = trackName;
+  r["ServerId"] = serverId();
+  r["Id"] = trackGuid;
+  r["Etag"] = trackGuid;
+  r["DateCreated"] = isoTime(t.user_data.added_at);
+  r["Container"] = t.audio.format;
+  r["Path"] = filePath;
+  r["RunTimeTicks"] = durationMs * 10000LL;
+  r["ProductionYear"] = t.year.value_or(0);
+  r["IndexNumber"] = t.track_no.value_or(0);
+  r["ParentIndexNumber"] = t.disc_no.value_or(0);
+  r["SortName"] = t.title;
+  r["Type"] = "Audio";
+  r["MediaType"] = "Audio";
+  r["IsFolder"] = false;
+  r["CanDownload"] = true;
+  r["PlayAccess"] = "Full";
+  if (t.lyrics_available) {
+    r["HasLyrics"] = true;
+  }
+  if (albumId > 0) {
+    r["AlbumId"] = makeId(kKindAlbum, albumId);
+    r["ParentId"] = makeId(kKindAlbum, albumId);
+  }
+  if (!albumName.empty()) {
+    r["Album"] = albumName;
+  }
+  {
+    crow::json::wvalue::list names;
+    crow::json::wvalue::list items;
+    for (const auto &p : trackArtists) {
+      names.emplace_back(p.first);
+      items.push_back(nameGuidPair(p.first, makeId(kKindArtist, p.second)));
+    }
+    if (!names.empty()) {
+      r["Artists"] = crow::json::wvalue(names);
+      r["ArtistItems"] = crow::json::wvalue(items);
+    }
+    const auto &albumList = albumArtists.empty() ? trackArtists : albumArtists;
+    crow::json::wvalue::list albItems;
+    for (const auto &p : albumList) {
+      albItems.push_back(nameGuidPair(p.first, makeId(kKindArtist, p.second)));
+    }
+    if (!albumList.empty()) {
+      r["AlbumArtist"] = albumList.front().first;
+      r["AlbumArtists"] = crow::json::wvalue(albItems);
+    }
+  }
+  crow::json::wvalue::list genreNames;
+  crow::json::wvalue::list genreItems;
+  for (const auto &g : genres) {
+    genreNames.emplace_back(g.first);
+    genreItems.push_back(nameGuidPair(g.first, makeId(kKindGenre, g.second)));
+  }
+  r["Genres"] = crow::json::wvalue(genreNames);
+  r["GenreItems"] = crow::json::wvalue(genreItems);
+  {
+    crow::json::wvalue stream;
+    stream["Type"] = "Audio";
+    stream["Codec"] = t.audio.format;
+    stream["Index"] = 0;
+    stream["IsDefault"] = true;
+    stream["BitRate"] = bitrateBps;
+    stream["Channels"] = channels;
+    stream["SampleRate"] = sampleRate;
+    if (channels == 1) {
+      stream["ChannelLayout"] = "mono";
+    } else if (channels == 2) {
+      stream["ChannelLayout"] = "stereo";
+    }
+    crow::json::wvalue::list streams;
+    streams.push_back(std::move(stream));
+
+    crow::json::wvalue source;
+    source["Id"] = trackGuid;
+    source["Name"] = trackName;
+    source["Path"] = filePath;
+    source["Container"] = t.audio.format;
+    source["Size"] = sizeBytes;
+    source["Bitrate"] = bitrateBps;
+    source["RunTimeTicks"] = durationMs * 10000LL;
+    source["SupportsDirectPlay"] = true;
+    source["SupportsDirectStream"] = true;
+    source["SupportsTranscoding"] = false;
+    source["IsRemote"] = true;
+    source["Type"] = "Default";
+    source["MediaStreams"] = crow::json::wvalue(streams);
+    source["DirectStreamUrl"] =
+        "/Audio/" + trackGuid + "/stream?static=true&mediaSourceId=" +
+        trackGuid;
+    crow::json::wvalue::list sources;
+    sources.push_back(std::move(source));
+    r["MediaSources"] = crow::json::wvalue(sources);
+    r["MediaSourceCount"] = 1;
+  }
+  const std::string imageTag = t.artwork.has_value() ? "1" : "";
+  setImageTag(r, imageTag);
+  crow::json::wvalue ud;
+  ud["PlaybackPositionTicks"] = 0;
+  ud["PlayCount"] = t.user_data.play_count;
+  ud["IsFavorite"] = false;
+  ud["Played"] = t.user_data.play_count > 0;
+  ud["Key"] = trackGuid;
+  if (!t.user_data.last_played.empty()) {
+    ud["LastPlayedDate"] = isoTime(t.user_data.last_played);
+  }
+  ud["Rating"] = t.user_data.rating;
+  r["UserData"] = std::move(ud);
+  return r;
+}
+
+crow::json::wvalue albumItem(
+    const media_library::Album &a, int albumId,
+    const std::vector<std::pair<std::string, int>> &albumArtists, int songCount,
+    const std::string &imageTag, long long runtimeTicks) {
+  crow::json::wvalue r;
+  r["Name"] = a.title;
+  r["ServerId"] = serverId();
+  r["Id"] = makeId(kKindAlbum, albumId);
+  r["Etag"] = makeId(kKindAlbum, albumId);
+  r["Type"] = "MusicAlbum";
+  r["MediaType"] = "Audio";
+  r["IsFolder"] = true;
+  if (!albumArtists.empty()) {
+    r["AlbumArtist"] = albumArtists.front().first;
+  }
+  r["ProductionYear"] = a.year.value_or(0);
+  r["ChildCount"] = songCount;
+  r["SongCount"] = songCount;
+  r["RecursiveItemCount"] = songCount;
+  if (runtimeTicks > 0) {
+    r["RunTimeTicks"] = runtimeTicks;
+    r["CumulativeRunTimeTicks"] = runtimeTicks;
+  }
+  if (!albumArtists.empty()) {
+    crow::json::wvalue::list names;
+    crow::json::wvalue::list items;
+    for (const auto &p : albumArtists) {
+      names.emplace_back(p.first);
+      items.push_back(nameGuidPair(p.first, makeId(kKindArtist, p.second)));
+    }
+    r["Artists"] = crow::json::wvalue(names);
+    r["AlbumArtists"] = crow::json::wvalue(items);
+    r["ArtistItems"] = crow::json::wvalue(items);
+  }
+  r["Genres"] = crow::json::wvalue::list{};
+  r["GenreItems"] = crow::json::wvalue::list{};
+  setImageTag(r, imageTag);
+  crow::json::wvalue ud;
+  ud["PlaybackPositionTicks"] = 0;
+  ud["PlayCount"] = 0;
+  ud["IsFavorite"] = false;
+  ud["Played"] = false;
+  r["UserData"] = std::move(ud);
+  return r;
+}
+
+crow::json::wvalue artistItem(const media_library::Artist &a, int artistId,
+                              int albumCount, const std::string &imageTag) {
+  crow::json::wvalue r;
+  r["Name"] = a.name;
+  r["ServerId"] = serverId();
+  r["Id"] = makeId(kKindArtist, artistId);
+  r["Etag"] = makeId(kKindArtist, artistId);
+  r["Type"] = "MusicArtist";
+  r["IsFolder"] = true;
+  r["AlbumCount"] = albumCount;
+  r["ChildCount"] = albumCount;
+  r["SortName"] = a.sort_name.empty() ? a.name : a.sort_name;
+  setImageTag(r, imageTag);
+  return r;
+}
+
 crow::json::wvalue albumItem(
     const repo::Album &a,
     const std::vector<std::pair<std::string, int>> &albumArtists, int songCount,

@@ -8,6 +8,8 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -164,6 +166,19 @@ std::vector<std::string> createStatements() {
       "CREATE INDEX IF NOT EXISTS idx_album_artist_album ON album_artist(album_id)",
       "CREATE INDEX IF NOT EXISTS idx_album_artist_artist ON album_artist(artist_id)",
       "CREATE INDEX IF NOT EXISTS idx_play_event_time ON play_event(played_at)",
+      "CREATE TABLE IF NOT EXISTS entity_mapping("
+      "library_id TEXT NOT NULL,"
+      "entity_type TEXT NOT NULL,"
+      "entity_id TEXT NOT NULL,"
+      "internal_id INTEGER NOT NULL,"
+      "state TEXT NOT NULL DEFAULT 'active',"
+      "confidence REAL,"
+      "created_at TEXT DEFAULT (datetime('now','localtime')),"
+      "updated_at TEXT,"
+      "PRIMARY KEY(library_id, entity_type, internal_id),"
+      "UNIQUE(library_id, entity_type, entity_id))",
+      "CREATE INDEX IF NOT EXISTS idx_entity_mapping_state ON "
+      "entity_mapping(library_id, entity_type, state)",
   };
 }
 
@@ -244,7 +259,7 @@ void migrate(SQLite::Database &database) {
   }
 
   if (!hasVersion) {
-    database.exec("INSERT INTO schema_version(version) VALUES (7)");
+    database.exec("INSERT INTO schema_version(version) VALUES (8)");
     return;
   }
 
@@ -397,13 +412,14 @@ void migrate(SQLite::Database &database) {
       u.bind(2, r.id);
       u.executeStep();
     }
-    const auto rootById = [&roots](int id) -> const repo::ScanRoot * {
+    const auto rootById =
+        [&roots](int id) -> std::optional<std::reference_wrapper<const repo::ScanRoot>> {
       for (const auto &r : roots) {
         if (r.id == id) {
-          return &r;
+          return std::cref(r);
         }
       }
-      return nullptr;
+      return std::nullopt;
     };
     std::vector<std::pair<int, std::string>> track_rows;
     {
@@ -412,11 +428,11 @@ void migrate(SQLite::Database &database) {
         const int tid = q.getColumn(0).getInt();
         const int rid = q.getColumn(1).getInt();
         const std::string real = q.getColumn(2).getText();
-        const repo::ScanRoot *root = rootById(rid);
-        if (root == nullptr) {
+        const auto root = rootById(rid);
+        if (!root.has_value()) {
           continue;
         }
-        const std::string v = storage::toVirtual(*root, real);
+        const std::string v = storage::toVirtual(root->get(), real);
         if (v == real) {
           continue;
         }
@@ -459,6 +475,12 @@ void migrate(SQLite::Database &database) {
         "synced INTEGER NOT NULL DEFAULT 0)");
     database.exec("UPDATE schema_version SET version = 7");
     version = 7;
+  }
+
+  if (version == 7) {
+    // CREATE TABLE 已在 migrate 开始时执行；这里只推进版本。
+    database.exec("UPDATE schema_version SET version = 8");
+    version = 8;
     return;
   }
 
@@ -470,20 +492,22 @@ void selfCheck(SQLite::Database &database) {
   sqlite3 *handle = database.getHandle();
 
   for (const auto &spec : allStatements()) {
-    sqlite3_stmt *prepared = nullptr;
+    sqlite3_stmt *raw = nullptr;
     const char *tail = nullptr;
     const int rc =
-        sqlite3_prepare_v2(handle, spec.sql.c_str(), -1, &prepared, &tail);
+        sqlite3_prepare_v2(handle, spec.sql.c_str(), -1, &raw, &tail);
+    // prepared 持有语句生命周期，避免手写 finalize。
+    const std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> prepared(
+        raw, &sqlite3_finalize);
 
-    if (rc != SQLITE_OK) {
+    if (rc != SQLITE_OK || !prepared) {
       throw std::runtime_error(
           "启动自检失败：语句 " + spec.name + " 无法 prepare（" +
           std::string(sqlite3_errmsg(handle)) + "）\n  SQL: " + spec.sql);
     }
 
-    const int actual = sqlite3_bind_parameter_count(prepared);
+    const int actual = sqlite3_bind_parameter_count(prepared.get());
     const bool fullyConsumed = (tail != nullptr && *tail == '\0');
-    sqlite3_finalize(prepared);
 
     if (!fullyConsumed) {
       throw std::runtime_error("启动自检失败：语句 " + spec.name +

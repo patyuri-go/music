@@ -58,14 +58,9 @@ std::string hexString(const unsigned char *data, std::size_t size) {
 
 class ContentHasher {
 public:
-  ContentHasher() : ctx_(EVP_MD_CTX_new()) {
-    if (ctx_ != nullptr) {
-      ok_ = EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr) == 1;
-    }
-  }
-  ~ContentHasher() {
-    if (ctx_ != nullptr) {
-      EVP_MD_CTX_free(ctx_);
+  ContentHasher() : ctx_(EVP_MD_CTX_new(), &EVP_MD_CTX_free) {
+    if (ctx_) {
+      ok_ = EVP_DigestInit_ex(ctx_.get(), EVP_sha256(), nullptr) == 1;
     }
   }
   ContentHasher(const ContentHasher &) = delete;
@@ -73,24 +68,24 @@ public:
 
   void update(const void *data, std::size_t size) {
     if (ok_ && size > 0) {
-      ok_ = EVP_DigestUpdate(ctx_, data, size) == 1;
+      ok_ = EVP_DigestUpdate(ctx_.get(), data, size) == 1;
     }
   }
 
   std::optional<std::string> finalHex() {
-    if (!ok_) {
+    if (!ok_ || !ctx_) {
       return std::nullopt;
     }
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int length = 0;
-    if (EVP_DigestFinal_ex(ctx_, digest, &length) != 1) {
+    if (EVP_DigestFinal_ex(ctx_.get(), digest, &length) != 1) {
       return std::nullopt;
     }
     return hexString(digest, length);
   }
 
 private:
-  EVP_MD_CTX *ctx_ = nullptr;
+  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx_;
   bool ok_ = false;
 };
 
@@ -232,7 +227,7 @@ ImageCache::ImageCache(Options opt) : opt_(std::move(opt)) {}
 
 ImageCache::~ImageCache() { shutdown(); }
 
-bool ImageCache::init(std::string *error) {
+bool ImageCache::init(std::string &error) {
   if (enabled_) {
     return true;
   }
@@ -242,9 +237,7 @@ bool ImageCache::init(std::string *error) {
   }
 
   auto fail = [&](const std::string &message) {
-    if (error != nullptr) {
-      *error = message;
-    }
+    error = message;
     return false;
   };
 
@@ -305,23 +298,17 @@ bool ImageCache::enabled() const { return enabled_ && !stopping_; }
 
 std::optional<fs::path>
 ImageCache::ensure(const std::string &virtual_path, const std::string &variant,
-                   std::string *error) {
+                   std::string &error) {
   if (!enabled()) {
-    if (error != nullptr) {
-      *error = "image cache is disabled";
-    }
+    error = "image cache is disabled";
     return std::nullopt;
   }
   if (variant != "original") {
-    if (error != nullptr) {
-      *error = "unsupported image variant: " + variant;
-    }
+    error = "unsupported image variant: " + variant;
     return std::nullopt;
   }
   if (virtual_path.empty()) {
-    if (error != nullptr) {
-      *error = "empty virtual path";
-    }
+    error = "empty virtual path";
     return std::nullopt;
   }
 
@@ -362,8 +349,8 @@ ImageCache::ensure(const std::string &virtual_path, const std::string &variant,
 
     if (!leader) {
       const auto result = waiter.get();
-      if (!result && error != nullptr) {
-        *error = "image cache fetch failed";
+      if (!result) {
+        error = "image cache fetch failed";
       }
       return result;
     }
@@ -382,7 +369,7 @@ ImageCache::ensure(const std::string &virtual_path, const std::string &variant,
       }
       if (!result) {
         const std::string resolved = storage::resolve(virtual_path);
-        result = fetchAndStore(virtual_path, variant, resolved, &failure);
+        result = fetchAndStore(virtual_path, variant, resolved, failure);
       }
     } catch (const std::exception &ex) {
       failure = ex.what();
@@ -394,14 +381,12 @@ ImageCache::ensure(const std::string &virtual_path, const std::string &variant,
       std::lock_guard<std::mutex> lock(inflight_mu_);
       inflight_.erase(key);
     }
-    if (!result && error != nullptr) {
-      *error = failure.empty() ? "image cache fetch failed" : failure;
+    if (!result) {
+      error = failure.empty() ? "image cache fetch failed" : failure;
     }
     return result;
   } catch (const std::exception &ex) {
-    if (error != nullptr) {
-      *error = ex.what();
-    }
+    error = ex.what();
     return std::nullopt;
   }
 }
@@ -625,39 +610,31 @@ void ImageCache::markValidated(const std::string &virtual_path,
 
 bool ImageCache::downloadToTemp(const std::string &resolved_location,
                                 const fs::path &tmp_path,
-                                std::string *image_id, std::uintmax_t *bytes,
-                                std::string *error) {
+                                std::string &image_id, std::uintmax_t &bytes,
+                                std::string &error) {
   const webdav::Url url = webdav::resolveCredentials(resolved_location);
   if (url.host.empty()) {
-    if (error != nullptr) {
-      *error = "invalid webdav url";
-    }
+    error = "invalid webdav url";
     return false;
   }
   std::cerr << "[image_cache] webdav fetch " << resolved_location << '\n';
   webdav::Stream stream = webdav::openStream(url, url.path, {});
   if (stream.status != 200 && stream.status != 206) {
     stream.close();
-    if (error != nullptr) {
-      *error = "webdav image request failed: " + std::to_string(stream.status);
-    }
+    error = "webdav image request failed: " + std::to_string(stream.status);
     return false;
   }
   if (stream.length >= 0 &&
       static_cast<std::uintmax_t>(stream.length) > opt_.max_file_bytes) {
     stream.close();
-    if (error != nullptr) {
-      *error = "image exceeds max_file_bytes";
-    }
+    error = "image exceeds max_file_bytes";
     return false;
   }
 
   std::ofstream output(tmp_path, std::ios::binary | std::ios::trunc);
   if (!output) {
     stream.close();
-    if (error != nullptr) {
-      *error = "cannot create temporary cache file";
-    }
+    error = "cannot create temporary cache file";
     return false;
   }
 
@@ -677,9 +654,7 @@ bool ImageCache::downloadToTemp(const std::string &resolved_location,
         break;
       }
       ok = false;
-      if (error != nullptr) {
-        *error = "webdav image read failed";
-      }
+      error = "webdav image read failed";
       break;
     }
     if (count == 0) {
@@ -688,17 +663,13 @@ bool ImageCache::downloadToTemp(const std::string &resolved_location,
     total += static_cast<std::uintmax_t>(count);
     if (opt_.max_file_bytes > 0 && total > opt_.max_file_bytes) {
       ok = false;
-      if (error != nullptr) {
-        *error = "image exceeds max_file_bytes";
-      }
+      error = "image exceeds max_file_bytes";
       break;
     }
     output.write(buffer.data(), static_cast<std::streamsize>(count));
     if (!output) {
       ok = false;
-      if (error != nullptr) {
-        *error = "cannot write temporary cache file";
-      }
+      error = "cannot write temporary cache file";
       break;
     }
     hasher.update(buffer.data(), static_cast<std::size_t>(count));
@@ -715,23 +686,19 @@ bool ImageCache::downloadToTemp(const std::string &resolved_location,
   if (!digest) {
     std::error_code ec;
     fs::remove(tmp_path, ec);
-    if (error != nullptr) {
-      *error = "cannot hash downloaded image";
-    }
+    error = "cannot hash downloaded image";
     return false;
   }
-  *image_id = *digest;
-  *bytes = total;
+  image_id = *digest;
+  bytes = total;
   return true;
 }
 
-bool ImageCache::hashLocalFile(const fs::path &path, std::string *image_id,
-                               std::uintmax_t *bytes, std::string *error) {
+bool ImageCache::hashLocalFile(const fs::path &path, std::string &image_id,
+                               std::uintmax_t &bytes, std::string &error) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
-    if (error != nullptr) {
-      *error = "cannot open local image";
-    }
+    error = "cannot open local image";
     return false;
   }
   ContentHasher hasher;
@@ -746,20 +713,16 @@ bool ImageCache::hashLocalFile(const fs::path &path, std::string *image_id,
     }
   }
   if (input.bad()) {
-    if (error != nullptr) {
-      *error = "cannot read local image";
-    }
+    error = "cannot read local image";
     return false;
   }
   const std::optional<std::string> digest = hasher.finalHex();
   if (!digest) {
-    if (error != nullptr) {
-      *error = "cannot hash local image";
-    }
+    error = "cannot hash local image";
     return false;
   }
-  *image_id = *digest;
-  *bytes = total;
+  image_id = *digest;
+  bytes = total;
   return true;
 }
 
@@ -767,25 +730,19 @@ std::optional<fs::path>
 ImageCache::fetchAndStore(const std::string &virtual_path,
                           const std::string &variant,
                           const std::string &resolved_location,
-                          std::string *error) {
+                          std::string &error) {
   if (variant != "original") {
-    if (error != nullptr) {
-      *error = "unsupported image variant: " + variant;
-    }
+    error = "unsupported image variant: " + variant;
     return std::nullopt;
   }
 
   const auto source = computeSourceSig(virtual_path, resolved_location);
   if (!source) {
-    if (error != nullptr) {
-      *error = "cannot read image source metadata";
-    }
+    error = "cannot read image source metadata";
     return std::nullopt;
   }
   if (!isCacheable(resolved_location)) {
-    if (error != nullptr) {
-      *error = "image source is not cacheable";
-    }
+    error = "image source is not cacheable";
     return std::nullopt;
   }
 
@@ -796,14 +753,12 @@ ImageCache::fetchAndStore(const std::string &virtual_path,
     std::error_code ec;
     const fs::path source_path = fs::weakly_canonical(resolved_location, ec);
     if (ec) {
-      if (error != nullptr) {
-        *error = "cannot canonicalize local image";
-      }
+      error = "cannot canonicalize local image";
       return std::nullopt;
     }
     std::string image_id;
     std::uintmax_t bytes = 0;
-    if (!hashLocalFile(source_path, &image_id, &bytes, error)) {
+    if (!hashLocalFile(source_path, image_id, bytes, error)) {
       return std::nullopt;
     }
     try {
@@ -817,16 +772,14 @@ ImageCache::fetchAndStore(const std::string &virtual_path,
   }
 
   if (opt_.max_file_bytes > 0 && source->size > opt_.max_file_bytes) {
-    if (error != nullptr) {
-      *error = "image exceeds max_file_bytes";
-    }
+    error = "image exceeds max_file_bytes";
     return std::nullopt;
   }
 
   const fs::path tmp_path = opt_.dir / "tmp" / (randomTempName() + ".part");
   std::string image_id;
   std::uintmax_t bytes = 0;
-  if (!downloadToTemp(resolved_location, tmp_path, &image_id, &bytes, error)) {
+  if (!downloadToTemp(resolved_location, tmp_path, image_id, bytes, error)) {
     return std::nullopt;
   }
 
@@ -836,9 +789,7 @@ ImageCache::fetchAndStore(const std::string &virtual_path,
   fs::create_directories(target.parent_path(), ec);
   if (ec) {
     fs::remove(tmp_path, ec);
-    if (error != nullptr) {
-      *error = "cannot create image cache shard directory";
-    }
+    error = "cannot create image cache shard directory";
     return std::nullopt;
   }
 
@@ -848,9 +799,7 @@ ImageCache::fetchAndStore(const std::string &virtual_path,
     fs::rename(tmp_path, target, ec);
     if (ec) {
       fs::remove(tmp_path, ec);
-      if (error != nullptr) {
-        *error = "cannot move temporary image into cache";
-      }
+      error = "cannot move temporary image into cache";
       return std::nullopt;
     }
   }
@@ -1228,15 +1177,15 @@ Stats ImageCache::stats() const {
 
 namespace {
 std::mutex g_instance_mu;
-std::unique_ptr<ImageCache> g_instance;
+std::shared_ptr<ImageCache> g_instance;
 } // namespace
 
-bool init(const Options &opt, std::string *error) {
+bool init(const Options &opt, std::string &error) {
   std::lock_guard<std::mutex> lock(g_instance_mu);
   if (g_instance) {
     return true;
   }
-  auto instance = std::make_unique<ImageCache>(opt);
+  auto instance = std::make_shared<ImageCache>(opt);
   if (!instance->init(error)) {
     return false;
   }
@@ -1245,7 +1194,7 @@ bool init(const Options &opt, std::string *error) {
 }
 
 void shutdown() {
-  std::unique_ptr<ImageCache> instance;
+  std::shared_ptr<ImageCache> instance;
   {
     std::lock_guard<std::mutex> lock(g_instance_mu);
     instance = std::move(g_instance);
@@ -1255,9 +1204,9 @@ void shutdown() {
   }
 }
 
-ImageCache *get() {
+std::shared_ptr<ImageCache> get() {
   std::lock_guard<std::mutex> lock(g_instance_mu);
-  return g_instance.get();
+  return g_instance;
 }
 
 } // namespace image_cache

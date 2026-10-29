@@ -20,6 +20,7 @@
 #include <ctime>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -433,7 +434,8 @@ struct DirTask {
 };
 
 void scanLocalTree(const repo::ScanRoot &sr, const std::vector<DirTask> &starts,
-                   Progress *progress, bool only_new = false);
+                   std::optional<std::reference_wrapper<Progress>> progress,
+                   bool only_new = false);
 
 struct ScanCtx {
   std::mutex mu;
@@ -505,17 +507,19 @@ void runDirPool(ScanCtx &ctx, int threads, const DirProcessor &process) {
 }
 
 void scanWebdavTree(const webdav::Url &base, const std::vector<DirTask> &starts,
-                    int root_id, Progress *progress, bool only_new = false) {
+                    int root_id,
+                    std::optional<std::reference_wrapper<Progress>> progress,
+                    bool only_new = false) {
   webdav::Client client(base);
   repo::ScanRootRepo root_repo(config::get().db_path.string());
   auto root_opt = root_repo.byId(root_id);
-  const repo::ScanRoot *root = root_opt ? &*root_opt : nullptr;
+  const std::optional<repo::ScanRoot> &root = root_opt;
 
   ScanRootProgress local_rp;
   ScanRootProgress &rp =
-      (progress != nullptr && root_id >= 1 &&
-       static_cast<std::size_t>(root_id) <= progress->roots.size())
-          ? progress->roots[root_id - 1]
+      (progress.has_value() && root_id >= 1 &&
+       static_cast<std::size_t>(root_id) <= progress->get().roots.size())
+          ? progress->get().roots[root_id - 1]
           : local_rp;
 
   ScanCtx ctx;
@@ -703,7 +707,7 @@ void scanWebdavRoot(const repo::ScanRoot &sr, Progress &progress) {
   try {
     const webdav::Url base = webdav::resolveCredentials(sr.path);
     const std::string start = base.path.empty() ? "/" : base.path;
-    scanWebdavTree(base, {DirTask{start, "", false}}, sr.id, &progress);
+    scanWebdavTree(base, {DirTask{start, "", false}}, sr.id, std::ref(progress));
   } catch (const std::exception &e) {
     std::cerr << "[scanner] scanWebdavRoot exception: " << e.what()
               << std::endl;
@@ -719,7 +723,7 @@ void scanWebdavDir(int root_id, const std::string &url) {
     if (!webdav::parseUrl(url, target)) {
       return;
     }
-    scanWebdavTree(base, {DirTask{target.path, "", false}}, root_id, nullptr);
+    scanWebdavTree(base, {DirTask{target.path, "", false}}, root_id, std::nullopt);
   } catch (const std::exception &e) {
     std::cerr << "[scanner] scanWebdavDir exception: " << e.what() << std::endl;
   }
@@ -730,16 +734,17 @@ void scanRoot(const repo::ScanRoot &sr, Progress &progress) {
     scanWebdavRoot(sr, progress);
     return;
   }
-  scanLocalTree(sr, {}, &progress);
+  scanLocalTree(sr, {}, std::ref(progress));
 }
 
 void scanLocalTree(const repo::ScanRoot &sr, const std::vector<DirTask> &starts,
-                   Progress *progress, bool only_new) {
+                   std::optional<std::reference_wrapper<Progress>> progress,
+                   bool only_new) {
   ScanRootProgress local_rp;
   ScanRootProgress &rp =
-      (progress != nullptr && sr.id >= 1 &&
-       static_cast<std::size_t>(sr.id) <= progress->roots.size())
-          ? progress->roots[sr.id - 1]
+      (progress.has_value() && sr.id >= 1 &&
+       static_cast<std::size_t>(sr.id) <= progress->get().roots.size())
+          ? progress->get().roots[sr.id - 1]
           : local_rp;
   rp.scanning = true;
   try {
@@ -976,7 +981,7 @@ void scanLocalFile(int root_id, const fs::path &file) {
     SQLite::Database &db = db::conn(config::get().db_path.string());
     repo::ScanRootRepo root_repo(config::get().db_path.string());
     auto root_opt = root_repo.byId(root_id);
-    const repo::ScanRoot *root = root_opt ? &*root_opt : nullptr;
+    const std::optional<repo::ScanRoot> &root = root_opt;
     const std::string vpath =
         root ? storage::toVirtual(*root, path_str) : path_str;
     SQLite::Statement check(db, schema::sql::kTrackByPath);
@@ -1029,7 +1034,7 @@ void scanWebdavFile(int root_id, const std::string &url) {
     SQLite::Database &db = db::conn(config::get().db_path.string());
     repo::ScanRootRepo root_repo(config::get().db_path.string());
     auto root_opt = root_repo.byId(root_id);
-    const repo::ScanRoot *root = root_opt ? &*root_opt : nullptr;
+    const std::optional<repo::ScanRoot> &root = root_opt;
     const std::string vpath = root ? storage::toVirtual(*root, url) : url;
     SQLite::Statement check(db, schema::sql::kTrackByPath);
     check.bind(1, vpath);
@@ -1118,7 +1123,7 @@ void scanDir(int root_id, const std::string &dir_path) {
     if (!root_opt) {
       return;
     }
-    scanLocalTree(*root_opt, {DirTask{dir.string(), "", false, 0, 0}}, nullptr);
+    scanLocalTree(*root_opt, {DirTask{dir.string(), "", false, 0, 0}}, std::nullopt);
   } catch (const std::exception &e) {
     std::cerr << "[scanner] scanDir exception: " << e.what() << std::endl;
   }
@@ -1164,7 +1169,7 @@ void scanDirBatch(int root_id, const std::vector<std::string> &paths) {
           starts.push_back(DirTask{p, "", true, size, mtime});
         }
       }
-      scanWebdavTree(base, starts, root_id, nullptr, true);
+      scanWebdavTree(base, starts, root_id, std::nullopt, true);
       return;
     }
 
@@ -1181,7 +1186,7 @@ void scanDirBatch(int root_id, const std::vector<std::string> &paths) {
         starts.push_back(DirTask{canonical_path.string(), "", false});
       }
     }
-    scanLocalTree(root, starts, nullptr, true);
+    scanLocalTree(root, starts, std::nullopt, true);
   } catch (const std::exception &e) {
     std::cerr << "[scanner] scanDirBatch exception: " << e.what() << std::endl;
   }

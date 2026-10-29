@@ -71,7 +71,7 @@ public:
   bool remove(int id);
 
 private:
-  SQLite::Database *pdb_ = nullptr;
+  SQLite::Database &pdb_;
 };
 
 class TrackRepo {
@@ -92,7 +92,7 @@ public:
   bool remove(int id);
 
 private:
-  SQLite::Database *pdb_ = nullptr;
+  SQLite::Database &pdb_;
 };
 
 class AlbumRepo {
@@ -103,7 +103,7 @@ public:
   std::vector<int> artistIdsByAlbumId(int album_id);
 
 private:
-  SQLite::Database *pdb_ = nullptr;
+  SQLite::Database &pdb_;
 };
 
 class ArtistRepo {
@@ -112,7 +112,7 @@ public:
   std::optional<Artist> byId(int id);
 
 private:
-  SQLite::Database *pdb_ = nullptr;
+  SQLite::Database &pdb_;
 };
 
 } // namespace repo

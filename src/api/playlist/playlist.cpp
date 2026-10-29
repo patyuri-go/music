@@ -281,19 +281,16 @@ bool rename(const std::string &id, const std::string &name) {
   return saveLocked(it->second);
 }
 
-bool addPath(const std::string &id, const std::string &path, std::string *err) {
+bool addPath(const std::string &id, const std::string &path,
+             std::string &err) {
   std::lock_guard<std::mutex> lock(g_mutex);
   const auto it = g_playlists.find(id);
   if (it == g_playlists.end()) {
-    if (err) {
-      *err = "playlist not found";
-    }
+    err = "playlist not found";
     return false;
   }
   if (path.empty()) {
-    if (err) {
-      *err = "empty path";
-    }
+    err = "empty path";
     return false;
   }
   Song s;
@@ -305,13 +302,11 @@ bool addPath(const std::string &id, const std::string &path, std::string *err) {
   return true;
 }
 
-bool addTrack(const std::string &id, int track_id, std::string *err) {
+bool addTrack(const std::string &id, int track_id, std::string &err) {
   repo::TrackRepo tr(config::get().db_path.string());
   auto track = tr.byId(track_id);
   if (!track) {
-    if (err) {
-      *err = "track not found";
-    }
+    err = "track not found";
     return false;
   }
   return addPath(id, track->path, err);

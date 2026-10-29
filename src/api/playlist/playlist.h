@@ -53,8 +53,9 @@ bool get(const std::string &id, Playlist &out);
 Playlist create(const std::string &name);
 bool remove(const std::string &id);
 bool rename(const std::string &id, const std::string &name);
-bool addPath(const std::string &id, const std::string &path, std::string *err);
-bool addTrack(const std::string &id, int track_id, std::string *err);
+bool addPath(const std::string &id, const std::string &path,
+             std::string &err);
+bool addTrack(const std::string &id, int track_id, std::string &err);
 bool removeAt(const std::string &id, int index);
 // 移除歌单中所有匹配该 track_id 的曲目（不存在返回 false）。
 bool removeTrack(const std::string &id, int track_id);

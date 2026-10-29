@@ -10,6 +10,7 @@
 #include "http_util.h"
 #include "image_cache.h"
 #include "jellyfin.h"
+#include "media_library/library_runtime.h"
 #include "metadata.h"
 #include "api/webdav/webdav.h"
 #include "schema.h"
@@ -413,6 +414,15 @@ crow::response browseDir(int root_id, const std::string &rel_path) {
   } catch (const std::exception &e) {
     return jsonResponse(500, "{\"erro\":true}");
   }
+}
+
+std::string media_library_lower(const std::string &text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const char c : text) {
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  return out;
 }
 
 std::string artistKeyOf(const std::vector<std::string> &names) {
@@ -824,8 +834,17 @@ int main(int argc, char *argv[]) {
   cache_options.gc_interval_seconds = cfg.image_cache.gc_interval_seconds;
   cache_options.revalidate_seconds = cfg.image_cache.revalidate_seconds;
   std::string cache_error;
-  if (!image_cache::init(cache_options, &cache_error)) {
+  if (!image_cache::init(cache_options, cache_error)) {
     std::cerr << "[image_cache] disabled: " << cache_error << std::endl;
+  }
+
+  // 主服务与 Jellyfin 兼容层共用同一个 Library 对象。
+  try {
+    media_library::initialize_library("local-main", cfg.jellyfin_server_name,
+                                      cfg.db_path.string());
+  } catch (const std::exception &e) {
+    std::cerr << "[fatal] 媒体库初始化失败: " << e.what() << std::endl;
+    return 1;
   }
 
   crow::SimpleApp app;
@@ -869,14 +888,13 @@ int main(int argc, char *argv[]) {
     if (!result) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    repo::TrackRepo track_repo(config::get().db_path.string());
-    auto genres = track_repo.genresByTrackId(id);
-    if (!genres.empty()) {
-      SQLite::Statement q(db::conn(config::get().db_path.string()),
-                          "SELECT name FROM genre WHERE id = ?");
-      q.bind(1, genres[0]);
-      if (q.executeStep()) {
-        (*result)["genre"] = std::string(q.getColumn(0).getText());
+    auto &library = media_library::library();
+    const auto ref =
+        library.ref_for_compat(media_library::EntityType::Track, id);
+    if (ref) {
+      const auto track = library.get_track(*ref, {});
+      if (track.ok() && !track.value().genres.empty()) {
+        (*result)["genre"] = track.value().genres.front();
       }
     }
     return jsonResponse(200, result->dump());
@@ -1049,18 +1067,31 @@ int main(int argc, char *argv[]) {
   });
 
   CROW_ROUTE(app, "/api/album-artists")([] {
-    SQLite::Database &db = db::conn(config::get().db_path.string());
-    SQLite::Statement q(
-        db,
-        "SELECT a.id, a.name, COUNT(DISTINCT aa.album_id) AS album_count "
-        "FROM artist a JOIN album_artist aa ON aa.artist_id = a.id "
-        "GROUP BY a.id ORDER BY a.name");
+    const auto snap = media_library::library().snapshot();
+    struct Row {
+      int id = 0;
+      std::string name;
+      int album_count = 0;
+    };
+    std::vector<Row> rows;
+    for (std::size_t i = 0; i < snap.artists.size(); ++i) {
+      const int internal_id = snap.artist_internal_ids[i];
+      const auto it = snap.artist_album_count.find(internal_id);
+      const int count = it == snap.artist_album_count.end() ? 0 : it->second;
+      if (count <= 0) {
+        continue;
+      }
+      rows.push_back(Row{internal_id, snap.artists[i].name, count});
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row &a, const Row &b) { return a.name < b.name; });
+
     crow::json::wvalue out(crow::json::type::List);
     int i = 0;
-    while (q.executeStep()) {
-      out[i]["id"] = q.getColumn(0).getInt();
-      out[i]["name"] = std::string(q.getColumn(1).getText());
-      out[i]["album_count"] = q.getColumn(2).getInt();
+    for (const auto &row : rows) {
+      out[i]["id"] = row.id;
+      out[i]["name"] = row.name;
+      out[i]["album_count"] = row.album_count;
       ++i;
     }
     return jsonResponse(200, out.dump());
@@ -1074,137 +1105,179 @@ int main(int argc, char *argv[]) {
     const auto notSpace = [](unsigned char c) { return !std::isspace(c); };
     q.erase(q.begin(), std::find_if(q.begin(), q.end(), notSpace));
     q.erase(std::find_if(q.rbegin(), q.rend(), notSpace).base(), q.end());
-    std::string ql = q;
-    for (char &c : ql) {
-      if (c >= 'A' && c <= 'Z') {
-        c = static_cast<char>(c - 'A' + 'a');
-      }
-    }
 
     crow::json::wvalue out;
     crow::json::wvalue::list empty_artists;
-    if (ql.empty()) {
+    if (q.empty()) {
       out["artists"] = crow::json::wvalue(empty_artists);
       return jsonResponse(200, out.dump());
     }
-    const std::string like = "%" + ql + "%";
-    SQLite::Database &db = db::conn(config::get().db_path.string());
 
-    std::set<int> matched_artists;
-    {
-      SQLite::Statement s(
-          db,
-          "SELECT DISTINCT a.id FROM artist a "
-          "JOIN album_artist aa ON aa.artist_id = a.id "
-          "WHERE lower(a.name) LIKE ?");
-      s.bind(1, like);
-      while (s.executeStep()) {
-        matched_artists.insert(s.getColumn(0).getInt());
-      }
+    auto &library = media_library::library();
+    const auto snap = library.snapshot();
+    const std::string needle = media_library_lower(q);
+
+    std::unordered_map<int, std::string> artist_names;
+    for (std::size_t i = 0; i < snap.artists.size(); ++i) {
+      artist_names[snap.artist_internal_ids[i]] = snap.artists[i].name;
     }
 
+    std::unordered_map<int, std::size_t> album_index;
+    for (std::size_t i = 0; i < snap.albums.size(); ++i) {
+      album_index[snap.album_internal_ids[i]] = i;
+    }
+
+    // 专辑内部 ID -> 按碟号/曲目号排序的曲目下标
+    std::map<int, std::vector<std::size_t>> album_tracks;
+    for (std::size_t i = 0; i < snap.tracks.size(); ++i) {
+      const auto &track = snap.tracks[i];
+      if (!track.album) {
+        continue;
+      }
+      const auto album_id = library.internal_id_of(track.album->ref);
+      if (!album_id) {
+        continue;
+      }
+      album_tracks[*album_id].push_back(i);
+    }
+    for (auto &entry : album_tracks) {
+      std::stable_sort(entry.second.begin(), entry.second.end(),
+                       [&snap](std::size_t a, std::size_t b) {
+                         const auto &left = snap.tracks[a];
+                         const auto &right = snap.tracks[b];
+                         const int ad = left.disc_no.value_or(0);
+                         const int bd = right.disc_no.value_or(0);
+                         if (ad != bd) {
+                           return ad < bd;
+                         }
+                         const int at = left.track_no.value_or(0);
+                         const int bt = right.track_no.value_or(0);
+                         if (at != bt) {
+                           return at < bt;
+                         }
+                         return left.title < right.title;
+                       });
+    }
+
+    // 命中的专辑：专辑名或其中曲目名包含关键词
     std::set<int> album_ids;
-    {
-      SQLite::Statement s(db,
-                          "SELECT id FROM album "
-                          "WHERE name <> '' AND lower(name) LIKE ?");
-      s.bind(1, like);
-      while (s.executeStep()) {
-        album_ids.insert(s.getColumn(0).getInt());
+    for (std::size_t i = 0; i < snap.albums.size(); ++i) {
+      const auto &album = snap.albums[i];
+      const int album_id = snap.album_internal_ids[i];
+      if (!album.title.empty() &&
+          media_library_lower(album.title).find(needle) != std::string::npos) {
+        album_ids.insert(album_id);
+        continue;
+      }
+      const auto it = album_tracks.find(album_id);
+      if (it == album_tracks.end()) {
+        continue;
+      }
+      for (const std::size_t index : it->second) {
+        if (media_library_lower(snap.tracks[index].title).find(needle) !=
+            std::string::npos) {
+          album_ids.insert(album_id);
+          break;
+        }
       }
     }
-    {
-      SQLite::Statement s(db,
-                          "SELECT DISTINCT album_id FROM track "
-                          "WHERE album_id IS NOT NULL AND lower(title) LIKE ?");
-      s.bind(1, like);
-      while (s.executeStep()) {
-        album_ids.insert(s.getColumn(0).getInt());
+
+    // 命中的艺术家：名称包含关键词且至少有一张专辑
+    std::set<int> matched_artists;
+    for (std::size_t i = 0; i < snap.artists.size(); ++i) {
+      const int artist_id = snap.artist_internal_ids[i];
+      const auto count = snap.artist_album_count.find(artist_id);
+      if (count == snap.artist_album_count.end() || count->second <= 0) {
+        continue;
+      }
+      if (media_library_lower(snap.artists[i].name).find(needle) !=
+          std::string::npos) {
+        matched_artists.insert(artist_id);
       }
     }
 
     std::map<int, std::set<int>> by_artist;
-    for (const int aid : album_ids) {
-      SQLite::Statement s(db,
-                          "SELECT artist_id FROM album_artist "
-                          "WHERE album_id = ? ORDER BY position");
-      s.bind(1, aid);
+    for (const int album_id : album_ids) {
+      const auto index = album_index.find(album_id);
+      if (index == album_index.end()) {
+        continue;
+      }
       bool any = false;
-      while (s.executeStep()) {
-        by_artist[s.getColumn(0).getInt()].insert(aid);
-        any = true;
+      for (const auto &link : snap.albums[index->second].artists) {
+        if (const auto artist_id = library.internal_id_of(link.ref)) {
+          by_artist[*artist_id].insert(album_id);
+          any = true;
+        }
       }
       if (!any) {
-        by_artist[0].insert(aid);
+        by_artist[0].insert(album_id);
       }
     }
-    for (const int aid : matched_artists) {
-      SQLite::Statement s(db,
-                          "SELECT album_id FROM album_artist WHERE artist_id = ?");
-      s.bind(1, aid);
-      while (s.executeStep()) {
-        by_artist[aid].insert(s.getColumn(0).getInt());
+    for (const int artist_id : matched_artists) {
+      for (std::size_t i = 0; i < snap.albums.size(); ++i) {
+        const int album_id = snap.album_internal_ids[i];
+        for (const auto &link : snap.albums[i].artists) {
+          const auto linked = library.internal_id_of(link.ref);
+          if (linked && *linked == artist_id) {
+            by_artist[artist_id].insert(album_id);
+            break;
+          }
+        }
       }
     }
-
-    const auto artistNameOf = [&](int aid) -> std::string {
-      if (aid == 0) {
-        return "(No album artist)";
-      }
-      SQLite::Statement s(db, "SELECT name FROM artist WHERE id = ?");
-      s.bind(1, aid);
-      if (s.executeStep()) {
-        return std::string(s.getColumn(0).getText());
-      }
-      return std::string();
-    };
-    const auto albumInfoOf = [&](int alid, std::string &name, int &year) {
-      SQLite::Statement s(db, "SELECT name, year FROM album WHERE id = ?");
-      s.bind(1, alid);
-      if (s.executeStep()) {
-        name = std::string(s.getColumn(0).getText());
-        year = s.getColumn(1).getInt();
-      }
-    };
 
     crow::json::wvalue::list artists_json;
     for (const auto &kv : by_artist) {
       crow::json::wvalue aj;
       aj["id"] = kv.first;
-      aj["name"] = artistNameOf(kv.first);
+      if (kv.first == 0) {
+        aj["name"] = std::string("(No album artist)");
+      } else {
+        const auto name = artist_names.find(kv.first);
+        aj["name"] = name == artist_names.end() ? std::string() : name->second;
+      }
 
       std::vector<int> albums(kv.second.begin(), kv.second.end());
       std::sort(albums.begin(), albums.end(), [&](int x, int y) {
-        std::string nx;
-        std::string ny;
-        int yx = 0;
-        int yy = 0;
-        albumInfoOf(x, nx, yx);
-        albumInfoOf(y, ny, yy);
+        const auto xi = album_index.find(x);
+        const auto yi = album_index.find(y);
+        const std::string nx =
+            xi == album_index.end() ? std::string()
+                                    : snap.albums[xi->second].title;
+        const std::string ny =
+            yi == album_index.end() ? std::string()
+                                    : snap.albums[yi->second].title;
         return nx < ny;
       });
+
       crow::json::wvalue::list albums_json;
-      for (const int alid : albums) {
-        std::string name;
-        int year = 0;
-        albumInfoOf(alid, name, year);
+      for (const int album_id : albums) {
+        const auto index = album_index.find(album_id);
+        if (index == album_index.end()) {
+          continue;
+        }
+        const auto &album = snap.albums[index->second];
         crow::json::wvalue alj;
-        alj["id"] = alid;
-        alj["name"] = name;
-        alj["year"] = year;
+        alj["id"] = album_id;
+        alj["name"] = album.title;
+        alj["year"] = album.year.value_or(0);
+
         crow::json::wvalue::list tracks_json;
-        SQLite::Statement ts(
-            db,
-            "SELECT id, title, track_no, duration_ms FROM track "
-            "WHERE album_id = ? ORDER BY disc_no, track_no, title");
-        ts.bind(1, alid);
-        while (ts.executeStep()) {
-          crow::json::wvalue tj;
-          tj["id"] = ts.getColumn(0).getInt();
-          tj["title"] = std::string(ts.getColumn(1).getText());
-          tj["track_no"] = ts.getColumn(2).getInt();
-          tj["duration_ms"] = ts.getColumn(3).getInt();
-          tracks_json.push_back(std::move(tj));
+        const auto it = album_tracks.find(album_id);
+        if (it != album_tracks.end()) {
+          for (const std::size_t index : it->second) {
+            const auto &track = snap.tracks[index];
+            const auto track_id = library.internal_id_of(track.ref);
+            if (!track_id) {
+              continue;
+            }
+            crow::json::wvalue tj;
+            tj["id"] = *track_id;
+            tj["title"] = track.title;
+            tj["track_no"] = track.track_no.value_or(0);
+            tj["duration_ms"] = track.duration_ms.value_or(0);
+            tracks_json.push_back(std::move(tj));
+          }
         }
         alj["tracks"] = crow::json::wvalue(tracks_json);
         albums_json.push_back(std::move(alj));
@@ -1282,10 +1355,9 @@ int main(int argc, char *argv[]) {
         std::string err;
         bool ok = false;
         if (json.has("trackId")) {
-          ok = playlist::addTrack(id, static_cast<int>(json["trackId"].i()),
-                                  &err);
+          ok = playlist::addTrack(id, static_cast<int>(json["trackId"].i()), err);
         } else if (json.has("path")) {
-          ok = playlist::addPath(id, std::string(json["path"].s()), &err);
+          ok = playlist::addPath(id, std::string(json["path"].s()), err);
         } else {
           err = "missing path or trackId";
         }
@@ -1465,40 +1537,57 @@ int main(int argc, char *argv[]) {
   });
 
   CROW_ROUTE(app, "/api/recent")([] {
-    repo::TrackRepo repo(config::get().db_path.string());
-    auto tracks = repo.recentPlays(config::get().page_size);
+    const auto snap = media_library::library().snapshot();
     crow::json::wvalue out(crow::json::type::List);
     int i = 0;
-    for (const auto &t : tracks) {
-      out[i] = Service().trackById(t.id).value_or(crow::json::wvalue());
+    for (const int internal_id : snap.recent_play_track_ids) {
+      auto item = Service().trackById(internal_id);
+      if (!item) {
+        continue;
+      }
+      out[i] = std::move(*item);
       ++i;
+      if (config::get().page_size > 0 &&
+          i >= config::get().page_size) {
+        break;
+      }
     }
     return jsonResponse(200, out.dump());
   });
 
   CROW_ROUTE(app, "/api/album/<int>/cover")([](int id) {
-    repo::AlbumRepo repo(config::get().db_path.string());
-    auto album = repo.byId(id);
-    if (!album || album->cover_path.empty()) {
+    auto &library = media_library::library();
+    const auto ref =
+        library.ref_for_compat(media_library::EntityType::Album, id);
+    if (!ref) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    const std::string cover_real = storage::resolve(album->cover_path);
+    const auto cover_path = library.artwork_path(*ref);
+    if (!cover_path || cover_path->empty()) {
+      return jsonResponse(404, "{\"erro\":true}");
+    }
+    const std::string cover_real = storage::resolve(*cover_path);
     if (!webdav::isWebdavUrl(cover_real)) {
       fs::path cover(cover_real);
       if (!fs::exists(cover) || !isUnderAnyRoot(cover)) {
         return jsonResponse(404, "{\"erro\":true}");
       }
     }
-    return http_util::serveImage(album->cover_path);
+    return http_util::serveImage(*cover_path);
   });
 
   CROW_ROUTE(app, "/api/track/<int>/file")([](const crow::request &req, int id) {
-    repo::TrackRepo repo(config::get().db_path.string());
-    auto track = repo.byId(id);
-    if (!track) {
+    auto &library = media_library::library();
+    const auto ref =
+        library.ref_for_compat(media_library::EntityType::Track, id);
+    if (!ref) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    const std::string track_real = storage::resolve(track->path);
+    const auto source = library.resolve_playback(*ref, {});
+    if (!source.ok() || source.value().internal_locator.empty()) {
+      return jsonResponse(404, "{\"erro\":true}");
+    }
+    const std::string track_real = source.value().internal_locator;
     if (webdav::isWebdavUrl(track_real)) {
       return http_util::serveResource(track_real,
                                       req.get_header_value("Range"));
@@ -1606,12 +1695,17 @@ int main(int argc, char *argv[]) {
   });
 
   CROW_ROUTE(app, "/api/track/<int>/file-meta")([](int id) {
-    repo::TrackRepo repo(config::get().db_path.string());
-    auto track = repo.byId(id);
-    if (!track) {
+    auto &library = media_library::library();
+    const auto ref =
+        library.ref_for_compat(media_library::EntityType::Track, id);
+    if (!ref) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    const std::string track_real = storage::resolve(track->path);
+    const auto source = library.resolve_playback(*ref, {});
+    if (!source.ok() || source.value().internal_locator.empty()) {
+      return jsonResponse(404, "{\"erro\":true}");
+    }
+    const std::string track_real = source.value().internal_locator;
     if (!webdav::isWebdavUrl(track_real) && !fs::exists(track_real)) {
       return jsonResponse(404, "{\"erro\":true}");
     }
@@ -1649,19 +1743,20 @@ int main(int argc, char *argv[]) {
   });
 
   CROW_ROUTE(app, "/api/track/<int>/lyrics")([](int id) {
-    repo::TrackRepo repo(config::get().db_path.string());
-    if (!repo.byId(id)) {
+    auto &library = media_library::library();
+    const auto ref =
+        library.ref_for_compat(media_library::EntityType::Track, id);
+    if (!ref) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    SQLite::Database &db = db::conn(config::get().db_path.string());
     crow::json::wvalue out;
     out["text"] = "";
     out["synced"] = false;
-    SQLite::Statement q(db, schema::sql::kTrackLyricsByTrackId);
-    q.bind(1, id);
-    if (q.executeStep()) {
-      out["text"] = std::string(q.getColumn(0).getText());
-      out["synced"] = q.getColumn(1).getInt() != 0;
+    const auto lyrics = library.get_lyrics(*ref, {});
+    if (lyrics.ok()) {
+      const auto &value = lyrics.value();
+      out["text"] = value.plain_text.value_or(std::string());
+      out["synced"] = value.mode != media_library::LyricsMode::Unsynced;
     }
     return jsonResponse(200, out.dump());
   });
@@ -2208,6 +2303,7 @@ int main(int argc, char *argv[]) {
   if (jellyfin_thread.joinable()) {
     jellyfin_thread.join();
   }
+  media_library::shutdown_library();
   image_cache::shutdown();
   return 0;
 }
