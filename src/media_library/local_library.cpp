@@ -5,6 +5,8 @@
 #include "schema.h"
 #include "storage.h"
 
+#include "api/webdav/webdav.h"
+
 #include <SQLiteCpp/Database.h>
 #include <SQLiteCpp/Statement.h>
 
@@ -479,13 +481,17 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
 
   PlaybackSource source;
   source.track = ref;
-  source.kind = PlaybackKind::LocalFile;
+  // 本地库的扫描根可以包含 WebDAV 根：kind 必须描述真实字节来源，
+  // 否则下游会把远端 URL 当成本地文件去打开。
+  source.internal_locator = storage::resolve(row->path);
+  source.kind = webdav::isWebdavUrl(source.internal_locator)
+                    ? PlaybackKind::WebDav
+                    : PlaybackKind::LocalFile;
   source.mime_type = mime_for(row->format);
   source.content_length = row->size_bytes;
   source.range_supported = true;
   source.cacheable = false;
   source.access_mode = AccessMode::Proxy;
-  source.internal_locator = storage::resolve(row->path);
   return Result<PlaybackSource>::success(std::move(source));
 }
 

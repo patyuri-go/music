@@ -98,6 +98,9 @@ struct Error {
   std::string capability;
   bool retryable = false;
   std::optional<std::int64_t> retry_after;
+  // 限制类失败（版权、地区、VIP、音质）与故障类失败是两件事：前者换源也没用，
+  // 必须让门面能翻译成用户可读原因。只在限制类失败里填写。
+  std::optional<RestrictionCode> restriction;
   std::string details;
   std::string internal_cause;
 

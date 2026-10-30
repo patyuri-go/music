@@ -4,6 +4,7 @@
 #include "http_util.h"
 #include "media_library/library_directory.h"
 #include "media_library/media_runtime.h"
+#include "stream_http.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -19,61 +20,11 @@ namespace {
 using namespace media_library;
 
 // ---------------------------------------------------------------------------
-// 错误到 HTTP 的映射。只有这里允许出现状态码与字符串。
+// 错误到 HTTP 的映射由 stream_http 统一提供：状态码与响应体全进程只有一份。
 // ---------------------------------------------------------------------------
 
-int status_of(ErrorCode code) noexcept {
-  switch (code) {
-  case ErrorCode::InvalidRequest:
-    return 400;
-  case ErrorCode::AuthRequired:
-    return 401;
-  case ErrorCode::PermissionDenied:
-    return 403;
-  case ErrorCode::NotFound:
-    return 404;
-  case ErrorCode::Conflict:
-    return 409;
-  case ErrorCode::PlaybackExpired:
-    return 410;
-  case ErrorCode::RateLimited:
-    return 429;
-  case ErrorCode::Unsupported:
-    return 501;
-  case ErrorCode::ProviderUnavailable:
-    return 503;
-  case ErrorCode::Timeout:
-    return 504;
-  case ErrorCode::Cancelled:
-    return 499;
-  case ErrorCode::Internal:
-    return 500;
-  }
-  return 500;
-}
-
-crow::json::wvalue error_json(const Error &error) {
-  crow::json::wvalue body;
-  crow::json::wvalue detail;
-  detail["code"] = std::string(error_code_name(error.code));
-  detail["message"] = error.message;
-  if (!error.library_id.empty()) {
-    detail["library_id"] = error.library_id;
-  }
-  if (!error.capability.empty()) {
-    detail["capability"] = error.capability;
-  }
-  detail["retryable"] = error.retryable;
-  if (error.retry_after.has_value()) {
-    detail["retry_after"] = *error.retry_after;
-  }
-  // internal_cause 与 details 是诊断字段，绝不出现在响应里。
-  body["error"] = std::move(detail);
-  return body;
-}
-
 crow::response fail(const Error &error) {
-  return http_util::jsonResponse(status_of(error.code), error_json(error).dump());
+  return stream_http::error_response(error);
 }
 
 crow::response invalid(const std::string &message) {
@@ -456,6 +407,30 @@ crow::json::wvalue routed_page_json(const RoutedPage<T> &page, Fn fn) {
   return out;
 }
 
+// 7.1 会话序列化：这里没有 locator，也没有 internal_locator 的任何形态。
+crow::json::wvalue session_json(const PlaybackSession &session) {
+  crow::json::wvalue summary;
+  summary["track"] = ref_json(session.stream.value.track);
+  summary["mime_type"] = session.stream.value.mime_type;
+  summary["bitrate_kbps"] = session.stream.value.bitrate_kbps;
+  summary["duration_ms"] = session.stream.value.duration_ms;
+  summary["seekable"] = session.stream.value.seekable;
+
+  crow::json::wvalue stream;
+  stream["value"] = std::move(summary);
+  stream["origin"] = origin_json(session.stream.origin);
+
+  crow::json::wvalue out;
+  out["session_id"] = session.session_id;
+  out["started_at_ms"] = session.started_at_ms;
+  out["expires_at_ms"] = session.expires_at_ms;
+  out["track"] = sourced_json(session.track, track_json);
+  out["stream"] = std::move(stream);
+  out["stream_url"] =
+      "/api/v1/playback/" + session.session_id + "/stream";
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // 请求参数
 // ---------------------------------------------------------------------------
@@ -737,7 +712,15 @@ crow::response track(const crow::request &req, const std::string &ref_text) {
 }
 
 crow::response track_stream(const crow::request &req, const std::string &ref) {
-  return track_aspect(req, ref, "stream");
+  const std::optional<SourceRef> parsed = parse_ref_param(ref);
+  if (!parsed.has_value()) {
+    return bad_ref();
+  }
+  if (parsed->entity_type != EntityType::Track) {
+    return invalid("expected a track reference");
+  }
+  // 出字节：open_playback -> open_stream -> Range 输出。locator 不出进程。
+  return stream_http::serve_track(req, *parsed, req.method == crow::HTTPMethod::HEAD);
 }
 
 crow::response track_lyrics(const crow::request &req, const std::string &ref) {
@@ -879,6 +862,83 @@ crow::response playlist(const crow::request &req, const std::string &ref_text) {
   }
   return http_util::jsonResponse(
       200, sourced_json(result.value(), playlist_json).dump());
+}
+
+// ---------------------------------------------------------------------------
+// 播放会话（7.1–7.4）。字节只从会话出；locator 不出进程。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::shared_ptr<PlaybackService> playback_or_null() {
+  return media_library::playback_service_ptr();
+}
+
+} // namespace
+
+crow::response playback_open(const crow::request &req,
+                             const std::string &ref_text) {
+  const std::shared_ptr<PlaybackService> service = playback_or_null();
+  if (service == nullptr) {
+    return unavailable();
+  }
+  const std::optional<SourceRef> ref = parse_ref_param(ref_text);
+  if (!ref.has_value()) {
+    return bad_ref();
+  }
+  if (ref->entity_type != EntityType::Track) {
+    return invalid("expected a track reference");
+  }
+  Result<PlaybackSession> session = service->open_playback(*ref, context_of(req));
+  if (!session.ok()) {
+    return fail(session.error());
+  }
+  return http_util::jsonResponse(201, session_json(session.value()).dump());
+}
+
+crow::response playback_session(const crow::request &,
+                                const std::string &session_id) {
+  const std::shared_ptr<PlaybackService> service = playback_or_null();
+  if (service == nullptr) {
+    return unavailable();
+  }
+  Result<PlaybackSession> session = service->session(session_id);
+  if (!session.ok()) {
+    return fail(session.error());
+  }
+  return http_util::jsonResponse(200, session_json(session.value()).dump());
+}
+
+crow::response playback_refresh(const crow::request &req,
+                                const std::string &session_id) {
+  const std::shared_ptr<PlaybackService> service = playback_or_null();
+  if (service == nullptr) {
+    return unavailable();
+  }
+  Result<PlaybackSession> session =
+      service->refresh(session_id, context_of(req));
+  if (!session.ok()) {
+    return fail(session.error());
+  }
+  return http_util::jsonResponse(200, session_json(session.value()).dump());
+}
+
+crow::response playback_close(const crow::request &,
+                              const std::string &session_id) {
+  const std::shared_ptr<PlaybackService> service = playback_or_null();
+  if (service == nullptr) {
+    return unavailable();
+  }
+  Status status = service->close(session_id);
+  if (!status.ok()) {
+    return fail(status.error());
+  }
+  return crow::response(204);
+}
+
+crow::response playback_stream(const crow::request &req,
+                               const std::string &session_id) {
+  return stream_http::serve_session(req, session_id, req.method == crow::HTTPMethod::HEAD);
 }
 
 } // namespace api_v1

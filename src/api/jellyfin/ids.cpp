@@ -27,6 +27,14 @@ bool isHex(const std::string &s) {
 
 } // namespace
 
+std::string itemId(const media_library::SourceRef &ref) {
+  return media_library::to_string(ref);
+}
+
+std::optional<media_library::SourceRef> parseItemId(std::string_view text) {
+  return media_library::parse_ref(text);
+}
+
 std::string makeId(int kind, int id) {
   char buffer[33];
   std::snprintf(buffer, sizeof(buffer), "%08x%024x",

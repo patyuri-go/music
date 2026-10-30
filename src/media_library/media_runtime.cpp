@@ -16,6 +16,7 @@ struct Runtime {
   std::shared_ptr<AggregatePriority> aggregate_priority;
   std::shared_ptr<Router> router;
   std::shared_ptr<MediaRouter> media_router;
+  std::shared_ptr<PlaybackService> playback;
 };
 
 std::mutex &mutex() {
@@ -66,6 +67,8 @@ void initialize_media_runtime(std::shared_ptr<Library> library,
   next.router = make_router(next.registry, next.links, next.aspect_priority,
                             next.aggregate_priority);
   next.media_router = make_media_router(next.router);
+  next.playback =
+      make_playback_service(next.media_router, make_system_clock());
 
   std::lock_guard<std::mutex> lock(mutex());
   state() = std::move(next);
@@ -91,6 +94,11 @@ std::shared_ptr<EntityLinkResolver> entity_links_ptr() noexcept {
   return state().links;
 }
 
+std::shared_ptr<PlaybackService> playback_service_ptr() noexcept {
+  std::lock_guard<std::mutex> lock(mutex());
+  return state().playback;
+}
+
 MediaRouter &media_router() {
   std::lock_guard<std::mutex> lock(mutex());
   if (state().media_router == nullptr) {
@@ -113,6 +121,14 @@ EntityLinkResolver &entity_links() {
     throw std::runtime_error("media_runtime 未初始化");
   }
   return *state().links;
+}
+
+PlaybackService &playback_service() {
+  std::lock_guard<std::mutex> lock(mutex());
+  if (state().playback == nullptr) {
+    throw std::runtime_error("media_runtime 未初始化");
+  }
+  return *state().playback;
 }
 
 void shutdown_media_runtime() noexcept {

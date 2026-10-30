@@ -12,6 +12,7 @@
 #include "jellyfin.h"
 #include "media_library/library_runtime.h"
 #include "media_library/media_runtime.h"
+#include "stream_http.h"
 #include "api/v1/v1.h"
 #include "metadata.h"
 #include "api/webdav/webdav.h"
@@ -902,10 +903,11 @@ int main(int argc, char *argv[]) {
                                                 std::string ref) {
     return api_v1::track(req, ref);
   });
-  CROW_ROUTE(app, "/api/v1/tracks/<string>/stream")([](const crow::request &req,
-                                                       std::string ref) {
-    return api_v1::track_stream(req, ref);
-  });
+  CROW_ROUTE(app, "/api/v1/tracks/<string>/stream")
+      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
+          [](const crow::request &req, std::string ref) {
+            return api_v1::track_stream(req, ref);
+          });
   CROW_ROUTE(app, "/api/v1/tracks/<string>/lyrics")([](const crow::request &req,
                                                        std::string ref) {
     return api_v1::track_lyrics(req, ref);
@@ -937,6 +939,35 @@ int main(int argc, char *argv[]) {
                                                    std::string ref) {
     return api_v1::playlist(req, ref);
   });
+
+  // ---- 播放会话：open / 查询 / 刷新 / 关闭 / 字节流 ----
+  CROW_ROUTE(app, "/api/v1/playback/<string>")
+      .methods("POST"_method)([](const crow::request &req, std::string ref) {
+        return api_v1::playback_open(req, ref);
+      });
+  CROW_ROUTE(app, "/api/v1/playback/<string>")([](const crow::request &req,
+                                                 std::string session_id) {
+    return api_v1::playback_session(req, session_id);
+  });
+  CROW_ROUTE(app, "/api/v1/playback/<string>")
+      .methods("DELETE"_method)([](const crow::request &req,
+                                   std::string session_id) {
+        return api_v1::playback_close(req, session_id);
+      });
+  CROW_ROUTE(app, "/api/v1/playback/<string>/refresh")
+      .methods("POST"_method)([](const crow::request &req,
+                                 std::string session_id) {
+        return api_v1::playback_refresh(req, session_id);
+      });
+  CROW_ROUTE(app, "/api/v1/playback/<string>/refresh")([](const crow::request &req,
+                                                         std::string session_id) {
+    return api_v1::playback_refresh(req, session_id);
+  });
+  CROW_ROUTE(app, "/api/v1/playback/<string>/stream")
+      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
+          [](const crow::request &req, std::string session_id) {
+            return api_v1::playback_stream(req, session_id);
+          });
 
   CROW_ROUTE(app, "/api/query")
       .methods("POST"_method)([](const crow::request &req) {
@@ -1646,28 +1677,19 @@ int main(int argc, char *argv[]) {
     return http_util::serveImage(*cover_path);
   });
 
-  CROW_ROUTE(app, "/api/track/<int>/file")([](const crow::request &req, int id) {
-    auto &library = media_library::library();
-    const auto ref =
-        library.ref_for_compat(media_library::EntityType::Track, id);
-    if (!ref) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    const auto source = library.resolve_playback(*ref, {});
-    if (!source.ok() || source.value().internal_locator.empty()) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    const std::string track_real = source.value().internal_locator;
-    if (webdav::isWebdavUrl(track_real)) {
-      return http_util::serveResource(track_real,
-                                      req.get_header_value("Range"));
-    }
-    fs::path track_path(track_real);
-    if (!fs::exists(track_path) || !isUnderAnyRoot(track_path)) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    return serveFile(track_path, req.get_header_value("Range"));
-  });
+  CROW_ROUTE(app, "/api/track/<int>/file")
+      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
+          [](const crow::request &req, int id) {
+            auto &library = media_library::library();
+            const auto ref =
+                library.ref_for_compat(media_library::EntityType::Track, id);
+            if (!ref) {
+              return jsonResponse(404, "{\"erro\":true}");
+            }
+            // 选源交给 MediaRouter（经 PlaybackService），locator 不再出现在 HTTP 层。
+            return stream_http::serve_track(
+                req, *ref, req.method == crow::HTTPMethod::HEAD);
+          });
 
   CROW_ROUTE(app, "/api/track/<int>/play")
       .methods("POST"_method)([](int id) {

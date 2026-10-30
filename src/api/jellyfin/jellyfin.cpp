@@ -11,7 +11,9 @@
 #include "api/playlist/playlist.h"
 #include "media_library/library_runtime.h"
 #include "media_library/local_library.h"
+#include "media_library/media_runtime.h"
 #include "media_library/snapshot.h"
+#include "stream_http.h"
 
 #include "crow/app.h"
 #include "crow/http_request.h"
@@ -45,28 +47,36 @@ constexpr const char *kVersion = "10.10.7";
 // Library 对象由 main() 创建；9000 与 5666 共用同一个实例。
 media_library::LocalLibrary &library() { return media_library::library(); }
 
-int compat_id_of(const media_library::SourceRef &ref) {
-  const auto internal = library().internal_id_of(ref);
-  return internal ? *internal : 0;
-}
+// 目录实体的对外 id 就是 SourceRef 的规范字符串（见 ids.h 的 itemId）。
+// 它不依赖数据库自增主键：重扫后不变，远端 provider 也能给出合法 id。
+using IdPair = std::pair<std::string, std::string>;
 
-std::vector<std::pair<std::string, int>> artist_pairs_of(
+std::vector<IdPair> artist_pairs_of(
     const std::vector<media_library::ArtistLink> &links) {
-  std::vector<std::pair<std::string, int>> out;
+  std::vector<IdPair> out;
+  out.reserve(links.size());
   for (const auto &link : links) {
-    out.emplace_back(link.name, compat_id_of(link.ref));
+    out.emplace_back(link.name, itemId(link.ref));
   }
   return out;
 }
 
-std::vector<std::pair<std::string, int>> album_artist_pairs_of(
+std::vector<IdPair> album_artist_pairs_of(
     const std::vector<media_library::AlbumArtistLink> &links) {
-  std::vector<std::pair<std::string, int>> out;
+  std::vector<IdPair> out;
+  out.reserve(links.size());
   for (const auto &link : links) {
-    out.emplace_back(link.name, compat_id_of(link.ref));
+    out.emplace_back(link.name, itemId(link.ref));
   }
   return out;
 }
+
+// 路径参数由 Crow 原样给出（未解码），解析前先做百分号解码。
+std::optional<media_library::SourceRef>
+parse_path_ref(const std::string &text) {
+  return parseItemId(http_util::urlDecode(text));
+}
+
 
 
 std::string lower(std::string s) {
@@ -319,25 +329,7 @@ crow::response respondItems(std::vector<Sortable> &items,
 
 // ------------------------------------------------- 快照到 Jellyfin DTO 的映射
 
-// 快照只携带统一领域模型；兼容层负责把 SourceRef 映射回对外 ID。
-std::vector<int> artist_compat_ids(
-    const std::vector<media_library::ArtistLink> &links) {
-  std::vector<int> out;
-  for (const auto &link : links) {
-    out.push_back(compat_id_of(link.ref));
-  }
-  return out;
-}
-
-std::vector<int> album_artist_compat_ids(
-    const std::vector<media_library::AlbumArtistLink> &links) {
-  std::vector<int> out;
-  for (const auto &link : links) {
-    out.push_back(compat_id_of(link.ref));
-  }
-  return out;
-}
-
+// 快照只携带统一领域模型；兼容层负责把 SourceRef 映射成对外 ID。
 std::vector<std::pair<std::string, int>> genre_pairs(
     const media_library::CatalogSnapshot &snap, int track_id) {
   std::vector<std::pair<std::string, int>> out;
@@ -372,7 +364,8 @@ Sortable itemForTrack(const media_library::CatalogSnapshot &snap,
   if (path_it != snap.track_paths.end()) {
     filePath = path_it->second;
   }
-  s.dto = trackItem(track, track_id, track.album ? compat_id_of(track.album->ref) : 0,
+  s.dto = trackItem(track, itemId(track.ref),
+                    track.album ? itemId(track.album->ref) : std::string(),
                     s.albumKey, filePath, trackArtists,
                     album_artist_pairs_of(track.album_artists),
                     genre_pairs(snap, track_id));
@@ -396,7 +389,8 @@ Sortable itemForAlbum(const media_library::CatalogSnapshot &snap,
   if (duration_it != snap.album_duration_ms.end()) {
     durationMs = duration_it->second;
   }
-  s.dto = albumItem(album, album_id, album_artist_pairs_of(album.artists), count,
+  s.dto = albumItem(album, itemId(album.ref),
+                    album_artist_pairs_of(album.artists), count,
                     album.artwork ? "1" : "", durationMs * 10000LL);
   return s;
 }
@@ -412,7 +406,8 @@ Sortable itemForArtist(const media_library::CatalogSnapshot &snap,
   if (it != snap.artist_album_count.end()) {
     count = it->second;
   }
-  s.dto = artistItem(artist, artist_id, count, artist.artwork ? "1" : "");
+  s.dto = artistItem(artist, itemId(artist.ref), count,
+                     artist.artwork ? "1" : "");
   return s;
 }
 
@@ -457,9 +452,14 @@ crow::json::wvalue playlistDto(const playlist::Playlist &p) {
   long long totalMs = 0;
   for (const auto &song : p.songs) {
     if (song.matched) {
-      ids.emplace_back(makeId(kKindTrack, song.track_id));
-      ++matched;
-      totalMs += song.duration_ms;
+      // playlist 子系统内部仍以库内 int id 存曲目；对外一律输出稳定 id。
+      const auto ref = library().ref_for_compat(
+          media_library::EntityType::Track, song.track_id);
+      if (ref) {
+        ids.emplace_back(itemId(*ref));
+        ++matched;
+        totalMs += song.duration_ms;
+      }
     }
   }
   crow::json::wvalue r;
@@ -616,9 +616,19 @@ crow::response handleItems(const crow::request &req) {
   const bool wantUnplayed = filters.find("IsUnplayed") != std::string::npos;
   const std::string nameStartsWith = lower(qs(req, "nameStartsWith"));
 
-  int pk = 0;
-  int pid = 0;
-  const bool hasParent = parseId(parent, pk, pid);
+  // 目录实体 id 是 SourceRef 规范串；genre / view 仍是非目录 id 形态。
+  const std::optional<media_library::SourceRef> parentRef =
+      parent.empty() ? std::nullopt : parseItemId(parent);
+  int genreParentId = 0;
+  {
+    int gk = 0;
+    int gid = 0;
+    if (parseId(parent, gk, gid) && gk == kKindGenre) {
+      genreParentId = gid;
+    }
+  }
+  const bool hasParent = parentRef.has_value();
+  const bool hasGenreParent = genreParentId != 0;
 
   const media_library::CatalogSnapshot snap = library().snapshot();
 
@@ -641,76 +651,121 @@ crow::response handleItems(const crow::request &req) {
     mode = Mode::Tracks;
     explicitMode = true;
   }
-  if (!explicitMode && hasParent) {
-    if (pk == kKindAlbum || pk == kKindGenre) {
+  if (!explicitMode) {
+    if (parentRef.has_value() &&
+        parentRef->entity_type == media_library::EntityType::Album) {
       mode = Mode::Tracks;
-    } else if (pk == kKindArtist) {
+    } else if (parentRef.has_value() &&
+               (parentRef->entity_type == media_library::EntityType::Artist ||
+                parentRef->entity_type ==
+                    media_library::EntityType::AlbumArtist)) {
       mode = Mode::Albums;
+    } else if (hasGenreParent) {
+      mode = Mode::Tracks;
     }
   }
 
-  const auto internal_of = [](const media_library::SourceRef &ref) {
-    const auto value = library().internal_id_of(ref);
-    return value ? *value : 0;
+  // artist / album_artist 是两种不同的引用：比较时显式转换，避免混用。
+  const auto as_artist = [](const media_library::SourceRef &ref) {
+    return ref.entity_type == media_library::EntityType::AlbumArtist
+               ? media_library::as_artist_ref(ref)
+               : ref;
   };
-  const auto has_artist = [&](const std::vector<media_library::ArtistLink> &links,
-                              int id) {
-    for (const auto &link : links) {
-      if (internal_of(link.ref) == id) {
-        return true;
-      }
-    }
-    return false;
+  const auto as_album_artist = [](const media_library::SourceRef &ref) {
+    return ref.entity_type == media_library::EntityType::Artist
+               ? media_library::as_album_artist_ref(ref)
+               : ref;
   };
-  const auto has_album_artist =
-      [&](const std::vector<media_library::AlbumArtistLink> &links, int id) {
+  const auto has_artist =
+      [&](const std::vector<media_library::ArtistLink> &links,
+          const std::vector<media_library::SourceRef> &refs) {
         for (const auto &link : links) {
-          if (internal_of(link.ref) == id) {
-            return true;
+          for (const auto &ref : refs) {
+            if (link.ref == as_artist(ref)) {
+              return true;
+            }
           }
         }
         return false;
       };
-  const auto parse_any = [](const std::vector<std::string> &values, int kind) {
+  const auto has_album_artist =
+      [&](const std::vector<media_library::AlbumArtistLink> &links,
+          const std::vector<media_library::SourceRef> &refs) {
+        for (const auto &link : links) {
+          for (const auto &ref : refs) {
+            if (link.ref == as_album_artist(ref)) {
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+  const auto parse_refs = [](const std::vector<std::string> &values,
+                             std::optional<media_library::EntityType> type) {
+    std::vector<media_library::SourceRef> out;
+    for (const auto &text : values) {
+      const auto ref = parseItemId(text);
+      if (!ref.has_value()) {
+        continue;
+      }
+      if (type.has_value() && ref->entity_type != *type) {
+        continue;
+      }
+      out.push_back(*ref);
+    }
+    return out;
+  };
+  const auto parse_genre_ids = [](const std::vector<std::string> &values) {
     std::vector<int> out;
     for (const auto &text : values) {
       int k = 0;
       int v = 0;
-      if (parseId(text, k, v) && k == kind) {
+      if (parseId(text, k, v) && k == kKindGenre) {
         out.push_back(v);
       }
     }
     return out;
   };
+  const auto contains_ref =
+      [](const std::vector<media_library::SourceRef> &refs,
+         const media_library::SourceRef &ref) {
+        return std::find(refs.begin(), refs.end(), ref) != refs.end();
+      };
   const auto contains_id = [](const std::vector<int> &ids, int id) {
     return std::find(ids.begin(), ids.end(), id) != ids.end();
   };
 
   std::vector<Sortable> items;
   if (mode == Mode::Tracks) {
-    const std::vector<int> album_ids = parse_any(wantAlbumIds, kKindAlbum);
-    const std::vector<int> artist_ids = parse_any(wantArtistIds, kKindArtist);
-    const std::vector<int> contrib_ids = parse_any(wantContribArtists, kKindArtist);
-    const std::vector<int> album_artist_ids =
-        parse_any(wantAlbumArtistIds, kKindArtist);
-    const std::vector<int> genre_ids = parse_any(wantGenreIds, kKindGenre);
+    const auto album_ids =
+        parse_refs(wantAlbumIds, media_library::EntityType::Album);
+    const auto artist_ids =
+        parse_refs(wantArtistIds, media_library::EntityType::Artist);
+    const auto contrib_ids =
+        parse_refs(wantContribArtists, media_library::EntityType::Artist);
+    const auto album_artist_ids = parse_refs(
+        wantAlbumArtistIds, media_library::EntityType::AlbumArtist);
+    const std::vector<int> genre_ids = parse_genre_ids(wantGenreIds);
     for (std::size_t i = 0; i < snap.tracks.size(); ++i) {
       const auto &t = snap.tracks[i];
       const int track_id = snap.track_internal_ids[i];
-      if (hasParent && pk == kKindAlbum) {
-        if (!t.album || internal_of(t.album->ref) != pid) {
+      if (hasParent &&
+          parentRef->entity_type == media_library::EntityType::Album) {
+        if (!t.album || !(t.album->ref == *parentRef)) {
           continue;
         }
-      } else if (hasParent && pk == kKindArtist) {
-        if (!has_artist(t.artists, pid)) {
+      } else if (hasParent && parentRef->entity_type ==
+                                  media_library::EntityType::Artist) {
+        if (!has_artist(t.artists, {*parentRef}) &&
+            !has_album_artist(t.album_artists, {*parentRef})) {
           continue;
         }
-      } else if (hasParent && pk == kKindGenre) {
+      } else if (hasGenreParent) {
         bool matched = false;
         const auto git = snap.track_genres.find(track_id);
         if (git != snap.track_genres.end()) {
           for (const auto &genre : git->second) {
-            if (genre.internal_id == pid) {
+            if (genre.internal_id == genreParentId) {
               matched = true;
               break;
             }
@@ -738,33 +793,19 @@ crow::response handleItems(const crow::request &req) {
         continue;
       }
       if (!album_ids.empty()) {
-        const int album_id = t.album ? internal_of(t.album->ref) : 0;
-        if (!contains_id(album_ids, album_id)) {
+        if (!t.album || !contains_ref(album_ids, t.album->ref)) {
           continue;
         }
       }
       if (!artist_ids.empty() || !contrib_ids.empty()) {
         const auto &list = artist_ids.empty() ? contrib_ids : artist_ids;
-        bool ok = false;
-        for (const int id : list) {
-          if (has_artist(t.artists, id) || has_album_artist(t.album_artists, id)) {
-            ok = true;
-            break;
-          }
-        }
-        if (!ok) {
+        if (!has_artist(t.artists, list) &&
+            !has_album_artist(t.album_artists, list)) {
           continue;
         }
       }
       if (!album_artist_ids.empty()) {
-        bool ok = false;
-        for (const int id : album_artist_ids) {
-          if (has_album_artist(t.album_artists, id)) {
-            ok = true;
-            break;
-          }
-        }
-        if (!ok) {
+        if (!has_album_artist(t.album_artists, album_artist_ids)) {
           continue;
         }
       }
@@ -802,13 +843,17 @@ crow::response handleItems(const crow::request &req) {
       items.push_back(itemForTrack(snap, i));
     }
   } else if (mode == Mode::Albums) {
-    const std::vector<int> artist_ids = parse_any(wantArtistIds, kKindArtist);
-    const std::vector<int> album_artist_ids =
-        parse_any(wantAlbumArtistIds, kKindArtist);
+    const auto artist_ids =
+        parse_refs(wantArtistIds, media_library::EntityType::Artist);
+    const auto album_artist_ids = parse_refs(
+        wantAlbumArtistIds, media_library::EntityType::AlbumArtist);
     for (std::size_t i = 0; i < snap.albums.size(); ++i) {
       const auto &a = snap.albums[i];
-      if (hasParent && pk == kKindArtist) {
-        if (!has_album_artist(a.artists, pid)) {
+      if (hasParent && (parentRef->entity_type ==
+                            media_library::EntityType::Artist ||
+                        parentRef->entity_type ==
+                            media_library::EntityType::AlbumArtist)) {
+        if (!has_album_artist(a.artists, {*parentRef})) {
           continue;
         }
       }
@@ -818,14 +863,7 @@ crow::response handleItems(const crow::request &req) {
       if (!artist_ids.empty() || !album_artist_ids.empty()) {
         const auto &list =
             artist_ids.empty() ? album_artist_ids : artist_ids;
-        bool ok = false;
-        for (const int id : list) {
-          if (has_album_artist(a.artists, id)) {
-            ok = true;
-            break;
-          }
-        }
-        if (!ok) {
+        if (!has_album_artist(a.artists, list)) {
           continue;
         }
       }
@@ -909,24 +947,19 @@ crow::response handleItem(const std::string &idstr) {
       return json(200, playlistDto(p));
     }
   }
-  int kind = 0;
-  int id = 0;
-  if (!parseId(idstr, kind, id)) {
-    return http_util::jsonResponse(404, "{}");
+  const std::string decoded = http_util::urlDecode(idstr);
+  if (decoded == musicViewId() || decoded == playlistsViewId()) {
+    return json(200, musicView());
   }
-  crow::json::wvalue dto;
-  bool found = false;
-  if (kind == kKindTrack) {
-    const auto ref =
-        library().ref_for_compat(media_library::EntityType::Track, id);
-    if (ref) {
+
+  const auto ref = parseItemId(decoded);
+  if (ref.has_value()) {
+    if (ref->entity_type == media_library::EntityType::Track) {
       const auto result = library().get_track(*ref, {});
       if (result.ok()) {
         const auto &t = result.value();
-        const int albumId = t.album ? compat_id_of(t.album->ref) : 0;
-        const auto source = library().resolve_playback(*ref, {});
-        const std::string filePath =
-            source.ok() ? source.value().internal_locator : std::string();
+        // Path 是 Jellyfin 的文件系统字段；locator 不出进程，这里留空（5.4.4）。
+        const std::string filePath;
         std::vector<std::pair<std::string, int>> genres;
         if (!t.genres.empty()) {
           const media_library::CatalogSnapshot snap = library().snapshot();
@@ -941,17 +974,14 @@ crow::response handleItem(const std::string &idstr) {
             genres.emplace_back(name, genreId);
           }
         }
-        dto = trackItem(t, id, albumId,
-                        t.album ? t.album->title : std::string(), filePath,
-                        artist_pairs_of(t.artists),
-                        album_artist_pairs_of(t.album_artists), genres);
-        found = true;
+        return json(200, trackItem(
+                             t, itemId(t.ref),
+                             t.album ? itemId(t.album->ref) : std::string(),
+                             t.album ? t.album->title : std::string(),
+                             filePath, artist_pairs_of(t.artists),
+                             album_artist_pairs_of(t.album_artists), genres));
       }
-    }
-  } else if (kind == kKindAlbum) {
-    const auto ref =
-        library().ref_for_compat(media_library::EntityType::Album, id);
-    if (ref) {
+    } else if (ref->entity_type == media_library::EntityType::Album) {
       const auto result = library().get_album(*ref, {});
       if (result.ok()) {
         const auto &a = result.value();
@@ -965,45 +995,43 @@ crow::response handleItem(const std::string &idstr) {
             runtimeMs += track.duration_ms.value_or(0);
           }
         }
-        dto = albumItem(a, id, album_artist_pairs_of(a.artists), count,
-                        a.artwork ? "1" : "", runtimeMs * 10000LL);
-        found = true;
+        return json(200, albumItem(a, itemId(a.ref),
+                                   album_artist_pairs_of(a.artists), count,
+                                   a.artwork ? "1" : "",
+                                   runtimeMs * 10000LL));
       }
-    }
-  } else if (kind == kKindArtist) {
-    const auto ref =
-        library().ref_for_compat(media_library::EntityType::Artist, id);
-    if (ref) {
-      const auto result = library().get_artist(*ref, {});
+    } else if (ref->entity_type == media_library::EntityType::Artist ||
+               ref->entity_type == media_library::EntityType::AlbumArtist) {
+      const media_library::ArtistRef artist_ref =
+          ref->entity_type == media_library::EntityType::AlbumArtist
+              ? media_library::as_artist_ref(*ref)
+              : *ref;
+      const auto result = library().get_artist(artist_ref, {});
       if (result.ok()) {
         const auto &a = result.value();
         int count = 0;
-        const auto albums =
-            library().list_artist_albums(*ref, {std::nullopt, 1000000}, {});
+        const auto albums = library().list_artist_albums(
+            artist_ref, {std::nullopt, 1000000}, {});
         if (albums.ok()) {
           count = static_cast<int>(albums.value().items.size());
         }
-        dto = artistItem(a, id, count, a.artwork ? "1" : "");
-        found = true;
+        return json(200, artistItem(a, itemId(a.ref), count,
+                                    a.artwork ? "1" : ""));
       }
     }
-  } else if (kind == kKindGenre) {
+  }
+
+  int kind = 0;
+  int id = 0;
+  if (parseId(decoded, kind, id) && kind == kKindGenre) {
     const media_library::CatalogSnapshot snap = library().snapshot();
     for (const auto &g : snap.genres) {
       if (g.internal_id == id) {
-        dto = genreItem(id, g.name);
-        found = true;
-        break;
+        return json(200, genreItem(id, g.name));
       }
     }
-  } else if (kind == kKindView) {
-    dto = musicView();
-    found = true;
   }
-  if (!found) {
-    return http_util::jsonResponse(404, "{}");
-  }
-  return json(200, dto);
+  return http_util::jsonResponse(404, "{}");
 }
 
 crow::response handleImage(const std::string &idstr) {
@@ -1036,27 +1064,18 @@ crow::response handleImage(const std::string &idstr) {
     std::uniform_int_distribution<std::size_t> dist(0, covers.size() - 1);
     return http_util::serveImage(covers[dist(rng)]);
   }
-  int kind = 0;
-  int id = 0;
-  if (!parseId(idstr, kind, id)) {
+  const auto ref = parse_path_ref(idstr);
+  if (!ref.has_value() ||
+      (ref->entity_type != media_library::EntityType::Track &&
+       ref->entity_type != media_library::EntityType::Album &&
+       ref->entity_type != media_library::EntityType::Artist &&
+       ref->entity_type != media_library::EntityType::AlbumArtist)) {
     return http_util::jsonResponse(404, "{}");
   }
-  std::optional<media_library::EntityType> entityType;
-  if (kind == kKindTrack) {
-    entityType = media_library::EntityType::Track;
-  } else if (kind == kKindAlbum) {
-    entityType = media_library::EntityType::Album;
-  } else if (kind == kKindArtist) {
-    entityType = media_library::EntityType::Artist;
-  }
-  if (!entityType) {
-    return http_util::jsonResponse(404, "{}");
-  }
-  const auto ref = library().ref_for_compat(*entityType, id);
-  if (!ref) {
-    return http_util::jsonResponse(404, "{}");
-  }
-  const auto artwork = library().artwork_path(*ref);
+  const auto artwork = library().artwork_path(
+      ref->entity_type == media_library::EntityType::AlbumArtist
+          ? media_library::as_artist_ref(*ref)
+          : *ref);
   if (!artwork) {
     return http_util::jsonResponse(404, "{}");
   }
@@ -1065,21 +1084,13 @@ crow::response handleImage(const std::string &idstr) {
 
 crow::response handleStream(const crow::request &req,
                             const std::string &idstr) {
-  int kind = 0;
-  int id = 0;
-  if (!parseId(idstr, kind, id) || kind != kKindTrack) {
+  const auto ref = parse_path_ref(idstr);
+  if (!ref.has_value() ||
+      ref->entity_type != media_library::EntityType::Track) {
     return http_util::jsonResponse(404, "{}");
   }
-  const auto ref = library().ref_for_compat(media_library::EntityType::Track, id);
-  if (!ref) {
-    return http_util::jsonResponse(404, "{}");
-  }
-  const auto source = library().resolve_playback(*ref, {});
-  if (!source.ok()) {
-    return http_util::jsonResponse(404, "{}");
-  }
-  return http_util::serveResource(source.value().internal_locator,
-                                  req.get_header_value("Range"));
+  // 音频字节统一从播放会话出：选源交给 MediaRouter，locator 不外泄。
+  return stream_http::serve_track(req, *ref, req.method == crow::HTTPMethod::HEAD);
 }
 
 /// 解析单个 LRC 时间标签（mm:ss、mm:ss.xx 或 mm:ss:xx）为毫秒。
@@ -1261,13 +1272,9 @@ crow::json::wvalue buildLyricDto(const std::string &title,
 }
 
 crow::response handleLyrics(const std::string &idstr) {
-  int kind = 0;
-  int id = 0;
-  if (!parseId(idstr, kind, id) || kind != kKindTrack) {
-    return http_util::jsonResponse(404, "{}");
-  }
-  const auto ref = library().ref_for_compat(media_library::EntityType::Track, id);
-  if (!ref) {
+  const auto ref = parse_path_ref(idstr);
+  if (!ref.has_value() ||
+      ref->entity_type != media_library::EntityType::Track) {
     return http_util::jsonResponse(404, "{}");
   }
   const auto lyricsResult = library().get_lyrics(*ref, {});
@@ -1346,29 +1353,37 @@ crow::response handleMusicGenreByName(const std::string &name) {
 
 // 播放信息：返回单个 MediaSource，供客户端直接播放原始文件。
 crow::response handlePlaybackInfo(const crow::request &, const std::string &idstr) {
-  int kind = 0, id = 0;
-  if (!parseId(idstr, kind, id) || kind != kKindTrack) {
+  const auto ref = parse_path_ref(idstr);
+  if (!ref.has_value() ||
+      ref->entity_type != media_library::EntityType::Track) {
     return http_util::jsonResponse(404, "{}");
   }
-  const auto ref = library().ref_for_compat(media_library::EntityType::Track, id);
-  if (!ref) {
-    return http_util::jsonResponse(404, "{}");
+  const auto service = media_library::playback_service_ptr();
+  if (service == nullptr) {
+    return stream_http::error_response(media_library::Error::make(
+        media_library::ErrorCode::ProviderUnavailable,
+        "media runtime is not initialized"));
   }
-  const auto result = library().get_track(*ref, {});
-  const auto source = library().resolve_playback(*ref, {});
-  if (!result.ok() || !source.ok()) {
-    return http_util::jsonResponse(404, "{}");
+  // 用会话拿一次摘要，随后立刻关闭：这里只需要「能不能播、多大、多久」。
+  auto session = service->open_playback(*ref, media_library::CallContext{});
+  if (!session.ok()) {
+    return stream_http::error_response(session.error());
   }
-  const auto &t = result.value();
-  const long long durationMs = t.duration_ms.value_or(0);
-  const int bitrateKbps = t.audio.bitrate_kbps.value_or(0);
+  const media_library::Track &t = session.value().track.value;
+  const media_library::PlaybackSourceSummary &summary =
+      session.value().stream.value;
+  service->close(session.value().session_id);
+
+  const long long durationMs = summary.duration_ms;
+  const int bitrateKbps = summary.bitrate_kbps;
   const std::string url =
       "/Audio/" + idstr + "/stream?static=true&mediaSourceId=" + idstr;
   const long long bitrate_bps = static_cast<long long>(bitrateKbps) * 1000LL;
   crow::json::wvalue src;
   src["Id"] = idstr;
   src["Name"] = t.title;
-  src["Path"] = source.value().internal_locator;
+  // locator 是进程内定位符，绝不能出现在响应里（5.4.4）。Path 用相对播放地址。
+  src["Path"] = url;
   src["Container"] = t.audio.format;
   src["Size"] = t.audio.size_bytes.value_or(0);
   src["Bitrate"] = bitrate_bps;
@@ -1413,44 +1428,46 @@ crow::response handleImageType(const std::string &idstr, const std::string &imag
 // 相似条目：同专辑 + 同流派的其它曲目。
 crow::response handleSimilar(const std::string &idstr) {
   std::vector<Sortable> items;
-  int kind = 0, id = 0;
-  if (parseId(idstr, kind, id) && kind == kKindTrack) {
+  const auto ref = parse_path_ref(idstr);
+  if (ref.has_value() && ref->entity_type == media_library::EntityType::Track) {
     const media_library::CatalogSnapshot snap = library().snapshot();
     std::size_t origin = snap.tracks.size();
-    for (std::size_t i = 0; i < snap.track_internal_ids.size(); ++i) {
-      if (snap.track_internal_ids[i] == id) {
+    for (std::size_t i = 0; i < snap.tracks.size(); ++i) {
+      if (snap.tracks[i].ref == *ref) {
         origin = i;
         break;
       }
     }
     if (origin < snap.tracks.size()) {
-      const int album_id = snap.tracks[origin].album
-                               ? compat_id_of(snap.tracks[origin].album->ref)
-                               : 0;
+      const auto &origin_track = snap.tracks[origin];
+      const auto origin_internal = library().internal_id_of(origin_track.ref);
       std::unordered_set<int> want_genres;
-      const auto genres = snap.track_genres.find(id);
-      if (genres != snap.track_genres.end()) {
-        for (const auto &g : genres->second) {
-          want_genres.insert(g.internal_id);
+      if (origin_internal) {
+        const auto genres = snap.track_genres.find(*origin_internal);
+        if (genres != snap.track_genres.end()) {
+          for (const auto &g : genres->second) {
+            want_genres.insert(g.internal_id);
+          }
         }
       }
-      std::unordered_set<int> seen{id};
+      std::unordered_set<std::string> seen{media_library::to_string(*ref)};
       constexpr std::size_t kLimit = 20;
       auto add_track = [&](std::size_t index) {
         if (items.size() >= kLimit) {
           return;
         }
-        const int track_id = snap.track_internal_ids[index];
-        if (!seen.insert(track_id).second) {
+        const std::string key = media_library::to_string(snap.tracks[index].ref);
+        if (!seen.insert(key).second) {
           return;
         }
         items.push_back(itemForTrack(snap, index));
       };
-      if (album_id > 0) {
+      if (origin_track.album.has_value()) {
+        const media_library::AlbumRef album = origin_track.album->ref;
         for (std::size_t i = 0; i < snap.tracks.size() && items.size() < kLimit;
              ++i) {
           const auto &other = snap.tracks[i];
-          if (other.album && compat_id_of(other.album->ref) == album_id) {
+          if (other.album && other.album->ref == album) {
             add_track(i);
           }
         }
@@ -1480,20 +1497,13 @@ crow::response handleSimilar(const std::string &idstr) {
 
 // 下载原始文件（与 /Items/<id>/File 同义）。
 crow::response handleDownload(const crow::request &req, const std::string &idstr) {
-  int kind = 0, id = 0;
-  if (!parseId(idstr, kind, id) || kind != kKindTrack) {
+  const auto ref = parse_path_ref(idstr);
+  if (!ref.has_value() ||
+      ref->entity_type != media_library::EntityType::Track) {
     return http_util::jsonResponse(404, "{}");
   }
-  const auto ref = library().ref_for_compat(media_library::EntityType::Track, id);
-  if (!ref) {
-    return http_util::jsonResponse(404, "{}");
-  }
-  const auto source = library().resolve_playback(*ref, {});
-  if (!source.ok()) {
-    return http_util::jsonResponse(404, "{}");
-  }
-  return http_util::serveResource(source.value().internal_locator,
-                                  req.get_header_value("Range"));
+  // 下载与在线播放走同一条会话路径：字节来源一致，Range 语义一致。
+  return stream_http::serve_track(req, *ref, req.method == crow::HTTPMethod::HEAD);
 }
 
 // 搜索建议：曲目 / 专辑 / 艺术家。
@@ -1529,25 +1539,23 @@ crow::response handleSearchHints(const crow::request &req) {
     for (const std::size_t i : track_hits) {
       if ((int)hints.size() >= cap) break;
       const auto &t = snap.tracks[i];
-      const int track_id = snap.track_internal_ids[i];
-      push(makeId(kKindTrack, track_id),
-           t.title.empty() ? ("Track " + std::to_string(track_id)) : t.title,
+      push(itemId(t.ref),
+           t.title.empty() ? ("Track " + t.ref.entity_id.substr(0, 8))
+                           : t.title,
            "Audio");
     }
     for (std::size_t i = 0; i < snap.albums.size() && (int)hints.size() < cap;
          ++i) {
       const auto &a = snap.albums[i];
       if (lower(a.title).find(lterm) != std::string::npos) {
-        push(makeId(kKindAlbum, snap.album_internal_ids[i]), a.title,
-             "MusicAlbum");
+        push(itemId(a.ref), a.title, "MusicAlbum");
       }
     }
     for (std::size_t i = 0; i < snap.artists.size() && (int)hints.size() < cap;
          ++i) {
       const auto &a = snap.artists[i];
       if (lower(a.name).find(lterm) != std::string::npos) {
-        push(makeId(kKindArtist, snap.artist_internal_ids[i]), a.name,
-             "MusicArtist");
+        push(itemId(a.ref), a.name, "MusicArtist");
       }
     }
   }
@@ -1578,22 +1586,25 @@ crow::response handleFilters(const crow::request &) {
   return json(200, r);
 }
 
-// 按名字（或 GUID）取单个艺术家。
+// 按稳定 id（或名字）取单个艺术家。
 crow::response handleArtistByName(const std::string &raw) {
-  int kind = 0, id = 0;
   const media_library::CatalogSnapshot snap = library().snapshot();
   std::optional<std::size_t> index;
-  if (parseId(raw, kind, id) && kind == kKindArtist) {
-    for (std::size_t i = 0; i < snap.artist_internal_ids.size(); ++i) {
-      if (snap.artist_internal_ids[i] == id) {
+  const std::string decoded = http_util::urlDecode(raw);
+  if (const auto ref = parseItemId(decoded)) {
+    const media_library::SourceRef artist_ref =
+        ref->entity_type == media_library::EntityType::AlbumArtist
+            ? media_library::as_artist_ref(*ref)
+            : *ref;
+    for (std::size_t i = 0; i < snap.artists.size(); ++i) {
+      if (snap.artists[i].ref == artist_ref) {
         index = i;
         break;
       }
     }
   } else {
-    const std::string name = http_util::urlDecode(raw);
     for (std::size_t i = 0; i < snap.artists.size(); ++i) {
-      if (snap.artists[i].name == name) {
+      if (snap.artists[i].name == decoded) {
         index = i;
         break;
       }
@@ -1607,30 +1618,34 @@ crow::response handleArtistByName(const std::string &raw) {
 
 // 相似艺术家：与本艺术家共享流派的其它艺术家。
 crow::response handleArtistSimilar(const std::string &raw) {
-  int kind = 0, id = 0;
   const media_library::CatalogSnapshot snap = library().snapshot();
-  int artist_id = -1;
-  if (parseId(raw, kind, id) && kind == kKindArtist) {
-    artist_id = id;
+  const std::string decoded = http_util::urlDecode(raw);
+  std::optional<media_library::SourceRef> artist_ref;
+  if (const auto ref = parseItemId(decoded)) {
+    media_library::SourceRef candidate =
+        ref->entity_type == media_library::EntityType::AlbumArtist
+            ? media_library::as_artist_ref(*ref)
+            : *ref;
+    if (candidate.entity_type == media_library::EntityType::Artist) {
+      artist_ref = std::move(candidate);
+    }
   } else {
-    const std::string name = http_util::urlDecode(raw);
-    for (std::size_t i = 0; i < snap.artists.size(); ++i) {
-      if (snap.artists[i].name == name) {
-        artist_id = snap.artist_internal_ids[i];
+    for (const auto &artist : snap.artists) {
+      if (artist.name == decoded) {
+        artist_ref = artist.ref;
         break;
       }
     }
   }
-  if (artist_id < 0) {
+  if (!artist_ref.has_value()) {
     return http_util::jsonResponse(404, "{}");
   }
 
   std::unordered_set<int> genre_ids;
   for (std::size_t i = 0; i < snap.tracks.size(); ++i) {
-    const int track_id = snap.track_internal_ids[i];
     bool by_artist = false;
     for (const auto &link : snap.tracks[i].artists) {
-      if (compat_id_of(link.ref) == artist_id) {
+      if (link.ref == *artist_ref) {
         by_artist = true;
         break;
       }
@@ -1638,7 +1653,7 @@ crow::response handleArtistSimilar(const std::string &raw) {
     if (!by_artist) {
       continue;
     }
-    const auto genres = snap.track_genres.find(track_id);
+    const auto genres = snap.track_genres.find(snap.track_internal_ids[i]);
     if (genres == snap.track_genres.end()) {
       continue;
     }
@@ -1647,10 +1662,10 @@ crow::response handleArtistSimilar(const std::string &raw) {
     }
   }
 
-  std::vector<int> artist_ids;
-  std::unordered_set<int> seen{artist_id};
+  std::vector<media_library::SourceRef> similar;
+  std::unordered_set<std::string> seen{media_library::to_string(*artist_ref)};
   constexpr std::size_t kLimit = 20;
-  for (std::size_t i = 0; i < snap.tracks.size() && artist_ids.size() < kLimit;
+  for (std::size_t i = 0; i < snap.tracks.size() && similar.size() < kLimit;
        ++i) {
     const auto genres = snap.track_genres.find(snap.track_internal_ids[i]);
     if (genres == snap.track_genres.end()) {
@@ -1667,21 +1682,20 @@ crow::response handleArtistSimilar(const std::string &raw) {
       continue;
     }
     for (const auto &link : snap.tracks[i].artists) {
-      const int aid = compat_id_of(link.ref);
-      if (aid <= 0 || !seen.insert(aid).second) {
+      if (!seen.insert(media_library::to_string(link.ref)).second) {
         continue;
       }
-      artist_ids.push_back(aid);
-      if (artist_ids.size() >= kLimit) {
+      similar.push_back(link.ref);
+      if (similar.size() >= kLimit) {
         break;
       }
     }
   }
 
   std::vector<Sortable> items;
-  for (const int aid : artist_ids) {
-    for (std::size_t i = 0; i < snap.artist_internal_ids.size(); ++i) {
-      if (snap.artist_internal_ids[i] == aid) {
+  for (const auto &wanted : similar) {
+    for (std::size_t i = 0; i < snap.artists.size(); ++i) {
+      if (snap.artists[i].ref == wanted) {
         items.push_back(itemForArtist(snap, i));
         break;
       }
@@ -1690,13 +1704,18 @@ crow::response handleArtistSimilar(const std::string &raw) {
   return respondItems(items, "", "Ascending", 0, 0);
 }
 
-// 解析逗号分隔的 track GUID 列表为 track id 列表。
+// 解析逗号分隔的稳定 track id 列表为库内 int（遗留 playlist 子系统只认 int）。
 std::vector<int> parseTrackIds(const std::string &csv) {
   std::vector<int> ids;
   for (const auto &tok : splitCsv(csv)) {
-    int k = 0, v = 0;
-    if (parseId(tok, k, v) && k == kKindTrack) {
-      ids.push_back(v);
+    const auto ref = parseItemId(tok);
+    if (!ref.has_value() ||
+        ref->entity_type != media_library::EntityType::Track) {
+      continue;
+    }
+    const auto internal = library().internal_id_of(*ref);
+    if (internal.has_value()) {
+      ids.push_back(*internal);
     }
   }
   return ids;
@@ -1736,7 +1755,7 @@ std::string qsJoined(const crow::request &req, const char *key) {
   return joined;
 }
 
-// 从 JSON body 的某个 GUID 数组字段追加 track id。
+// 从 JSON body 的某个稳定 id 数组字段追加 track id。
 void appendBodyIds(const crow::json::rvalue &body, const char *name,
                    std::vector<int> &out) {
   if (!body || !body.has(name) ||
@@ -1744,10 +1763,17 @@ void appendBodyIds(const crow::json::rvalue &body, const char *name,
     return;
   }
   for (const auto &x : body[name]) {
-    int k = 0, v = 0;
-    if (x.t() == crow::json::type::String &&
-        parseId(std::string(x.s()), k, v) && k == kKindTrack) {
-      out.push_back(v);
+    if (x.t() != crow::json::type::String) {
+      continue;
+    }
+    const auto ref = parseItemId(std::string(x.s()));
+    if (!ref.has_value() ||
+        ref->entity_type != media_library::EntityType::Track) {
+      continue;
+    }
+    const auto internal = library().internal_id_of(*ref);
+    if (internal.has_value()) {
+      out.push_back(*internal);
     }
   }
 }
@@ -1792,7 +1818,11 @@ crow::response handlePlaylistItems(const std::string &idstr) {
       continue;
     }
     Sortable item = itemForTrack(snap, it->second);
-    item.dto["PlaylistItemId"] = makeId(kKindTrack, s.track_id);
+    // PlaylistItemId 对外也用稳定 id；内部 int 只在 playlist 子系统里流转。
+    if (const auto ref = library().ref_for_compat(
+            media_library::EntityType::Track, s.track_id)) {
+      item.dto["PlaylistItemId"] = itemId(*ref);
+    }
     item.dto["CanDelete"] = true;
     items.push_back(std::move(item));
   }
@@ -1975,8 +2005,10 @@ void run(const config::Config &cfg) {
     return handleImageType(itemId, imageType, "");
   });
   JF_ROUTE(app, "/Items/<string>/Download")
+      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)
   ([](const crow::request &req, std::string itemId) { return handleDownload(req, itemId); });
   JF_ROUTE(app, "/Items/<string>/File")
+      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)
   ([](const crow::request &req, std::string itemId) { return handleDownload(req, itemId); });
   JF_ROUTE(app, "/Items/<string>/Similar")
   ([](const crow::request &, std::string itemId) { return handleSimilar(itemId); });

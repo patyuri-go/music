@@ -28,6 +28,17 @@ crow::response artist_albums(const crow::request &req, const std::string &ref);
 crow::response playlists(const crow::request &req);
 crow::response playlist(const crow::request &req, const std::string &ref);
 
+// 播放会话（7.1–7.4）：字节只从会话出，locator 不出进程。
+crow::response playback_open(const crow::request &req, const std::string &ref);
+crow::response playback_session(const crow::request &req,
+                                const std::string &session_id);
+crow::response playback_refresh(const crow::request &req,
+                                const std::string &session_id);
+crow::response playback_close(const crow::request &req,
+                              const std::string &session_id);
+crow::response playback_stream(const crow::request &req,
+                               const std::string &session_id);
+
 } // namespace api_v1
 
 #endif // API_V1_V1_H

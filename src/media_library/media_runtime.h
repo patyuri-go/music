@@ -4,6 +4,7 @@
 #include "media_library/entity_link.h"
 #include "media_library/library.h"
 #include "media_library/media_router.h"
+#include "media_library/playback.h"
 #include "media_library/registry.h"
 
 #include <memory>
@@ -32,11 +33,13 @@ bool media_runtime_initialized() noexcept;
 std::shared_ptr<MediaRouter> media_router_ptr() noexcept;
 std::shared_ptr<LibraryRegistry> library_registry_ptr() noexcept;
 std::shared_ptr<EntityLinkResolver> entity_links_ptr() noexcept;
+std::shared_ptr<PlaybackService> playback_service_ptr() noexcept;
 
 // 未初始化属于程序错误（与 library_runtime::library() 一致）。
 MediaRouter &media_router();
 LibraryRegistry &library_registry();
 EntityLinkResolver &entity_links();
+PlaybackService &playback_service();
 
 // 只释放本运行期持有的引用；Library 对象本身的关闭由调用方负责。
 void shutdown_media_runtime() noexcept;
