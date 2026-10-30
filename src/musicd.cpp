@@ -11,6 +11,8 @@
 #include "image_cache.h"
 #include "jellyfin.h"
 #include "media_library/library_runtime.h"
+#include "media_library/media_runtime.h"
+#include "api/v1/v1.h"
 #include "metadata.h"
 #include "api/webdav/webdav.h"
 #include "schema.h"
@@ -847,6 +849,20 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // P1 组合根：把注册表、映射、优先级、路由与 5.4 门面组装一次。
+  try {
+    media_library::MediaRuntimeOptions options;
+    options.library_id = "local-main";
+    options.display_name = cfg.jellyfin_server_name;
+    options.platform = media_library::PlatformKind::Local;
+    options.priority = 100;
+    media_library::initialize_media_runtime(media_library::library_ptr(),
+                                            options);
+  } catch (const std::exception &e) {
+    std::cerr << "[fatal] 媒体库路由初始化失败: " << e.what() << std::endl;
+    return 1;
+  }
+
   crow::SimpleApp app;
   app.loglevel(crow::LogLevel::WARNING);
 
@@ -866,6 +882,60 @@ int main(int argc, char *argv[]) {
     }
     res.set_static_file_info_unsafe(target->string());
     return res;
+  });
+
+  // ---- 原生统一读门面 /api/v1：直接依赖 MediaRouter + LibraryDirectory ----
+  // 这一层只做参数解析与 JSON 序列化，不选源、不组合、不拼字段。
+  CROW_ROUTE(app, "/api/v1/libraries")([](const crow::request &req) {
+    return api_v1::libraries(req);
+  });
+  CROW_ROUTE(app, "/api/v1/providers")([](const crow::request &req) {
+    return api_v1::provider_health(req);
+  });
+  CROW_ROUTE(app, "/api/v1/health/providers")([](const crow::request &req) {
+    return api_v1::provider_health(req);
+  });
+  CROW_ROUTE(app, "/api/v1/search")([](const crow::request &req) {
+    return api_v1::search(req);
+  });
+  CROW_ROUTE(app, "/api/v1/tracks/<string>")([](const crow::request &req,
+                                                std::string ref) {
+    return api_v1::track(req, ref);
+  });
+  CROW_ROUTE(app, "/api/v1/tracks/<string>/stream")([](const crow::request &req,
+                                                       std::string ref) {
+    return api_v1::track_stream(req, ref);
+  });
+  CROW_ROUTE(app, "/api/v1/tracks/<string>/lyrics")([](const crow::request &req,
+                                                       std::string ref) {
+    return api_v1::track_lyrics(req, ref);
+  });
+  CROW_ROUTE(app, "/api/v1/tracks/<string>/artwork")([](const crow::request &req,
+                                                        std::string ref) {
+    return api_v1::track_artwork(req, ref);
+  });
+  CROW_ROUTE(app, "/api/v1/albums/<string>")([](const crow::request &req,
+                                                std::string ref) {
+    return api_v1::album(req, ref);
+  });
+  CROW_ROUTE(app, "/api/v1/albums/<string>/tracks")([](const crow::request &req,
+                                                       std::string ref) {
+    return api_v1::album_tracks(req, ref);
+  });
+  CROW_ROUTE(app, "/api/v1/artists/<string>")([](const crow::request &req,
+                                                 std::string ref) {
+    return api_v1::artist(req, ref);
+  });
+  CROW_ROUTE(app, "/api/v1/artists/<string>/albums")([](const crow::request &req,
+                                                        std::string ref) {
+    return api_v1::artist_albums(req, ref);
+  });
+  CROW_ROUTE(app, "/api/v1/playlists")([](const crow::request &req) {
+    return api_v1::playlists(req);
+  });
+  CROW_ROUTE(app, "/api/v1/playlists/<string>")([](const crow::request &req,
+                                                   std::string ref) {
+    return api_v1::playlist(req, ref);
   });
 
   CROW_ROUTE(app, "/api/query")
@@ -2303,6 +2373,7 @@ int main(int argc, char *argv[]) {
   if (jellyfin_thread.joinable()) {
     jellyfin_thread.join();
   }
+  media_library::shutdown_media_runtime();
   media_library::shutdown_library();
   image_cache::shutdown();
   return 0;
