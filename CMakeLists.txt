@@ -26,6 +26,7 @@ add_executable(musicd
   ./src/media_library/registry.cpp
   ./src/media_library/entity_link.cpp
   ./src/media_library/router.cpp
+  ./src/media_library/media_router.cpp
   ./src/api/jellyfin/ids.cpp
   ./src/api/jellyfin/dto.cpp
   ./src/api/jellyfin/jellyfin.cpp

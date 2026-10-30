@@ -108,12 +108,18 @@ public:
   Result<Track> get_track(const TrackRef &ref, const CallContext &ctx);
   Result<Album> get_album(const AlbumRef &ref, const CallContext &ctx);
   Result<Artist> get_artist(const ArtistRef &ref, const CallContext &ctx);
+  Result<Playlist> get_playlist(const PlaylistRef &ref,
+                                const CallContext &ctx);
   Result<Page<Track>> list_album_tracks(const AlbumRef &ref,
                                         const PageRequest &page,
                                         const CallContext &ctx);
   Result<Page<Album>> list_artist_albums(const ArtistRef &ref,
                                          const PageRequest &page,
                                          const CallContext &ctx);
+  // 库内歌单列表：库由 library_id 显式指定，不做任何选择。
+  Result<Page<Playlist>> list_playlists(const std::string &library_id,
+                                        const PageRequest &page,
+                                        const CallContext &ctx);
 
   // 单源搜索：命中 0 条就是 0 条，绝不从其他库补（5.3.2）。
   Result<Page<SearchHit>> search_in(const std::string &library_id,

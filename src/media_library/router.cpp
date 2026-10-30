@@ -408,6 +408,58 @@ Result<Page<Album>> Router::list_artist_albums(const ArtistRef &ref,
   return result;
 }
 
+// 歌单读取走 PlaylistRead 能力，不走 CatalogReader。
+Result<Playlist> Router::get_playlist(const PlaylistRef &ref,
+                                      const CallContext &ctx) {
+  auto library = acquire(ref.library_id, CapabilityId::PlaylistRead);
+  if (!library.ok()) {
+    return Result<Playlist>::failure(library.error());
+  }
+  AdmissionGuard guard(registry_, ref.library_id);
+
+  auto reader = library.value()->capability<PlaylistReader>();
+  if (!reader.has_value()) {
+    Error error = Error::make(ErrorCode::Unsupported, "no playlist reader");
+    error.library_id = ref.library_id;
+    guard.finish(error);
+    return Result<Playlist>::failure(std::move(error));
+  }
+
+  Result<Playlist> result = reader->get().get_playlist(ref, ctx);
+  if (!result.ok()) {
+    guard.finish(result.error());
+    return result;
+  }
+  guard.finish(std::nullopt);
+  return result;
+}
+
+Result<Page<Playlist>> Router::list_playlists(const std::string &library_id,
+                                              const PageRequest &page,
+                                              const CallContext &ctx) {
+  auto library = acquire(library_id, CapabilityId::PlaylistRead);
+  if (!library.ok()) {
+    return Result<Page<Playlist>>::failure(library.error());
+  }
+  AdmissionGuard guard(registry_, library_id);
+
+  auto reader = library.value()->capability<PlaylistReader>();
+  if (!reader.has_value()) {
+    Error error = Error::make(ErrorCode::Unsupported, "no playlist reader");
+    error.library_id = library_id;
+    guard.finish(error);
+    return Result<Page<Playlist>>::failure(std::move(error));
+  }
+
+  Result<Page<Playlist>> result = reader->get().list_playlists(page, ctx);
+  if (!result.ok()) {
+    guard.finish(result.error());
+    return result;
+  }
+  guard.finish(std::nullopt);
+  return result;
+}
+
 // 5.3.2：指定库的搜索只可能来自该库，命中 0 条就是 0 条，绝不从别处补。
 Result<Page<SearchHit>> Router::search_in(const std::string &library_id,
                                           const SearchQuery &query,
