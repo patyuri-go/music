@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <typeindex>
 #include <unordered_map>
 #include <utility>
@@ -41,6 +42,35 @@ enum class CapabilityId {
   LibraryWrite,
   Auth
 };
+
+// 能力名。只在日志、指标与错误边界使用；内部判断一律用枚举。
+constexpr std::string_view capability_name(CapabilityId id) noexcept {
+  switch (id) {
+  case CapabilityId::CatalogRead:
+    return "catalog_read";
+  case CapabilityId::Search:
+    return "search";
+  case CapabilityId::StreamResolve:
+    return "stream_resolve";
+  case CapabilityId::LyricsRead:
+    return "lyrics_read";
+  case CapabilityId::ArtworkRead:
+    return "artwork_read";
+  case CapabilityId::PlaylistRead:
+    return "playlist_read";
+  case CapabilityId::PlaylistWrite:
+    return "playlist_write";
+  case CapabilityId::FavoriteRead:
+    return "favorite_read";
+  case CapabilityId::FavoriteWrite:
+    return "favorite_write";
+  case CapabilityId::LibraryWrite:
+    return "library_write";
+  case CapabilityId::Auth:
+    return "auth";
+  }
+  return "unknown";
+}
 
 struct CapabilityState {
   CapabilityId id = CapabilityId::CatalogRead;
