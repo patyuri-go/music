@@ -6,6 +6,7 @@
 #include "media_library/library.h"
 #include "media_library/media_router.h"
 #include "media_library/playback.h"
+#include "media_library/playlist_directory.h"
 #include "media_library/registry.h"
 #include "media_library/snapshot.h"
 
@@ -54,6 +55,8 @@ bool media_runtime_initialized() noexcept;
 
 // 返回空表示运行期尚未初始化。HTTP 层用这个判断，避免异常穿过请求处理。
 std::shared_ptr<MediaRouter> media_router_ptr() noexcept;
+// 播放列表总管：与 MediaRouter 并列的另一条入口（歌单走它，不走路由器）。
+std::shared_ptr<PlaylistDirectory> playlist_directory_ptr() noexcept;
 std::shared_ptr<LibraryRegistry> library_registry_ptr() noexcept;
 std::shared_ptr<EntityLinkResolver> entity_links_ptr() noexcept;
 std::shared_ptr<PlaybackService> playback_service_ptr() noexcept;
@@ -61,6 +64,7 @@ std::shared_ptr<ArtworkService> artwork_service_ptr() noexcept;
 
 // 未初始化属于程序错误（与 library_runtime::library() 一致）。
 MediaRouter &media_router();
+PlaylistDirectory &playlist_directory();
 LibraryRegistry &library_registry();
 EntityLinkResolver &entity_links();
 PlaybackService &playback_service();

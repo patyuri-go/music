@@ -6,6 +6,7 @@
 #include "schema.h"
 #include "storage.h"
 
+#include "api/playlist/playlist.h"
 #include "api/webdav/webdav.h"
 
 #include <SQLiteCpp/Database.h>
@@ -127,6 +128,7 @@ void LocalLibrary::initialize() {
   auto self = shared_from_this();
   register_capability<CatalogReader>(self);
   register_capability<CatalogLister>(self);
+  register_capability<PlaylistReader>(self);
   register_capability<Searcher>(self);
   register_capability<StreamResolver>(self);
   register_capability<LyricsProvider>(self);
@@ -155,7 +157,7 @@ CapabilitySet LocalLibrary::capabilities() const {
   add(CapabilityId::StreamResolve, true);
   add(CapabilityId::LyricsRead, true);
   add(CapabilityId::ArtworkRead, true);
-  add(CapabilityId::PlaylistRead, false);
+  add(CapabilityId::PlaylistRead, true);
   add(CapabilityId::PlaylistWrite, false);
   add(CapabilityId::FavoriteRead, false);
   add(CapabilityId::FavoriteWrite, false);
@@ -1072,6 +1074,79 @@ Result<Page<Track>> LocalLibrary::list_recent(const PageRequest &page,
                      return a.user_data.added_at > b.user_data.added_at;
                    });
   return Result<Page<Track>>::success(local_slice_page(snap.tracks, page));
+}
+
+// ---------------------------------------------------------------------------
+// 本地歌单：把 `./playlists` 下的 JSON 歌单包成库能力，让播放列表总管能跨库
+// 汇总。这块数据不在数据库里，曲目靠「虚拟路径」在启动时匹配成 track_id。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 本地歌单的 ref：entity_id 就是歌单文件的 32 位十六进制 id。
+PlaylistRef local_playlist_ref(const std::string &library_id,
+                               const std::string &playlist_id) {
+  PlaylistRef ref;
+  ref.library_id = library_id;
+  ref.entity_type = EntityType::Playlist;
+  ref.entity_id = playlist_id;
+  return ref;
+}
+
+} // namespace
+
+Result<Page<Playlist>> LocalLibrary::list_playlists(const PageRequest &page,
+                                                    const CallContext &) {
+  // 列表只给摘要：曲目留给 get_playlist 展开，否则列一次歌单就要把每个歌单
+  // 的每首歌都读一遍。
+  const std::vector<playlist::Playlist> stored = playlist::list();
+  std::vector<Playlist> summaries;
+  summaries.reserve(stored.size());
+  for (const playlist::Playlist &item : stored) {
+    Playlist summary;
+    summary.ref = local_playlist_ref(library_id_, item.id);
+    summary.name = item.name;
+    summaries.push_back(std::move(summary));
+  }
+  // 游标语义与本地 CatalogLister 一致：十进制 offset。
+  return Result<Page<Playlist>>::success(local_slice_page(summaries, page));
+}
+
+Result<Playlist> LocalLibrary::get_playlist(const PlaylistRef &ref,
+                                            const CallContext &ctx) {
+  using R = Result<Playlist>;
+  if (ref.entity_type != EntityType::Playlist ||
+      ref.library_id != library_id_) {
+    return R::failure(
+        Error::make(ErrorCode::InvalidRequest, "invalid playlist reference"));
+  }
+
+  playlist::Playlist stored;
+  if (!playlist::get(ref.entity_id, stored)) {
+    return R::failure(
+        Error::make(ErrorCode::NotFound, "local playlist not found"));
+  }
+
+  Playlist out;
+  out.ref = ref;
+  out.name = stored.name;
+  out.tracks.reserve(stored.songs.size());
+  for (const playlist::Song &song : stored.songs) {
+    // 扫库后路径不在了：丢弃，只出能真正播放的曲目。
+    if (!song.matched || song.track_id <= 0) {
+      continue;
+    }
+    const SourceRef track_ref = ref_for(EntityType::Track, song.track_id);
+    if (track_ref.entity_id.empty()) {
+      continue;
+    }
+    Result<Track> track = get_track(track_ref, ctx);
+    if (!track.ok()) {
+      continue;
+    }
+    out.tracks.push_back(std::move(track.value()));
+  }
+  return R::success(std::move(out));
 }
 
 } // namespace media_library

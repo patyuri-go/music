@@ -32,6 +32,16 @@ crow::json::wvalue artistItem(const media_library::Artist &a,
 
 crow::json::wvalue genreItem(int id, const std::string &name);
 
+// 歌单列表条目。Jellyfin 用 ChildCount / RunTimeTicks 画卡片上的曲目数与时长，
+// 两个值都由调用方算好后传入（Playlist 自己带了完整曲目，算得出来）。
+crow::json::wvalue playlistItem(const media_library::Playlist &p,
+                                const std::string &playlistId, int childCount,
+                                long long runtimeTicks);
+
+// 歌单详情。带 ItemIds，客户端据此再拉 /Playlists/<id>/Items。
+crow::json::wvalue playlistDto(const media_library::Playlist &p,
+                               const std::string &playlistId);
+
 crow::json::wvalue userDto();
 
 crow::json::wvalue sessionInfo(const std::string &client,

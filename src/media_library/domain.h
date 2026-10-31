@@ -94,7 +94,9 @@ struct Playlist {
   PlaylistRef ref;
   std::string name;
   std::string description;
-  std::vector<TrackRef> tracks;
+  // 曲目给完整领域模型而不是 TrackRef：列表要曲目数/时长，条目端点要直接
+  // 出 DTO；只留 ref 会逼上层逐条回查，等于把远端请求放大成 N 次。
+  std::vector<Track> tracks;
 };
 
 enum class LyricsMode { WordSynced, LineSynced, Unsynced };

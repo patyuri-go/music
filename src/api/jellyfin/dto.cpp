@@ -308,6 +308,44 @@ crow::json::wvalue sessionInfo(const std::string &client,
   return r;
 }
 
+crow::json::wvalue playlistItem(const media_library::Playlist &p,
+                                const std::string &playlistId, int childCount,
+                                long long runtimeTicks) {
+  crow::json::wvalue r;
+  r["Name"] = p.name;
+  r["ServerId"] = serverId();
+  r["Id"] = playlistId;
+  r["Type"] = "Playlist";
+  r["MediaType"] = "Audio";
+  r["IsFolder"] = true;
+  r["ChildCount"] = childCount;
+  if (!p.description.empty()) {
+    r["Overview"] = p.description;
+  }
+  if (runtimeTicks > 0) {
+    r["RunTimeTicks"] = runtimeTicks;
+    r["CumulativeRunTimeTicks"] = runtimeTicks;
+  }
+  return r;
+}
+
+crow::json::wvalue playlistDto(const media_library::Playlist &p,
+                               const std::string &playlistId) {
+  crow::json::wvalue::list ids;
+  ids.reserve(p.tracks.size());
+  long long runtimeTicks = 0;
+  for (const media_library::Track &track : p.tracks) {
+    ids.emplace_back(itemId(track.ref));
+    if (track.duration_ms.has_value()) {
+      runtimeTicks += *track.duration_ms * 10000LL;
+    }
+  }
+  crow::json::wvalue r = playlistItem(
+      p, playlistId, static_cast<int>(ids.size()), runtimeTicks);
+  r["ItemIds"] = crow::json::wvalue(std::move(ids));
+  return r;
+}
+
 crow::json::wvalue queryResult(std::vector<crow::json::wvalue> items, int total,
                                int startIndex) {
   crow::json::wvalue r;

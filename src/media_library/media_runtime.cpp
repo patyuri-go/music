@@ -1,6 +1,7 @@
 #include "media_library/media_runtime.h"
 
 #include "media_library/local_library.h"
+#include "media_library/playlist_directory.h"
 #include "media_library/router.h"
 
 #include <optional>
@@ -20,6 +21,7 @@ struct Runtime {
   std::shared_ptr<AggregatePriority> aggregate_priority;
   std::shared_ptr<Router> router;
   std::shared_ptr<MediaRouter> media_router;
+  std::shared_ptr<PlaylistDirectory> playlist_directory;
   std::shared_ptr<PlaybackService> playback;
   std::shared_ptr<ArtworkService> artwork;
 };
@@ -104,6 +106,7 @@ void initialize_media_runtime(std::vector<LibrarySetup> libraries,
   next.router = make_router(next.registry, next.links, next.aspect_priority,
                             next.aggregate_priority);
   next.media_router = make_media_router(next.router);
+  next.playlist_directory = make_playlist_directory(next.registry);
   next.playback =
       make_playback_service(next.media_router, make_system_clock());
   next.artwork = make_artwork_service(next.media_router, next.registry);
@@ -127,6 +130,11 @@ bool media_runtime_initialized() noexcept {
 std::shared_ptr<MediaRouter> media_router_ptr() noexcept {
   std::lock_guard<std::mutex> lock(mutex());
   return state().media_router;
+}
+
+std::shared_ptr<PlaylistDirectory> playlist_directory_ptr() noexcept {
+  std::lock_guard<std::mutex> lock(mutex());
+  return state().playlist_directory;
 }
 
 std::shared_ptr<LibraryRegistry> library_registry_ptr() noexcept {
@@ -155,6 +163,14 @@ MediaRouter &media_router() {
     throw std::runtime_error("media_runtime 未初始化");
   }
   return *state().media_router;
+}
+
+PlaylistDirectory &playlist_directory() {
+  std::lock_guard<std::mutex> lock(mutex());
+  if (state().playlist_directory == nullptr) {
+    throw std::runtime_error("media_runtime 未初始化");
+  }
+  return *state().playlist_directory;
 }
 
 LibraryRegistry &library_registry() {

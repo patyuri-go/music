@@ -59,6 +59,14 @@ media_library::Error http_error(int status, const std::string &path) {
     error.retryable = true;
     return error;
   }
+  // 上游 404 是「这个对象不存在」，不是「后端坏了」。api-enhanced 对缺失的
+  // 歌单/专辑直接回 HTTP 404（曲目则回 200 + 空数组），不在这里区分的话
+  // 库层的 NotFound 分支永远到不了，主 API 会把「没有」报成 503。
+  if (status == 404) {
+    return media_library::Error::make(
+        media_library::ErrorCode::NotFound,
+        "api-enhanced 返回 HTTP 404 (" + path + ")");
+  }
   media_library::Error error = media_library::Error::make(
       media_library::ErrorCode::ProviderUnavailable,
       "api-enhanced 返回 HTTP " + std::to_string(status) + " (" + path + ")");

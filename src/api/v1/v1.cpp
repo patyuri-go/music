@@ -198,8 +198,8 @@ crow::json::wvalue playlist_json(const Playlist &playlist) {
   out["description"] = playlist.description;
   crow::json::wvalue::list tracks;
   tracks.reserve(playlist.tracks.size());
-  for (const TrackRef &track : playlist.tracks) {
-    tracks.push_back(to_string(track));
+  for (const Track &track : playlist.tracks) {
+    tracks.push_back(to_string(track.ref));
   }
   out["tracks"] = std::move(tracks);
   return out;
@@ -834,31 +834,48 @@ crow::response artist_albums(const crow::request &req,
 }
 
 // ---------------------------------------------------------------------------
-// 歌单（当前仅声明了能力的库能回答）
+// 歌单：读操作走播放列表总管（与 MediaRouter 并列的另一条入口）。
+// 写操作不存在——没有 PlaylistWriter 能力。
 // ---------------------------------------------------------------------------
 
 crow::response playlists(const crow::request &req) {
-  const std::shared_ptr<MediaRouter> router = media_library::media_router_ptr();
-  if (router == nullptr) {
+  // library_id 显式指定 -> 单源（路由器）；不指定 -> 总管跨库汇总。
+  if (const std::optional<std::string> library_id = text_param(req, "library_id");
+      library_id.has_value() && !library_id->empty()) {
+    const std::shared_ptr<MediaRouter> router =
+        media_library::media_router_ptr();
+    if (router == nullptr) {
+      return unavailable();
+    }
+    Result<Sourced<Page<Playlist>>> result = router->list_playlists(
+        *library_id, page_of(req), context_of(req));
+    if (!result.ok()) {
+      return fail(result.error());
+    }
+    crow::json::wvalue body = sourced_page_json(result.value(), playlist_json);
+    body["mode"] = "single";
+    return http_util::jsonResponse(200, body.dump());
+  }
+
+  const std::shared_ptr<media_library::PlaylistDirectory> directory =
+      media_library::playlist_directory_ptr();
+  if (directory == nullptr) {
     return unavailable();
   }
-  // 单源接口：库必须显式给出，不推断、不遍历。
-  const std::optional<std::string> library_id = text_param(req, "library_id");
-  if (!library_id.has_value() || library_id->empty()) {
-    return invalid("library_id is required");
-  }
-  Result<Sourced<Page<Playlist>>> result = router->list_playlists(
-      *library_id, page_of(req), context_of(req));
+  Result<RoutedPage<Playlist>> result =
+      directory->list_playlists(page_of(req), context_of(req));
   if (!result.ok()) {
     return fail(result.error());
   }
-  return http_util::jsonResponse(
-      200, sourced_page_json(result.value(), playlist_json).dump());
+  crow::json::wvalue body = routed_page_json(result.value(), playlist_json);
+  body["mode"] = "aggregate";
+  return http_util::jsonResponse(200, body.dump());
 }
 
 crow::response playlist(const crow::request &req, const std::string &ref_text) {
-  const std::shared_ptr<MediaRouter> router = media_library::media_router_ptr();
-  if (router == nullptr) {
+  const std::shared_ptr<media_library::PlaylistDirectory> directory =
+      media_library::playlist_directory_ptr();
+  if (directory == nullptr) {
     return unavailable();
   }
   const std::optional<SourceRef> ref = parse_ref_param(ref_text);
@@ -868,7 +885,8 @@ crow::response playlist(const crow::request &req, const std::string &ref_text) {
   if (ref->entity_type != EntityType::Playlist) {
     return invalid("expected a playlist reference");
   }
-  Result<Sourced<Playlist>> result = router->get_playlist(*ref, context_of(req));
+  Result<Sourced<Playlist>> result =
+      directory->get_playlist(*ref, context_of(req));
   if (!result.ok()) {
     return fail(result.error());
   }

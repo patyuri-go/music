@@ -39,36 +39,6 @@ int aggregate_error_rank(ErrorCode code) noexcept {
   }
 }
 
-// admit / release 必须配对。错误路径忘记 release 会让该库的并发名额永久
-// 被占用，所以用 RAII 兜底；正常完成时由 finish() 显式给出结果。
-class AdmissionGuard {
-public:
-  AdmissionGuard(std::shared_ptr<LibraryRegistry> registry, std::string library_id)
-      : registry_(std::move(registry)), library_id_(std::move(library_id)) {}
-
-  ~AdmissionGuard() {
-    if (!finished_) {
-      registry_->release(library_id_, std::nullopt, current_ms());
-    }
-  }
-
-  AdmissionGuard(const AdmissionGuard &) = delete;
-  AdmissionGuard &operator=(const AdmissionGuard &) = delete;
-
-  void finish(const std::optional<Error> &error) {
-    if (finished_) {
-      return;
-    }
-    finished_ = true;
-    registry_->release(library_id_, error, current_ms());
-  }
-
-private:
-  std::shared_ptr<LibraryRegistry> registry_;
-  std::string library_id_;
-  bool finished_ = false;
-};
-
 class AggregatePriorityImpl final : public AggregatePriority {
 public:
   std::vector<std::string> order() const override {
@@ -231,232 +201,186 @@ bool Router::should_fall_back(ErrorCode code) noexcept {
   return false;
 }
 
-Result<std::shared_ptr<Library>>
-Router::acquire(const std::string &library_id,
-                CapabilityId capability) const {
-  if (library_id.empty()) {
-    return Result<std::shared_ptr<Library>>::failure(Error::make(
-        ErrorCode::InvalidRequest, "library id is required"));
-  }
-  if (registry_ == nullptr) {
-    return Result<std::shared_ptr<Library>>::failure(Error::make(
-        ErrorCode::ProviderUnavailable, "library registry is not configured"));
-  }
-
-  const auto registration = registry_->find(library_id);
-  if (!registration.has_value()) {
-    Error error = Error::make(ErrorCode::InvalidRequest,
-                              "unknown library: " + library_id);
-    error.library_id = library_id;
-    return Result<std::shared_ptr<Library>>::failure(std::move(error));
-  }
-
-  std::shared_ptr<Library> library = registry_->library(library_id);
-  if (library == nullptr) {
-    Error error = Error::make(ErrorCode::ProviderUnavailable,
-                              "library is not available: " + library_id);
-    error.library_id = library_id;
-    return Result<std::shared_ptr<Library>>::failure(std::move(error));
-  }
-
-  const auto capabilities = registry_->capabilities(library_id);
-  if (!capabilities.has_value() ||
-      !capabilities->supports(capability)) {
-    Error error = Error::make(ErrorCode::Unsupported,
-                              "library does not support the requested capability");
-    error.library_id = library_id;
-    error.capability = std::string(capability_name(capability));
-    return Result<std::shared_ptr<Library>>::failure(std::move(error));
-  }
-
-  // 5.2.6：并发上限、熔断、限流在这里统一拦截。
-  const Status admitted = registry_->admit(library_id, now_ms());
-  if (!admitted.ok()) {
-    return Result<std::shared_ptr<Library>>::failure(admitted.error());
-  }
-  return Result<std::shared_ptr<Library>>::success(std::move(library));
-}
-
 // ---------------------------------------------------------------------------
 // 5.3.2 单源路由：调用方已经指定 library_id。
 // 不读任何优先级、不做替换、不回退、不返回 sources。
 // ---------------------------------------------------------------------------
 
 Result<Track> Router::get_track(const TrackRef &ref, const CallContext &ctx) {
-  auto library = acquire(ref.library_id, CapabilityId::CatalogRead);
-  if (!library.ok()) {
-    return Result<Track>::failure(library.error());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  if (!lease.ok()) {
+    return Result<Track>::failure(lease.error());
   }
-  AdmissionGuard guard(registry_, ref.library_id);
+  auto library = lease.value().library();
 
-  auto reader = library.value()->capability<CatalogReader>();
+  auto reader = library->capability<CatalogReader>();
   if (!reader.has_value()) {
     Error error = Error::make(ErrorCode::Unsupported, "no catalog reader");
     error.library_id = ref.library_id;
-    guard.finish(error);
+    lease.value().finish(error);
     return Result<Track>::failure(std::move(error));
   }
 
   Result<Track> result = reader->get().get_track(ref, ctx);
   if (!result.ok()) {
-    guard.finish(result.error());
+    lease.value().finish(result.error());
     return result;
   }
-  guard.finish(std::nullopt);
+  lease.value().finish(std::nullopt);
   return result;
 }
 
 Result<Album> Router::get_album(const AlbumRef &ref, const CallContext &ctx) {
-  auto library = acquire(ref.library_id, CapabilityId::CatalogRead);
-  if (!library.ok()) {
-    return Result<Album>::failure(library.error());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  if (!lease.ok()) {
+    return Result<Album>::failure(lease.error());
   }
-  AdmissionGuard guard(registry_, ref.library_id);
+  auto library = lease.value().library();
 
-  auto reader = library.value()->capability<CatalogReader>();
+  auto reader = library->capability<CatalogReader>();
   if (!reader.has_value()) {
     Error error = Error::make(ErrorCode::Unsupported, "no catalog reader");
     error.library_id = ref.library_id;
-    guard.finish(error);
+    lease.value().finish(error);
     return Result<Album>::failure(std::move(error));
   }
 
   Result<Album> result = reader->get().get_album(ref, ctx);
   if (!result.ok()) {
-    guard.finish(result.error());
+    lease.value().finish(result.error());
     return result;
   }
-  guard.finish(std::nullopt);
+  lease.value().finish(std::nullopt);
   return result;
 }
 
 Result<Artist> Router::get_artist(const ArtistRef &ref,
                                   const CallContext &ctx) {
-  auto library = acquire(ref.library_id, CapabilityId::CatalogRead);
-  if (!library.ok()) {
-    return Result<Artist>::failure(library.error());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  if (!lease.ok()) {
+    return Result<Artist>::failure(lease.error());
   }
-  AdmissionGuard guard(registry_, ref.library_id);
+  auto library = lease.value().library();
 
-  auto reader = library.value()->capability<CatalogReader>();
+  auto reader = library->capability<CatalogReader>();
   if (!reader.has_value()) {
     Error error = Error::make(ErrorCode::Unsupported, "no catalog reader");
     error.library_id = ref.library_id;
-    guard.finish(error);
+    lease.value().finish(error);
     return Result<Artist>::failure(std::move(error));
   }
 
   Result<Artist> result = reader->get().get_artist(ref, ctx);
   if (!result.ok()) {
-    guard.finish(result.error());
+    lease.value().finish(result.error());
     return result;
   }
-  guard.finish(std::nullopt);
+  lease.value().finish(std::nullopt);
   return result;
 }
 
 Result<Page<Track>> Router::list_album_tracks(const AlbumRef &ref,
                                               const PageRequest &page,
                                               const CallContext &ctx) {
-  auto library = acquire(ref.library_id, CapabilityId::CatalogRead);
-  if (!library.ok()) {
-    return Result<Page<Track>>::failure(library.error());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  if (!lease.ok()) {
+    return Result<Page<Track>>::failure(lease.error());
   }
-  AdmissionGuard guard(registry_, ref.library_id);
+  auto library = lease.value().library();
 
-  auto reader = library.value()->capability<CatalogReader>();
+  auto reader = library->capability<CatalogReader>();
   if (!reader.has_value()) {
     Error error = Error::make(ErrorCode::Unsupported, "no catalog reader");
     error.library_id = ref.library_id;
-    guard.finish(error);
+    lease.value().finish(error);
     return Result<Page<Track>>::failure(std::move(error));
   }
 
   Result<Page<Track>> result = reader->get().list_album_tracks(ref, page, ctx);
   if (!result.ok()) {
-    guard.finish(result.error());
+    lease.value().finish(result.error());
     return result;
   }
-  guard.finish(std::nullopt);
+  lease.value().finish(std::nullopt);
   return result;
 }
 
 Result<Page<Album>> Router::list_artist_albums(const ArtistRef &ref,
                                                const PageRequest &page,
                                                const CallContext &ctx) {
-  auto library = acquire(ref.library_id, CapabilityId::CatalogRead);
-  if (!library.ok()) {
-    return Result<Page<Album>>::failure(library.error());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  if (!lease.ok()) {
+    return Result<Page<Album>>::failure(lease.error());
   }
-  AdmissionGuard guard(registry_, ref.library_id);
+  auto library = lease.value().library();
 
-  auto reader = library.value()->capability<CatalogReader>();
+  auto reader = library->capability<CatalogReader>();
   if (!reader.has_value()) {
     Error error = Error::make(ErrorCode::Unsupported, "no catalog reader");
     error.library_id = ref.library_id;
-    guard.finish(error);
+    lease.value().finish(error);
     return Result<Page<Album>>::failure(std::move(error));
   }
 
   Result<Page<Album>> result =
       reader->get().list_artist_albums(ref, page, ctx);
   if (!result.ok()) {
-    guard.finish(result.error());
+    lease.value().finish(result.error());
     return result;
   }
-  guard.finish(std::nullopt);
+  lease.value().finish(std::nullopt);
   return result;
 }
 
 // 歌单读取走 PlaylistRead 能力，不走 CatalogReader。
 Result<Playlist> Router::get_playlist(const PlaylistRef &ref,
                                       const CallContext &ctx) {
-  auto library = acquire(ref.library_id, CapabilityId::PlaylistRead);
-  if (!library.ok()) {
-    return Result<Playlist>::failure(library.error());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::PlaylistRead, now_ms());
+  if (!lease.ok()) {
+    return Result<Playlist>::failure(lease.error());
   }
-  AdmissionGuard guard(registry_, ref.library_id);
+  auto library = lease.value().library();
 
-  auto reader = library.value()->capability<PlaylistReader>();
+  auto reader = library->capability<PlaylistReader>();
   if (!reader.has_value()) {
     Error error = Error::make(ErrorCode::Unsupported, "no playlist reader");
     error.library_id = ref.library_id;
-    guard.finish(error);
+    lease.value().finish(error);
     return Result<Playlist>::failure(std::move(error));
   }
 
   Result<Playlist> result = reader->get().get_playlist(ref, ctx);
   if (!result.ok()) {
-    guard.finish(result.error());
+    lease.value().finish(result.error());
     return result;
   }
-  guard.finish(std::nullopt);
+  lease.value().finish(std::nullopt);
   return result;
 }
 
 Result<Page<Playlist>> Router::list_playlists(const std::string &library_id,
                                               const PageRequest &page,
                                               const CallContext &ctx) {
-  auto library = acquire(library_id, CapabilityId::PlaylistRead);
-  if (!library.ok()) {
-    return Result<Page<Playlist>>::failure(library.error());
+  auto lease = registry_->acquire(library_id, CapabilityId::PlaylistRead, now_ms());
+  if (!lease.ok()) {
+    return Result<Page<Playlist>>::failure(lease.error());
   }
-  AdmissionGuard guard(registry_, library_id);
+  auto library = lease.value().library();
 
-  auto reader = library.value()->capability<PlaylistReader>();
+  auto reader = library->capability<PlaylistReader>();
   if (!reader.has_value()) {
     Error error = Error::make(ErrorCode::Unsupported, "no playlist reader");
     error.library_id = library_id;
-    guard.finish(error);
+    lease.value().finish(error);
     return Result<Page<Playlist>>::failure(std::move(error));
   }
 
   Result<Page<Playlist>> result = reader->get().list_playlists(page, ctx);
   if (!result.ok()) {
-    guard.finish(result.error());
+    lease.value().finish(result.error());
     return result;
   }
-  guard.finish(std::nullopt);
+  lease.value().finish(std::nullopt);
   return result;
 }
 
@@ -464,26 +388,26 @@ Result<Page<Playlist>> Router::list_playlists(const std::string &library_id,
 Result<Page<SearchHit>> Router::search_in(const std::string &library_id,
                                           const SearchQuery &query,
                                           const CallContext &ctx) {
-  auto library = acquire(library_id, CapabilityId::Search);
-  if (!library.ok()) {
-    return Result<Page<SearchHit>>::failure(library.error());
+  auto lease = registry_->acquire(library_id, CapabilityId::Search, now_ms());
+  if (!lease.ok()) {
+    return Result<Page<SearchHit>>::failure(lease.error());
   }
-  AdmissionGuard guard(registry_, library_id);
+  auto library = lease.value().library();
 
-  auto searcher = library.value()->capability<Searcher>();
+  auto searcher = library->capability<Searcher>();
   if (!searcher.has_value()) {
     Error error = Error::make(ErrorCode::Unsupported, "no searcher");
     error.library_id = library_id;
-    guard.finish(error);
+    lease.value().finish(error);
     return Result<Page<SearchHit>>::failure(std::move(error));
   }
 
   Result<Page<SearchHit>> result = searcher->get().search(query, ctx);
   if (!result.ok()) {
-    guard.finish(result.error());
+    lease.value().finish(result.error());
     return result;
   }
-  guard.finish(std::nullopt);
+  lease.value().finish(std::nullopt);
   return result;
 }
 
@@ -614,25 +538,25 @@ Router::run_aspect(const SourceRef &ref, Aspect aspect, const CallContext &ctx,
     AspectAttempt attempt;
     attempt.library_id = candidate.library_id;
 
-    auto library = acquire(candidate.library_id, capability_for(aspect));
-    if (!library.ok()) {
+    auto lease = registry_->acquire(candidate.library_id, capability_for(aspect), now_ms());
+    if (!lease.ok()) {
       attempt.ok = false;
-      attempt.error = library.error().code;
+      attempt.error = lease.error().code;
       attempt.elapsed_ms = current_ms() - started;
       output.attempts.push_back(attempt);
-      last_error = library.error();
-      if (!should_fall_back(library.error().code)) {
+      last_error = lease.error();
+      if (!should_fall_back(lease.error().code)) {
         break;
       }
       continue;
     }
 
-    AdmissionGuard guard(registry_, candidate.library_id);
-    Result<T> result = executor(*library.value(), candidate, ctx);
+    auto library = lease.value().library();
+    Result<T> result = executor(*library, candidate, ctx);
     attempt.elapsed_ms = current_ms() - started;
 
     if (result.ok()) {
-      guard.finish(std::nullopt);
+      lease.value().finish(std::nullopt);
       attempt.ok = true;
       output.attempts.push_back(attempt);
       output.value = std::move(result).value();
@@ -641,7 +565,7 @@ Router::run_aspect(const SourceRef &ref, Aspect aspect, const CallContext &ctx,
       return Result<AspectResult<T>>::success(std::move(output));
     }
 
-    guard.finish(result.error());
+    lease.value().finish(result.error());
     attempt.ok = false;
     attempt.error = result.error().code;
     output.attempts.push_back(attempt);
@@ -771,22 +695,22 @@ Result<AggregatedPage<SearchHit>> Router::search(const SearchQuery &query,
     status.library_id = registration.library_id;
     const std::int64_t started = current_ms();
 
-    auto library = acquire(registration.library_id, CapabilityId::Search);
-    if (!library.ok()) {
-      status.state = source_state_from(library.error().code);
-      status.error = library.error();
+    auto lease = registry_->acquire(registration.library_id, CapabilityId::Search, now_ms());
+    if (!lease.ok()) {
+      status.state = source_state_from(lease.error().code);
+      status.error = lease.error();
       status.elapsed_ms = current_ms() - started;
       page.sources.push_back(status);
-      failures.push_back(library.error());
+      failures.push_back(lease.error());
       continue;
     }
 
-    AdmissionGuard guard(registry_, registration.library_id);
-    auto searcher = library.value()->capability<Searcher>();
+    auto library = lease.value().library();
+    auto searcher = library->capability<Searcher>();
     if (!searcher.has_value()) {
       Error error = Error::make(ErrorCode::Unsupported, "no searcher");
       error.library_id = registration.library_id;
-      guard.finish(error);
+      lease.value().finish(error);
       status.state = source_state_from(error.code);
       status.error = error;
       status.elapsed_ms = current_ms() - started;
@@ -798,7 +722,7 @@ Result<AggregatedPage<SearchHit>> Router::search(const SearchQuery &query,
     Result<Page<SearchHit>> result = searcher->get().search(query, ctx);
     status.elapsed_ms = current_ms() - started;
     if (!result.ok()) {
-      guard.finish(result.error());
+      lease.value().finish(result.error());
       status.state = source_state_from(result.error().code);
       status.error = result.error();
       page.sources.push_back(status);
@@ -806,7 +730,7 @@ Result<AggregatedPage<SearchHit>> Router::search(const SearchQuery &query,
       continue;
     }
 
-    guard.finish(std::nullopt);
+    lease.value().finish(std::nullopt);
     status.state = SourceState::Ok;
     status.item_count = static_cast<int>(result.value().items.size());
     page.sources.push_back(status);

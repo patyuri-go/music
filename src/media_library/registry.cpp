@@ -1,5 +1,7 @@
 #include "media_library/registry.h"
 
+#include <chrono>
+
 #include <algorithm>
 #include <map>
 #include <mutex>
@@ -105,7 +107,9 @@ struct Entry {
   int registration_order = 0;
 };
 
-class LibraryRegistryImpl final : public LibraryRegistry {
+class LibraryRegistryImpl final
+    : public LibraryRegistry,
+      public std::enable_shared_from_this<LibraryRegistryImpl> {
 public:
   Status add(std::shared_ptr<Library> library,
              const LibraryRegistration &registration) override {
@@ -329,6 +333,50 @@ public:
     return Status::success();
   }
 
+  Result<LibraryLease> acquire(std::string_view library_id,
+                               CapabilityId capability,
+                               std::int64_t now_ms) override {
+    if (library_id.empty()) {
+      return Result<LibraryLease>::failure(
+          Error::make(ErrorCode::InvalidRequest, "library id is required"));
+    }
+    const std::string id(library_id);
+
+    if (!find(id).has_value()) {
+      Error error = Error::make(ErrorCode::InvalidRequest,
+                                "unknown library: " + id);
+      error.library_id = id;
+      return Result<LibraryLease>::failure(std::move(error));
+    }
+
+    std::shared_ptr<Library> instance = library(id);
+    if (instance == nullptr) {
+      Error error = Error::make(ErrorCode::ProviderUnavailable,
+                                "library is not available: " + id);
+      error.library_id = id;
+      return Result<LibraryLease>::failure(std::move(error));
+    }
+
+    const auto capabilities_of = capabilities(id);
+    if (!capabilities_of.has_value() ||
+        !capabilities_of->supports(capability)) {
+      Error error = Error::make(
+          ErrorCode::Unsupported,
+          "library does not support the requested capability");
+      error.library_id = id;
+      error.capability = std::string(capability_name(capability));
+      return Result<LibraryLease>::failure(std::move(error));
+    }
+
+    // 5.2.6：并发上限、熔断、限流在这里统一拦截。
+    const Status admitted = admit(id, now_ms);
+    if (!admitted.ok()) {
+      return Result<LibraryLease>::failure(admitted.error());
+    }
+    return Result<LibraryLease>::success(
+        LibraryLease(shared_from_this(), id, std::move(instance)));
+  }
+
   Status admit(std::string_view library_id, std::int64_t now_ms) override {
     std::unique_lock lock(mutex_);
     note_now_locked(now_ms);
@@ -509,6 +557,68 @@ private:
 };
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// LibraryLease：admit / release 配对的唯一入口。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::int64_t lease_now_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+} // namespace
+
+LibraryLease::LibraryLease(std::shared_ptr<LibraryRegistry> registry,
+                           std::string library_id,
+                           std::shared_ptr<Library> library)
+    : registry_(std::move(registry)),
+      library_id_(std::move(library_id)),
+      library_(std::move(library)) {}
+
+LibraryLease::~LibraryLease() {
+  // 兜底：只归还名额，不碰健康状态。用 Cancelled 而不是 nullopt——
+  // release 收到 nullopt 会把 consecutive_failures 清零并清掉已开的熔断。
+  release_with(
+      Error::make(ErrorCode::Cancelled, "lease released without a result"));
+}
+
+LibraryLease::LibraryLease(LibraryLease &&other) noexcept
+    : registry_(std::move(other.registry_)),
+      library_id_(std::move(other.library_id_)),
+      library_(std::move(other.library_)) {
+  other.registry_.reset();
+}
+
+LibraryLease &LibraryLease::operator=(LibraryLease &&other) noexcept {
+  if (this != &other) {
+    release_with(
+        Error::make(ErrorCode::Cancelled, "lease overwritten before result"));
+    registry_ = std::move(other.registry_);
+    library_id_ = std::move(other.library_id_);
+    library_ = std::move(other.library_);
+    other.registry_.reset();
+  }
+  return *this;
+}
+
+void LibraryLease::finish(const std::optional<Error> &error) {
+  release_with(error);
+}
+
+void LibraryLease::release_with(const std::optional<Error> &error) {
+  if (registry_ == nullptr) {
+    return;
+  }
+  // 先交出所有权再调用：release 可能重入，且保证 finish 幂等。
+  const std::shared_ptr<LibraryRegistry> registry = std::move(registry_);
+  registry_.reset();
+  registry->release(library_id_, error, lease_now_ms());
+  library_id_.clear();
+}
 
 std::shared_ptr<LibraryRegistry> make_library_registry() {
   return std::make_shared<LibraryRegistryImpl>();

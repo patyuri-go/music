@@ -150,11 +150,6 @@ public:
                                     Aspect aspect) const;
 
 private:
-  // 取库并占用一个并发名额（5.2.6 的 admit）。
-  // 成功后调用方必须配对 release：用文件内的 AdmissionGuard 保证。
-  Result<std::shared_ptr<Library>> acquire(const std::string &library_id,
-                                           CapabilityId capability) const;
-
   // 多源候选：硬过滤 + 按方面优先级排序。空表示没有可用候选。
   // 返回完整 SourceRef，因为选定库之后还要用该库自己的引用去取数据。
   std::vector<SourceRef> candidates_for(const SourceRef &ref, Aspect aspect,

@@ -366,6 +366,52 @@ crow::json::wvalue searchHitItem(const media_library::SearchHit &hit) {
 //   parentId = 艺术家      → list_artist_albums
 //   ArtistIds/AlbumArtistIds 指定艺术家 → list_artist_albums
 // 其余（Music 视图根等）没有路由器能力，返回空列表。
+// 歌单列表：只经播放列表总管（跨库汇总）。门面不排序、不遍历库、不换源。
+// Jellyfin 客户端用 startIndex/limit 翻页，总管用不透明游标，因此每次向总管
+// 取「startIndex + limit」条再切片——门面不持有游标，也不做缓存。
+crow::response playlistListPage(int startIndex, int limit) {
+  const std::shared_ptr<media_library::PlaylistDirectory> directory =
+      media_library::playlist_directory_ptr();
+  if (directory == nullptr) {
+    return emptyList();
+  }
+  const int from = startIndex < 0 ? 0 : startIndex;
+  const int page_size = limit > 0 ? limit : 50;
+
+  const auto result =
+      directory->list_playlists({std::nullopt, from + page_size}, {});
+  if (!result.ok()) {
+    return emptyList();
+  }
+
+  std::vector<crow::json::wvalue> items;
+  int index = 0;
+  for (const auto &sourced : result.value().items) {
+    if (index++ < from) {
+      continue;
+    }
+    if (static_cast<int>(items.size()) >= page_size) {
+      break;
+    }
+    // 列表卡片要曲目数与时长：总管列表只给摘要，这里逐个歌单展开一次。
+    // 代价是每个歌单一次远端请求，按当前口径接受。
+    int childCount = 0;
+    long long runtimeTicks = 0;
+    const auto full = directory->get_playlist(sourced.value.ref, {});
+    if (full.ok()) {
+      childCount = static_cast<int>(full.value().value.tracks.size());
+      for (const auto &track : full.value().value.tracks) {
+        runtimeTicks += track.duration_ms.value_or(0) * 10000LL;
+      }
+    }
+    items.push_back(playlistItem(sourced.value, itemId(sourced.value.ref),
+                                 childCount, runtimeTicks));
+  }
+  // 总管不提供 total，只能报「本次已知的条数」（契约缺口，见文档）。
+  return json(200, queryResult(std::move(items),
+                               from + static_cast<int>(items.size()), from));
+}
+
 crow::response handleItems(const crow::request &req) {
   const std::string parent = qs(req, "parentId");
   const std::string include = qs(req, "includeItemTypes");
@@ -388,6 +434,12 @@ crow::response handleItems(const crow::request &req) {
     }
     return out;
   };
+
+  // 歌单视图根，或显式要 Playlist 类型：只经播放列表总管。
+  if ((!parent.empty() && parent == playlistsViewId()) ||
+      listHas(include, "Playlist")) {
+    return playlistListPage(startIndex, limit);
+  }
 
   std::vector<crow::json::wvalue> items;
 
@@ -559,6 +611,16 @@ crow::response handleItem(const std::string &idstr) {
         }
         return json(200,
                     artistItem(a, itemId(a.ref), count, a.artwork ? "1" : ""));
+      }
+    } else if (ref->entity_type == media_library::EntityType::Playlist) {
+      // 歌单详情：客户端列完歌单会逐条回来拉 Fields，只经播放列表总管。
+      // ChildCount / RunTimeTicks 要曲目数，跟专辑一样顺手展开一次。
+      const auto directory = media_library::playlist_directory_ptr();
+      if (directory != nullptr) {
+        const auto result = directory->get_playlist(*ref, {});
+        if (result.ok()) {
+          return json(200, playlistDto(result.value().value, itemId(*ref)));
+        }
       }
     }
   }
@@ -1031,22 +1093,49 @@ void appendBodyIds(const crow::json::rvalue &body, const char *name,
   }
 }
 
-// 歌单列表。
-crow::response handlePlaylists() {
-  // 本地歌单是文件式子系统的私有概念，路由器只认 PlaylistRef。
-  return emptyList();
+// 歌单列表（跨库汇总，只经播放列表总管）。
+crow::response handlePlaylists(const crow::request &req) {
+  return playlistListPage(qsInt(req, "startIndex", 0), qsInt(req, "limit", 0));
 }
 
-// 歌单详情。
+// 歌单详情。歌单 id 就是 SourceRef 的规范字符串，直接解析后交给总管；
+// 不遍历库、不回退、不换源。
 crow::response handlePlaylistById(const std::string &idstr) {
-  (void)idstr;
-  return http_util::jsonResponse(404, "{}");
+  const std::shared_ptr<media_library::PlaylistDirectory> directory =
+      media_library::playlist_directory_ptr();
+  const auto ref = parse_path_ref(idstr);
+  if (directory == nullptr || !ref.has_value() ||
+      ref->entity_type != media_library::EntityType::Playlist) {
+    return http_util::jsonResponse(404, "{}");
+  }
+  const auto result = directory->get_playlist(*ref, {});
+  if (!result.ok()) {
+    return http_util::jsonResponse(404, "{}");
+  }
+  return json(200, playlistDto(result.value().value, itemId(*ref)));
 }
 
-// 歌单内的曲目。
+// 歌单内的曲目。曲目随歌单一起返回（Playlist.tracks 是完整领域模型），
+// 不再逐条回查。
 crow::response handlePlaylistItems(const std::string &idstr) {
-  (void)idstr;
-  return emptyList();
+  const std::shared_ptr<media_library::PlaylistDirectory> directory =
+      media_library::playlist_directory_ptr();
+  const auto ref = parse_path_ref(idstr);
+  if (directory == nullptr || !ref.has_value() ||
+      ref->entity_type != media_library::EntityType::Playlist) {
+    return emptyList();
+  }
+  const auto result = directory->get_playlist(*ref, {});
+  if (!result.ok()) {
+    return emptyList();
+  }
+  std::vector<crow::json::wvalue> items;
+  items.reserve(result.value().value.tracks.size());
+  for (const auto &track : result.value().value.tracks) {
+    items.push_back(remoteTrackItem(track));
+  }
+  return json(200, queryResult(std::move(items),
+                               static_cast<int>(items.size()), 0));
 }
 
 // 新建歌单（name/ids 可来自 query 或 JSON body）。
@@ -1305,7 +1394,9 @@ void run(const config::Config &cfg) {
     std::vector<crow::json::wvalue> empty;
     return json(200, queryResult(std::move(empty), 0, 0));
   });
-  JF_ROUTE(app, "/Playlists")([] { return handlePlaylists(); });
+  JF_ROUTE(app, "/Playlists")([](const crow::request &req) {
+    return handlePlaylists(req);
+  });
   JF_ROUTE(app, "/Playlists")
       .methods(crow::HTTPMethod::Post)(
           [](const crow::request &req) { return handleCreatePlaylist(req); });

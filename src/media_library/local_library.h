@@ -20,6 +20,7 @@ class LocalLibrary : public Library,
                      public CatalogReader,
                      public CatalogLister,
                      public Searcher,
+                     public PlaylistReader,
                      public StreamResolver,
                      public LyricsProvider,
                      public ArtworkProvider,
@@ -59,6 +60,14 @@ public:
   Result<Page<Album>> list_artist_albums(const ArtistRef &ref,
                                          const PageRequest &page,
                                          const CallContext &ctx) override;
+
+  // 本地歌单：./playlists 下的 JSON 文件（`playlist::` 子系统）包成库能力。
+  // 列表只给摘要，曲目在 get_playlist 里展开；未匹配到库曲目的条目直接丢弃
+  // （扫库后路径不在了，留着也放不出来）。
+  Result<Page<Playlist>> list_playlists(const PageRequest &page,
+                                        const CallContext &ctx) override;
+  Result<Playlist> get_playlist(const PlaylistRef &ref,
+                                const CallContext &ctx) override;
 
   Result<Page<SearchHit>> search(const SearchQuery &query,
                                  const CallContext &ctx) override;

@@ -1154,11 +1154,13 @@ NeteaseLibrary::list_playlists(const PageRequest &page,
     out.items.push_back(std::move(playlist));
   }
 
-  // 平台的 more 是「还有下一批」的唯一依据；limit 不严格时额外按是否
-  // 取满一页兜底，避免 has_more 永远为 true。
-  if (!out.items.empty() &&
-      (fetched.value().has_more ||
-       static_cast<int>(out.items.size()) >= limit)) {
+  // 平台不严格遵守 limit/offset，实测两种表现：
+  //   * uid=1 命中置顶的「喜欢的音乐」时 limit=3 会给 4 条；
+  //   * 也会直接忽略 limit，limit=2 给 3 条、limit=1 给 2 条。
+  // 因此这里如实转述平台结果，不按 limit 截断：截断会把平台多给的那条永久
+  // 丢掉（下一段的 offset 落在平台自己的分页边界之外，实测取回 0 条）。
+  // has_more 只认平台给的 more，不用「是否取满一页」去推断。
+  if (!out.items.empty() && fetched.value().has_more) {
     out.has_more = true;
     out.next_cursor = std::to_string(
         offset + static_cast<std::int64_t>(out.items.size()));
@@ -1229,11 +1231,12 @@ Result<Playlist> NeteaseLibrary::get_playlist(const PlaylistRef &ref,
       if (song.id <= 0) {
         continue;
       }
-      auto track_ref = api_enhanced::make_ref(EntityType::Track, song.id);
-      if (!track_ref.ok()) {
+      // 这里已经为造 ref 解析过整首歌，直接留下完整 Track，别让上层再查一遍。
+      Track track = track_from_song(song, std::nullopt, ctx);
+      if (track.ref.entity_id.empty()) {
         continue;
       }
-      playlist.tracks.push_back(std::move(track_ref).value());
+      playlist.tracks.push_back(std::move(track));
     }
     if (static_cast<int>(fetched.value().items.size()) < kPageSize) {
       break;

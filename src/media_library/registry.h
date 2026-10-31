@@ -65,6 +65,45 @@ struct LibraryRegistration {
   std::optional<ErrorCode> initial_health_reason;
 };
 
+class LibraryRegistry;
+
+// 借用一次操作的凭证（5.2.6）。
+//
+// acquire() 成功即占用该库的一个并发名额，本对象析构时必定归还——
+// 「admit / release 必须配对」从纪律变成类型约束。
+//
+// 正常路径要用 finish(error) 显式交出本次调用的结果：release 的第二个参数
+// 不是备注，而是健康状态机的输入（nullopt 会把 consecutive_failures 清零
+// 并清掉已打开的熔断）。析构兜底走 Cancelled：只归还名额，不碰健康状态。
+class LibraryLease {
+public:
+  LibraryLease() = default;
+  LibraryLease(std::shared_ptr<LibraryRegistry> registry, std::string library_id,
+               std::shared_ptr<Library> library);
+  ~LibraryLease();
+
+  LibraryLease(LibraryLease &&other) noexcept;
+  LibraryLease &operator=(LibraryLease &&other) noexcept;
+  LibraryLease(const LibraryLease &) = delete;
+  LibraryLease &operator=(const LibraryLease &) = delete;
+
+  // 本次借到的库实例；未持有时为空。
+  const std::shared_ptr<Library> &library() const { return library_; }
+  bool holds() const noexcept { return registry_ != nullptr; }
+
+  // 交出本次调用的结果并归还名额。幂等，可重复调用。
+  void finish(const std::optional<Error> &error);
+
+private:
+  friend class LibraryRegistry;
+
+  void release_with(const std::optional<Error> &error);
+
+  std::shared_ptr<LibraryRegistry> registry_;
+  std::string library_id_;
+  std::shared_ptr<Library> library_;
+};
+
 class LibraryRegistry {
 public:
   virtual ~LibraryRegistry() = default;
@@ -93,18 +132,29 @@ public:
 
   virtual HealthSnapshot health(std::string_view library_id) const = 0;
 
+  // 借一个库来做一次操作：查表 → 取实例 → 验能力 → 占并发名额（5.2.6）。
+  // 成功返回的 LibraryLease 已经占用名额，析构即归还。
+  // 判断「有没有资格」全部在注册表内部，调用方不做也不应重复这套顺序。
+  virtual Result<LibraryLease> acquire(std::string_view library_id,
+                                       CapabilityId capability,
+                                       std::int64_t now_ms) = 0;
+
   // 能力集合可能随账号状态变化，显式刷新（5.2.4）。
   virtual Status refresh_capabilities(std::string_view library_id) = 0;
 
+  virtual void shutdown() noexcept = 0;
+
+private:
+  friend class LibraryLease;
+
   // 并发与熔断（5.2.6）。
   // admit 检查 enabled / stopping / 熔断窗口 / 限流窗口 / 并发上限，
-  // 通过后占用一个并发名额，必须配对 release。
+  // 通过后占用一个并发名额，必须配对 release——用 acquire() 拿 LibraryLease，
+  // 不要直接调这两个：外部调用顺序写错会泄漏名额或误清熔断。
   virtual Status admit(std::string_view library_id, std::int64_t now_ms) = 0;
   virtual void release(std::string_view library_id,
                        const std::optional<Error> &error,
                        std::int64_t now_ms) = 0;
-
-  virtual void shutdown() noexcept = 0;
 };
 
 std::shared_ptr<LibraryRegistry> make_library_registry();

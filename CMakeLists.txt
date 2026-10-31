@@ -33,6 +33,7 @@ add_executable(musicd
   ./src/media_library/playback.cpp
   ./src/media_library/artwork.cpp
   ./src/media_library/netease_library.cpp
+  ./src/media_library/playlist_directory.cpp
   ./src/stream_http.cpp
   ./src/api/v1/v1.cpp
   ./src/api/api-enhanced/transport.cpp
