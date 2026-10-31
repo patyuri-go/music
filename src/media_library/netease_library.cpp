@@ -193,9 +193,10 @@ bool contains_name(const std::vector<AlbumArtistLink> &links,
 
 NeteaseLibrary::NeteaseLibrary(
     std::string library_id, std::string display_name,
-    std::shared_ptr<api_enhanced::NeteaseClient> client)
+    std::shared_ptr<api_enhanced::NeteaseClient> client, std::string uid)
     : library_id_(std::move(library_id)),
-      display_name_(std::move(display_name)), client_(std::move(client)) {}
+      display_name_(std::move(display_name)), client_(std::move(client)),
+      uid_(std::move(uid)) {}
 
 void NeteaseLibrary::initialize() {
   auto self = shared_from_this();
@@ -206,6 +207,7 @@ void NeteaseLibrary::initialize() {
   register_capability<LyricsProvider>(self);
   register_capability<ArtworkProvider>(self);
   register_capability<ArtworkBytes>(self);
+  register_capability<PlaylistReader>(self);
 }
 
 LibraryIdentity NeteaseLibrary::identity() const {
@@ -231,7 +233,7 @@ CapabilitySet NeteaseLibrary::capabilities() const {
   add(CapabilityId::StreamResolve, true, std::nullopt);
   add(CapabilityId::LyricsRead, true, std::nullopt);
   add(CapabilityId::ArtworkRead, true, std::nullopt);
-  add(CapabilityId::PlaylistRead, false, ErrorCode::Unsupported);
+  add(CapabilityId::PlaylistRead, true, std::nullopt);
   add(CapabilityId::PlaylistWrite, false, ErrorCode::Unsupported);
   add(CapabilityId::FavoriteRead, false, ErrorCode::Unsupported);
   add(CapabilityId::FavoriteWrite, false, ErrorCode::Unsupported);
@@ -969,6 +971,13 @@ NeteaseLibrary::picture_of(const SourceRef &owner,
     }
     return std::nullopt;
   }
+  case EntityType::Playlist: {
+    auto playlist = client->playlist(id.value(), ctx);
+    if (playlist.ok() && !playlist.value().cover_img_url.empty()) {
+      return playlist.value().cover_img_url;
+    }
+    return std::nullopt;
+  }
   case EntityType::Artist:
   case EntityType::AlbumArtist: {
     auto artist = client->artist(id.value(), ctx);
@@ -1097,11 +1106,148 @@ Result<Lyrics> NeteaseLibrary::get_lyrics(const TrackRef &ref,
   return R::success(std::move(lyrics));
 }
 
+Result<Page<Playlist>>
+NeteaseLibrary::list_playlists(const PageRequest &page,
+                               const CallContext &ctx) {
+  using R = Result<Page<Playlist>>;
+  if (uid_.empty()) {
+    // §12 N5：没配 uid 不是「没数据」，是可操作的配置错误。
+    return R::failure(Error::make(
+        ErrorCode::InvalidRequest,
+        "netease uid is not configured (set netease.uid or --netease-uid)"));
+  }
+
+  std::shared_ptr<api_enhanced::NeteaseClient> client;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    client = client_;
+  }
+  if (client == nullptr) {
+    return R::failure(
+        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+  }
+
+  const std::int64_t offset = offset_of(page.cursor);
+  const int limit = page.limit > 0 ? page.limit : 50;
+
+  auto fetched = client->user_playlists(uid_, limit,
+                                        static_cast<int>(offset), ctx);
+  if (!fetched.ok()) {
+    return R::failure(fetched.error());
+  }
+
+  Page<Playlist> out;
+  for (const auto &item : fetched.value().items) {
+    if (item.id <= 0) {
+      continue;
+    }
+    auto ref = api_enhanced::make_ref(EntityType::Playlist, item.id);
+    if (!ref.ok()) {
+      continue;
+    }
+    Playlist playlist;
+    playlist.ref = std::move(ref).value();
+    playlist.name = item.name;
+    playlist.description = item.description;
+    // 列表只给摘要，tracks 留给 get_playlist 按需展开。
+    out.items.push_back(std::move(playlist));
+  }
+
+  // 平台的 more 是「还有下一批」的唯一依据；limit 不严格时额外按是否
+  // 取满一页兜底，避免 has_more 永远为 true。
+  if (!out.items.empty() &&
+      (fetched.value().has_more ||
+       static_cast<int>(out.items.size()) >= limit)) {
+    out.has_more = true;
+    out.next_cursor = std::to_string(
+        offset + static_cast<std::int64_t>(out.items.size()));
+  }
+  return R::success(std::move(out));
+}
+
+Result<Playlist> NeteaseLibrary::get_playlist(const PlaylistRef &ref,
+                                              const CallContext &ctx) {
+  using R = Result<Playlist>;
+  if (ref.entity_type != EntityType::Playlist ||
+      ref.library_id != library_id_) {
+    return R::failure(
+        Error::make(ErrorCode::InvalidRequest, "invalid playlist reference"));
+  }
+  const auto id = api_enhanced::parse_platform_id(ref.entity_id);
+  if (!id.ok()) {
+    return R::failure(id.error());
+  }
+
+  std::shared_ptr<api_enhanced::NeteaseClient> client;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    client = client_;
+  }
+  if (client == nullptr) {
+    return R::failure(
+        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+  }
+
+  auto detail = client->playlist(id.value(), ctx);
+  if (!detail.ok()) {
+    return R::failure(detail.error());
+  }
+  if (detail.value().id <= 0) {
+    return R::failure(
+        Error::make(ErrorCode::NotFound, "netease playlist not found"));
+  }
+
+  Playlist playlist;
+  playlist.ref = ref;
+  playlist.name = detail.value().name;
+  playlist.description = detail.value().description;
+
+  // /playlist/track/all 不返回 more，只能按 trackCount 收敛。
+  // 500/页，最多 20 页（10000 曲）作为防跑飞的硬上限。
+  constexpr int kPageSize = 500;
+  constexpr int kMaxPages = 20;
+  const std::int64_t total = detail.value().track_count;
+  for (int page_index = 0; page_index < kMaxPages; ++page_index) {
+    const std::int64_t offset = static_cast<std::int64_t>(page_index) * kPageSize;
+    if (total > 0 && offset >= total) {
+      break;
+    }
+    auto fetched = client->playlist_tracks(id.value(), kPageSize,
+                                           static_cast<int>(offset), ctx);
+    if (!fetched.ok()) {
+      // 已经拿到的部分仍然有价值；首屏失败才整体失败。
+      if (playlist.tracks.empty()) {
+        return R::failure(fetched.error());
+      }
+      break;
+    }
+    if (fetched.value().items.empty()) {
+      break;
+    }
+    for (const auto &song : fetched.value().items) {
+      if (song.id <= 0) {
+        continue;
+      }
+      auto track_ref = api_enhanced::make_ref(EntityType::Track, song.id);
+      if (!track_ref.ok()) {
+        continue;
+      }
+      playlist.tracks.push_back(std::move(track_ref).value());
+    }
+    if (static_cast<int>(fetched.value().items.size()) < kPageSize) {
+      break;
+    }
+  }
+
+  return R::success(std::move(playlist));
+}
+
 Result<std::shared_ptr<NeteaseLibrary>>
 make_netease_library(const std::string &library_id,
                      const std::string &display_name,
                      const api_enhanced::NeteaseTransportOptions &transport,
-                     const api_enhanced::NeteaseClientOptions &client_options) {
+                     const api_enhanced::NeteaseClientOptions &client_options,
+                     const std::string &uid) {
   auto http = api_enhanced::make_http_transport(transport);
   if (http == nullptr) {
     return Result<std::shared_ptr<NeteaseLibrary>>::failure(
@@ -1113,7 +1259,7 @@ make_netease_library(const std::string &library_id,
       std::make_shared<api_enhanced::NeteaseClient>(std::move(http),
                                                     client_options);
   auto library = std::make_shared<NeteaseLibrary>(library_id, display_name,
-                                                  std::move(client));
+                                                  std::move(client), uid);
   library->initialize();
   library->probe_health(CallContext{});
 

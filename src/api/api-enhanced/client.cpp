@@ -237,6 +237,24 @@ NeteaseArtist parse_artist(const crow::json::rvalue &object) {
   return artist;
 }
 
+NeteasePlaylist parse_playlist(const crow::json::rvalue &object) {
+  NeteasePlaylist playlist;
+  if (!is_object(object)) {
+    return playlist;
+  }
+  playlist.id = field_int64(object, "id");
+  playlist.name = field_string(object, "name");
+  playlist.cover_img_url = field_string(object, "coverImgUrl");
+  playlist.track_count = field_int64(object, "trackCount");
+  playlist.update_time_ms = field_int64(object, "updateTime");
+  playlist.description = field_string(object, "description");
+  playlist.tags = field_strings(object, "tags");
+  if (object.has("creator")) {
+    playlist.creator_name = field_string(object["creator"], "nickname");
+  }
+  return playlist;
+}
+
 // 统一入口：解析 body，校验 code，然后交给 extractor 取数据。
 template <typename T, typename Extractor>
 media_library::Result<T>
@@ -955,6 +973,101 @@ NeteaseClient::lyric(std::int64_t id, const media_library::CallContext &ctx) {
           lyrics.line_synced = false;
         }
         return lyrics;
+      });
+}
+
+media_library::Result<NeteasePage<NeteasePlaylist>>
+NeteaseClient::user_playlists(const std::string &uid, int limit, int offset,
+                              const media_library::CallContext &ctx) {
+  using Result = media_library::Result<NeteasePage<NeteasePlaylist>>;
+  if (uid.empty()) {
+    return Result::failure(media_library::Error::make(
+        media_library::ErrorCode::InvalidRequest, "netease uid is required"));
+  }
+  auto body = get_json("/user/playlist",
+                       {{"uid", uid},
+                        {"limit", std::to_string(limit)},
+                        {"offset", std::to_string(offset)}},
+                       ctx);
+  if (!body.ok()) {
+    return Result::failure(body.error());
+  }
+  return parse_body<NeteasePage<NeteasePlaylist>>(
+      body.value(), "/user/playlist", [](const crow::json::rvalue &json) {
+        NeteasePage<NeteasePlaylist> page;
+        if (!json.has("playlist") || !is_list(json["playlist"])) {
+          return page;
+        }
+        const crow::json::rvalue &list = json["playlist"];
+        page.items.reserve(list.size());
+        for (std::size_t i = 0; i < list.size(); ++i) {
+          NeteasePlaylist playlist = parse_playlist(list[i]);
+          if (playlist.id > 0) {
+            page.items.push_back(std::move(playlist));
+          }
+        }
+        page.has_more = field_bool(json, "more", false);
+        return page;
+      });
+}
+
+media_library::Result<NeteasePlaylist>
+NeteaseClient::playlist(std::int64_t id, const media_library::CallContext &ctx) {
+  using Result = media_library::Result<NeteasePlaylist>;
+  if (id <= 0) {
+    return Result::failure(media_library::Error::make(
+        media_library::ErrorCode::InvalidRequest,
+        "netease playlist id is invalid"));
+  }
+  auto body =
+      get_json("/playlist/detail", {{"id", std::to_string(id)}}, ctx);
+  if (!body.ok()) {
+    return Result::failure(body.error());
+  }
+  return parse_body<NeteasePlaylist>(
+      body.value(), "/playlist/detail", [](const crow::json::rvalue &json) {
+        if (!json.has("playlist") || !is_object(json["playlist"])) {
+          return NeteasePlaylist{};
+        }
+        return parse_playlist(json["playlist"]);
+      });
+}
+
+media_library::Result<NeteasePage<NeteaseSong>>
+NeteaseClient::playlist_tracks(std::int64_t id, int limit, int offset,
+                               const media_library::CallContext &ctx) {
+  using Result = media_library::Result<NeteasePage<NeteaseSong>>;
+  if (id <= 0) {
+    return Result::failure(media_library::Error::make(
+        media_library::ErrorCode::InvalidRequest,
+        "netease playlist id is invalid"));
+  }
+  auto body = get_json("/playlist/track/all",
+                       {{"id", std::to_string(id)},
+                        {"limit", std::to_string(limit)},
+                        {"offset", std::to_string(offset)}},
+                       ctx);
+  if (!body.ok()) {
+    return Result::failure(body.error());
+  }
+  return parse_body<NeteasePage<NeteaseSong>>(
+      body.value(), "/playlist/track/all", [limit](const crow::json::rvalue &json) {
+        NeteasePage<NeteaseSong> page;
+        if (!json.has("songs") || !is_list(json["songs"])) {
+          return page;
+        }
+        const crow::json::rvalue &list = json["songs"];
+        page.items.reserve(list.size());
+        for (std::size_t i = 0; i < list.size(); ++i) {
+          NeteaseSong song = parse_song(list[i]);
+          if (song.id > 0) {
+            page.items.push_back(std::move(song));
+          }
+        }
+        // 平台不返回 more：拿满一页就认为还有下一批。
+        page.has_more =
+            limit > 0 && static_cast<int>(page.items.size()) >= limit;
+        return page;
       });
 }
 

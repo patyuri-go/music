@@ -423,4 +423,9 @@ void setNeteaseCookie(std::string cookie) {
   g_config.netease.cookie = std::move(cookie);
 }
 
+void setNeteaseUid(std::string uid) {
+  get();
+  g_config.netease.uid = std::move(uid);
+}
+
 } // namespace config

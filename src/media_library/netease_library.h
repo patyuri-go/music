@@ -31,10 +31,12 @@ class NeteaseLibrary : public Library,
                        public LyricsProvider,
                        public ArtworkProvider,
                        public ArtworkBytes,
+                       public PlaylistReader,
                        public std::enable_shared_from_this<NeteaseLibrary> {
 public:
   NeteaseLibrary(std::string library_id, std::string display_name,
-                 std::shared_ptr<api_enhanced::NeteaseClient> client);
+                 std::shared_ptr<api_enhanced::NeteaseClient> client,
+                 std::string uid = {});
 
   // 必须在 make_shared 之后调用：内部要 shared_from_this 注册能力。
   void initialize();
@@ -71,6 +73,12 @@ public:
   Result<ArtworkRef> get_artwork(const SourceRef &owner,
                                  const CallContext &ctx) override;
 
+  // N5：歌单（§4.5）。tracks 只读，不回写 playlist 表。
+  Result<Page<Playlist>> list_playlists(const PageRequest &page,
+                                        const CallContext &ctx) override;
+  Result<Playlist> get_playlist(const PlaylistRef &ref,
+                                const CallContext &ctx) override;
+
   // 封面字节出口：locator 是远端 http 图片地址，只进 ArtworkService。
   Result<ArtworkLocation> artwork_location(const ArtworkRef &ref,
                                            const CallContext &ctx) override;
@@ -102,6 +110,8 @@ private:
   std::string library_id_;
   std::string display_name_;
   std::shared_ptr<api_enhanced::NeteaseClient> client_;
+  // 「我的歌单」需要的用户 id；留空则 list_playlists 明确报 InvalidRequest。
+  std::string uid_;
 
   mutable std::mutex mutex_;
   HealthSnapshot health_;
@@ -115,7 +125,8 @@ Result<std::shared_ptr<NeteaseLibrary>>
 make_netease_library(const std::string &library_id,
                      const std::string &display_name,
                      const api_enhanced::NeteaseTransportOptions &transport,
-                     const api_enhanced::NeteaseClientOptions &client);
+                     const api_enhanced::NeteaseClientOptions &client,
+                     const std::string &uid = {});
 
 } // namespace media_library
 

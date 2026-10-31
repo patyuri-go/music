@@ -819,6 +819,8 @@ int main(int argc, char *argv[]) {
       } else if (arg == "--netease-cookie") {
         // 明文凭据只进内存配置，不回显到任何输出。
         config::setNeteaseCookie(next("--netease-cookie"));
+      } else if (arg == "--netease-uid") {
+        config::setNeteaseUid(next("--netease-uid"));
       } else if (arg == "--help" || arg == "-h") {
         std::cout << "用法: musicd [选项]\n"
                   << "  --port N               主服务端口 (默认 5666)\n"
@@ -827,6 +829,7 @@ int main(int argc, char *argv[]) {
                   << "  --netease-enabled B    是否启用网易云库 (1/0)\n"
                   << "  --netease-api URL      api-enhanced 地址\n"
                   << "  --netease-cookie C     网易云 cookie（最高优先级）\n"
+                  << "  --netease-uid U        网易云用户 ID（歌单读取必需）\n"
                   << "  -h, --help             显示帮助\n";
         return 0;
       } else {
@@ -891,7 +894,7 @@ int main(int argc, char *argv[]) {
 
     auto netease = media_library::make_netease_library(
         std::string(api_enhanced::kNetEaseLibraryId), "网易云音乐", transport,
-        client);
+        client, cfg.netease.uid);
     if (!netease.ok()) {
       // 配置错误或 api-enhanced 不可用都不该拖垮本地库。
       std::cerr << "[netease] 未启用: "

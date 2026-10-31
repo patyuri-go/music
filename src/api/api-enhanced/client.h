@@ -138,6 +138,19 @@ struct NeteaseLyrics {
   std::string plain_text;
 };
 
+// 歌单。/playlist/detail 与 /user/playlist 的条目形状基本一致。
+struct NeteasePlaylist {
+  std::int64_t id{0};
+  std::string name;
+  std::string cover_img_url;
+  std::int64_t track_count{0};
+  std::int64_t update_time_ms{0};
+  // creator.userId / creator.nickname；只取展示需要的两个字段。
+  std::string creator_name;
+  std::string description;
+  std::vector<std::string> tags;
+};
+
 template <typename T> struct NeteasePage {
   std::vector<T> items;
   bool has_more{false};
@@ -198,6 +211,21 @@ public:
   // 无歌词时返回空 lines（由媒体库层翻译成 NotFound）。
   media_library::Result<NeteaseLyrics>
   lyric(std::int64_t id, const media_library::CallContext &ctx);
+
+  // /user/playlist?uid=&limit=&offset=：用户「我的歌单」。
+  // uid 为空由调用方拦下（媒体库层返回 InvalidRequest）。
+  media_library::Result<NeteasePage<NeteasePlaylist>>
+  user_playlists(const std::string &uid, int limit, int offset,
+                 const media_library::CallContext &ctx);
+
+  // /playlist/detail?id=
+  media_library::Result<NeteasePlaylist>
+  playlist(std::int64_t id, const media_library::CallContext &ctx);
+
+  // /playlist/track/all?id=&limit=&offset=：只返回曲目，不含歌单元信息。
+  media_library::Result<NeteasePage<NeteaseSong>>
+  playlist_tracks(std::int64_t id, int limit, int offset,
+                  const media_library::CallContext &ctx);
 
   const NeteaseClientOptions &options() const noexcept { return options_; }
 

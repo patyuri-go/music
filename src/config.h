@@ -74,6 +74,7 @@ void setJellyfinEnabled(bool enabled);
 void setNeteaseEnabled(bool enabled);
 void setNeteaseApi(std::string api_base);
 void setNeteaseCookie(std::string cookie);
+void setNeteaseUid(std::string uid);
 
 } // namespace config
 
