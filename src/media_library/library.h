@@ -31,6 +31,8 @@ struct LibraryIdentity {
 
 enum class CapabilityId {
   CatalogRead,
+  // 全库列举。远端库永远不允许全量扫描，因此只有本地库声明这一项。
+  CatalogList,
   Search,
   StreamResolve,
   LyricsRead,
@@ -48,6 +50,8 @@ constexpr std::string_view capability_name(CapabilityId id) noexcept {
   switch (id) {
   case CapabilityId::CatalogRead:
     return "catalog_read";
+  case CapabilityId::CatalogList:
+    return "catalog_list";
   case CapabilityId::Search:
     return "search";
   case CapabilityId::StreamResolve:
@@ -119,6 +123,23 @@ public:
   virtual Result<Page<Album>> list_artist_albums(const ArtistRef &ref,
                                                  const PageRequest &page,
                                                  const CallContext &ctx) = 0;
+
+};
+
+// 全库列举。远端库永远不允许全量扫描，因此远端实现不该继承本接口；
+// 聚合层只对「继承了本接口」的库做归并。
+class CatalogLister {
+public:
+  virtual ~CatalogLister() = default;
+  virtual Result<Page<Track>> list_tracks(const PageRequest &page,
+                                          const CallContext &ctx) = 0;
+  virtual Result<Page<Album>> list_albums(const PageRequest &page,
+                                          const CallContext &ctx) = 0;
+  virtual Result<Page<Artist>> list_artists(const PageRequest &page,
+                                            const CallContext &ctx) = 0;
+  // 「最近添加」是排序语义而非过滤语义，单独成方法，避免聚合层自己拼排序。
+  virtual Result<Page<Track>> list_recent(const PageRequest &page,
+                                          const CallContext &ctx) = 0;
 };
 
 class Searcher {

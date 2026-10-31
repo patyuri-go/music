@@ -18,6 +18,7 @@ namespace media_library {
 // 只实现只读能力；不写 HTTP，不返回平台 DTO，不传音频字节。
 class LocalLibrary : public Library,
                      public CatalogReader,
+                     public CatalogLister,
                      public Searcher,
                      public StreamResolver,
                      public LyricsProvider,
@@ -34,6 +35,16 @@ public:
   LibraryIdentity identity() const override;
   CapabilitySet capabilities() const override;
   void close() noexcept override;
+
+  // 全库列举（门面的聚合列表只用它，不再让门面遍历库）。
+  Result<Page<Track>> list_tracks(const PageRequest &page,
+                                  const CallContext &ctx) override;
+  Result<Page<Album>> list_albums(const PageRequest &page,
+                                  const CallContext &ctx) override;
+  Result<Page<Artist>> list_artists(const PageRequest &page,
+                                    const CallContext &ctx) override;
+  Result<Page<Track>> list_recent(const PageRequest &page,
+                                  const CallContext &ctx) override;
 
   Result<Track> get_track(const TrackRef &ref,
                           const CallContext &ctx) override;

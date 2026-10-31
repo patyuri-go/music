@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <sstream>
 #include <unordered_map>
+#include <optional>
 #include <unordered_set>
 
 namespace media_library {
@@ -125,6 +126,7 @@ LocalLibrary::LocalLibrary(std::string library_id, std::string display_name,
 void LocalLibrary::initialize() {
   auto self = shared_from_this();
   register_capability<CatalogReader>(self);
+  register_capability<CatalogLister>(self);
   register_capability<Searcher>(self);
   register_capability<StreamResolver>(self);
   register_capability<LyricsProvider>(self);
@@ -148,6 +150,7 @@ CapabilitySet LocalLibrary::capabilities() const {
     set.items.push_back(std::move(state));
   };
   add(CapabilityId::CatalogRead, true);
+  add(CapabilityId::CatalogList, true);
   add(CapabilityId::Search, true);
   add(CapabilityId::StreamResolve, true);
   add(CapabilityId::LyricsRead, true);
@@ -950,6 +953,75 @@ LocalLibrary::track_transport(int internal_id) const {
     }
   }
   return transport;
+}
+
+// ---------------------------------------------------------------------------
+// CatalogLister：门面的聚合列表只经由本接口取全量条目，不再遍历库。
+// 实现走本地快照（一次读全，内部再用 SQL 的收益远小于一致性成本）。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::int64_t local_offset_of(const std::optional<std::string> &cursor) {
+  if (!cursor.has_value() || cursor->empty()) {
+    return 0;
+  }
+  try {
+    const long long parsed = std::stoll(*cursor);
+    return parsed > 0 ? static_cast<std::int64_t>(parsed) : 0;
+  } catch (const std::exception &) {
+    return 0;
+  }
+}
+
+template <typename T>
+Page<T> local_slice_page(const std::vector<T> &all, const PageRequest &page) {
+  const std::int64_t total = static_cast<std::int64_t>(all.size());
+  const std::int64_t offset = std::min(local_offset_of(page.cursor), total);
+  std::int64_t end = total;
+  if (page.limit > 0) {
+    end = std::min(total, offset + static_cast<std::int64_t>(page.limit));
+  }
+  Page<T> out;
+  out.items.reserve(static_cast<std::size_t>(end - offset));
+  for (std::int64_t i = offset; i < end; ++i) {
+    out.items.push_back(all[static_cast<std::size_t>(i)]);
+  }
+  if (end < total) {
+    out.has_more = true;
+    out.next_cursor = std::to_string(end);
+  }
+  return out;
+}
+
+} // namespace
+
+Result<Page<Track>> LocalLibrary::list_tracks(const PageRequest &page,
+                                              const CallContext &) {
+  const CatalogSnapshot snap = snapshot();
+  return Result<Page<Track>>::success(local_slice_page(snap.tracks, page));
+}
+
+Result<Page<Album>> LocalLibrary::list_albums(const PageRequest &page,
+                                              const CallContext &) {
+  const CatalogSnapshot snap = snapshot();
+  return Result<Page<Album>>::success(local_slice_page(snap.albums, page));
+}
+
+Result<Page<Artist>> LocalLibrary::list_artists(const PageRequest &page,
+                                                const CallContext &) {
+  const CatalogSnapshot snap = snapshot();
+  return Result<Page<Artist>>::success(local_slice_page(snap.artists, page));
+}
+
+Result<Page<Track>> LocalLibrary::list_recent(const PageRequest &page,
+                                              const CallContext &) {
+  CatalogSnapshot snap = snapshot();
+  std::stable_sort(snap.tracks.begin(), snap.tracks.end(),
+                   [](const Track &a, const Track &b) {
+                     return a.user_data.added_at > b.user_data.added_at;
+                   });
+  return Result<Page<Track>>::success(local_slice_page(snap.tracks, page));
 }
 
 } // namespace media_library
