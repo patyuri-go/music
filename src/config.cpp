@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace config {
 namespace {
@@ -66,6 +67,39 @@ const Config &get() {
 
 const Config &load(const std::string &file) {
   Config loaded;
+
+  // 网易云：环境变量是最低优先级的一层，先落默认值，随后被 config.json 覆盖，
+  // 最后被命令行覆盖（见 setNetease*）。这样优先级天然是 CLI > 文件 > 环境变量。
+  if (const std::string value = envValue("NETEASE_ENABLED"); !value.empty()) {
+    loaded.netease.enabled = toBool(value, "NETEASE_ENABLED");
+  }
+  if (const std::string value = envValue("NETEASE_API_BASE"); !value.empty()) {
+    loaded.netease.api_base = value;
+  }
+  if (const std::string value = envValue("NETEASE_COOKIE"); !value.empty()) {
+    loaded.netease.cookie = value;
+  }
+  if (const std::string value = envValue("NETEASE_DEFAULT_LEVEL");
+      !value.empty()) {
+    loaded.netease.default_level = value;
+  }
+  if (const std::string value = envValue("NETEASE_UID"); !value.empty()) {
+    loaded.netease.uid = value;
+  }
+  if (const std::string value = envValue("NETEASE_TIMEOUT_MS"); !value.empty()) {
+    loaded.netease.timeout_ms = toInt(value, "NETEASE_TIMEOUT_MS");
+  }
+  if (const std::string value = envValue("NETEASE_METADATA_TTL_MS");
+      !value.empty()) {
+    loaded.netease.metadata_ttl_ms = toInt(value, "NETEASE_METADATA_TTL_MS");
+  }
+  if (const std::string value = envValue("NETEASE_MAX_CONCURRENCY");
+      !value.empty()) {
+    loaded.netease.max_concurrency = toInt(value, "NETEASE_MAX_CONCURRENCY");
+  }
+  if (const std::string value = envValue("NETEASE_REAL_IP"); !value.empty()) {
+    loaded.netease.real_ip = value;
+  }
 
   std::ifstream input(file);
   if (input.is_open()) {
@@ -153,6 +187,44 @@ const Config &load(const std::string &file) {
       if (cache.has("revalidate_seconds")) {
         loaded.image_cache.revalidate_seconds =
             static_cast<int>(cache["revalidate_seconds"].i());
+      }
+    }
+    if (json.has("netease")) {
+      const auto &ne = json["netease"];
+      if (ne.has("enabled")) {
+        loaded.netease.enabled = ne["enabled"].b();
+      }
+      if (ne.has("api_base")) {
+        loaded.netease.api_base = ne["api_base"].s();
+      }
+      if (ne.has("cookie")) {
+        loaded.netease.cookie = ne["cookie"].s();
+      }
+      if (ne.has("default_level")) {
+        loaded.netease.default_level = ne["default_level"].s();
+      }
+      if (ne.has("uid")) {
+        const auto &uid = ne["uid"];
+        // uid 在 JSON 里可能是数字或字符串，两种都接受。
+        if (uid.t() == crow::json::type::Number) {
+          loaded.netease.uid = std::to_string(uid.i());
+        } else if (uid.t() == crow::json::type::String) {
+          loaded.netease.uid = uid.s();
+        }
+      }
+      if (ne.has("timeout_ms")) {
+        loaded.netease.timeout_ms = static_cast<int>(ne["timeout_ms"].i());
+      }
+      if (ne.has("metadata_ttl_ms")) {
+        loaded.netease.metadata_ttl_ms =
+            static_cast<int>(ne["metadata_ttl_ms"].i());
+      }
+      if (ne.has("max_concurrency")) {
+        loaded.netease.max_concurrency =
+            static_cast<int>(ne["max_concurrency"].i());
+      }
+      if (ne.has("real_ip")) {
+        loaded.netease.real_ip = ne["real_ip"].s();
       }
     }
     if (json.has("webdav")) {
@@ -277,6 +349,29 @@ const Config &load(const std::string &file) {
   if (loaded.image_cache.revalidate_seconds < 0) {
     throw std::runtime_error("image_cache.revalidate_seconds 不能为负数");
   }
+  if (loaded.netease.timeout_ms <= 0) {
+    throw std::runtime_error("netease.timeout_ms 必须为正数: " +
+                             std::to_string(loaded.netease.timeout_ms));
+  }
+  if (loaded.netease.metadata_ttl_ms < 0) {
+    throw std::runtime_error("netease.metadata_ttl_ms 不能为负数");
+  }
+  if (loaded.netease.max_concurrency < 1 ||
+      loaded.netease.max_concurrency > 64) {
+    throw std::runtime_error("netease.max_concurrency 超出范围 (1-64): " +
+                             std::to_string(loaded.netease.max_concurrency));
+  }
+  if (loaded.netease.enabled && loaded.netease.api_base.empty()) {
+    throw std::runtime_error("netease.api_base 不能为空");
+  }
+  if (loaded.netease.enabled) {
+    const std::string &base = loaded.netease.api_base;
+    const bool http = base.rfind("http://", 0) == 0;
+    const bool https = base.rfind("https://", 0) == 0;
+    if (!http && !https) {
+      throw std::runtime_error("netease.api_base 必须是 http(s) URL: " + base);
+    }
+  }
 
   g_config = loaded;
   g_loaded = true;
@@ -303,6 +398,29 @@ void setJellyfinPort(int port) {
 void setJellyfinEnabled(bool enabled) {
   get();
   g_config.jellyfin_enabled = enabled;
+}
+
+void setNeteaseEnabled(bool enabled) {
+  get();
+  g_config.netease.enabled = enabled;
+}
+
+void setNeteaseApi(std::string api_base) {
+  if (api_base.empty()) {
+    throw std::runtime_error("netease.api_base 不能为空");
+  }
+  const bool http = api_base.rfind("http://", 0) == 0;
+  const bool https = api_base.rfind("https://", 0) == 0;
+  if (!http && !https) {
+    throw std::runtime_error("netease.api_base 必须是 http(s) URL: " + api_base);
+  }
+  get();
+  g_config.netease.api_base = std::move(api_base);
+}
+
+void setNeteaseCookie(std::string cookie) {
+  get();
+  g_config.netease.cookie = std::move(cookie);
 }
 
 } // namespace config

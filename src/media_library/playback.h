@@ -1,6 +1,7 @@
 #ifndef MEDIA_LIBRARY_PLAYBACK_H
 #define MEDIA_LIBRARY_PLAYBACK_H
 
+#include "media_library/byte_stream.h"
 #include "media_library/domain.h"
 #include "media_library/error.h"
 #include "media_library/library.h"
@@ -53,26 +54,9 @@ struct PlaybackSession {
 // ---------------------------------------------------------------------------
 // 7.3 字节流
 //
-// 只暴露「读多少、跳到哪」，不暴露底层是文件、WebDAV 还是远端 URL。
+// 契约在 byte_stream.h（ByteStream）；AudioStream 是它的别名，
+// 因为音频只是「可 seek 的字节流」。
 // ---------------------------------------------------------------------------
-
-struct StreamInfo {
-  std::string mime_type;
-  std::int64_t size_bytes = -1; // -1 表示长度未知（不支持 Range）
-  bool seekable = true;
-};
-
-class AudioStream {
-public:
-  virtual ~AudioStream() = default;
-
-  virtual StreamInfo info() const = 0;
-
-  // 返回空数组表示流已结束；返回失败表示读到一半出错。
-  virtual Result<std::vector<std::byte>> read(std::size_t max_bytes) = 0;
-
-  virtual Status seek(std::int64_t offset) = 0;
-};
 
 class PlaybackService {
 public:

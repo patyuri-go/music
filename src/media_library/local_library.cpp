@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "db.h"
+#include "http_util.h"
 #include "schema.h"
 #include "storage.h"
 
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -127,6 +129,7 @@ void LocalLibrary::initialize() {
   register_capability<StreamResolver>(self);
   register_capability<LyricsProvider>(self);
   register_capability<ArtworkProvider>(self);
+  register_capability<ArtworkBytes>(self);
 
   entities_.backfill();
 }
@@ -633,6 +636,23 @@ Result<ArtworkRef> LocalLibrary::get_artwork(const SourceRef &owner,
   artwork.kind = "primary";
   artwork.cache_tag = std::to_string(std::hash<std::string>{}(path));
   return Result<ArtworkRef>::success(std::move(artwork));
+}
+
+Result<ArtworkLocation>
+LocalLibrary::artwork_location(const ArtworkRef &ref, const CallContext &) {
+  const std::string path = cover_path_of(ref.owner);
+  if (path.empty()) {
+    return Result<ArtworkLocation>::failure(
+        Error::make(ErrorCode::NotFound, "artwork not found"));
+  }
+
+  ArtworkLocation location;
+  location.mime_type = http_util::mimeType(std::filesystem::path(path));
+  // 虚拟路径原样带出：ArtworkService 用它命中 image_cache；
+  // locator 是解析后的真实路径，只在本进程内流转。
+  location.cache_virtual_path = path;
+  location.locator = storage::resolve(path);
+  return Result<ArtworkLocation>::success(std::move(location));
 }
 
 CatalogSnapshot LocalLibrary::snapshot() {

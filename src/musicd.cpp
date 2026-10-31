@@ -10,10 +10,13 @@
 #include "http_util.h"
 #include "image_cache.h"
 #include "jellyfin.h"
+#include "media_library/error.h"
 #include "media_library/library_runtime.h"
 #include "media_library/media_runtime.h"
+#include "media_library/netease_library.h"
 #include "stream_http.h"
 #include "api/v1/v1.h"
+#include "api/api-enhanced/ids.h"
 #include "metadata.h"
 #include "api/webdav/webdav.h"
 #include "schema.h"
@@ -808,11 +811,22 @@ int main(int argc, char *argv[]) {
       } else if (arg == "--jellyfin-enabled") {
         const std::string v = next("--jellyfin-enabled");
         config::setJellyfinEnabled(v == "1" || v == "true" || v == "TRUE");
+      } else if (arg == "--netease-enabled") {
+        const std::string v = next("--netease-enabled");
+        config::setNeteaseEnabled(v == "1" || v == "true" || v == "TRUE");
+      } else if (arg == "--netease-api") {
+        config::setNeteaseApi(next("--netease-api"));
+      } else if (arg == "--netease-cookie") {
+        // 明文凭据只进内存配置，不回显到任何输出。
+        config::setNeteaseCookie(next("--netease-cookie"));
       } else if (arg == "--help" || arg == "-h") {
         std::cout << "用法: musicd [选项]\n"
                   << "  --port N               主服务端口 (默认 5666)\n"
                   << "  --jellyfin-port N      Jellyfin 端口 (默认 8096)\n"
                   << "  --jellyfin-enabled B   是否启用 Jellyfin (1/0)\n"
+                  << "  --netease-enabled B    是否启用网易云库 (1/0)\n"
+                  << "  --netease-api URL      api-enhanced 地址\n"
+                  << "  --netease-cookie C     网易云 cookie（最高优先级）\n"
                   << "  -h, --help             显示帮助\n";
         return 0;
       } else {
@@ -850,15 +864,57 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // P1 组合根：把注册表、映射、优先级、路由与 5.4 门面组装一次。
-  try {
+  // P1 组合根：一次性组装全部库。本地库失败即致命；远端库失败只降级。
+  std::vector<media_library::LibrarySetup> setups;
+  {
     media_library::MediaRuntimeOptions options;
     options.library_id = "local-main";
     options.display_name = cfg.jellyfin_server_name;
     options.platform = media_library::PlatformKind::Local;
     options.priority = 100;
-    media_library::initialize_media_runtime(media_library::library_ptr(),
-                                            options);
+    setups.push_back(
+        media_library::LibrarySetup{media_library::library_ptr(), options});
+  }
+
+  if (cfg.netease.enabled) {
+    api_enhanced::NeteaseTransportOptions transport;
+    transport.api_base = cfg.netease.api_base;
+    transport.cookie = cfg.netease.cookie;
+    transport.timeout_ms = cfg.netease.timeout_ms;
+    transport.real_ip = cfg.netease.real_ip;
+
+    api_enhanced::NeteaseClientOptions client;
+    client.cookie = cfg.netease.cookie;
+    client.real_ip = cfg.netease.real_ip;
+    client.default_level = cfg.netease.default_level;
+    client.metadata_ttl_ms = cfg.netease.metadata_ttl_ms;
+
+    auto netease = media_library::make_netease_library(
+        std::string(api_enhanced::kNetEaseLibraryId), "网易云音乐", transport,
+        client);
+    if (!netease.ok()) {
+      // 配置错误或 api-enhanced 不可用都不该拖垮本地库。
+      std::cerr << "[netease] 未启用: "
+                << error_code_name(netease.error().code) << " "
+                << netease.error().message << std::endl;
+    } else {
+      media_library::MediaRuntimeOptions options;
+      options.library_id = std::string(api_enhanced::kNetEaseLibraryId);
+      options.display_name = "网易云音乐";
+      options.platform = media_library::PlatformKind::NetEase;
+      // 低于本地库：同实体优先本地文件，远端只做补充。
+      options.priority = 50;
+      options.limits.max_concurrency = cfg.netease.max_concurrency;
+      options.limits.default_timeout_ms = cfg.netease.timeout_ms;
+      options.initial_health = netease.value()->health().state;
+      options.initial_health_reason = netease.value()->health().reason;
+      setups.push_back(
+          media_library::LibrarySetup{netease.value(), options});
+    }
+  }
+
+  try {
+    media_library::initialize_media_runtime(std::move(setups));
   } catch (const std::exception &e) {
     std::cerr << "[fatal] 媒体库路由初始化失败: " << e.what() << std::endl;
     return 1;
@@ -989,13 +1045,13 @@ int main(int argc, char *argv[]) {
     if (!result) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    auto &library = media_library::library();
-    const auto ref =
-        library.ref_for_compat(media_library::EntityType::Track, id);
+    // TODO(legacy): 对外 id 仍是库内 int；改走 SourceRef 后这条补丁可删除。
+    const auto ref = media_library::compat_ref_for(
+        media_library::EntityType::Track, id);
     if (ref) {
-      const auto track = library.get_track(*ref, {});
-      if (track.ok() && !track.value().genres.empty()) {
-        (*result)["genre"] = track.value().genres.front();
+      const auto track = media_library::media_router().get_track(*ref, {});
+      if (track.ok() && !track.value().value.genres.empty()) {
+        (*result)["genre"] = track.value().value.genres.front();
       }
     }
     return jsonResponse(200, result->dump());
@@ -1167,8 +1223,10 @@ int main(int argc, char *argv[]) {
     return jsonResponse(200, result->dump());
   });
 
+  // TODO(legacy): 等媒体库层提供跨库专辑艺术家聚合后删除本地快照。
   CROW_ROUTE(app, "/api/album-artists")([] {
-    const auto snap = media_library::library().snapshot();
+    media_library::CatalogSnapshot snap;
+    media_library::compat_snapshot(snap);
     struct Row {
       int id = 0;
       std::string name;
@@ -1214,8 +1272,8 @@ int main(int argc, char *argv[]) {
       return jsonResponse(200, out.dump());
     }
 
-    auto &library = media_library::library();
-    const auto snap = library.snapshot();
+    media_library::CatalogSnapshot snap;
+    media_library::compat_snapshot(snap);
     const std::string needle = media_library_lower(q);
 
     std::unordered_map<int, std::string> artist_names;
@@ -1235,7 +1293,7 @@ int main(int argc, char *argv[]) {
       if (!track.album) {
         continue;
       }
-      const auto album_id = library.internal_id_of(track.album->ref);
+      const auto album_id = media_library::compat_internal_id_of(track.album->ref);
       if (!album_id) {
         continue;
       }
@@ -1305,7 +1363,7 @@ int main(int argc, char *argv[]) {
       }
       bool any = false;
       for (const auto &link : snap.albums[index->second].artists) {
-        if (const auto artist_id = library.internal_id_of(link.ref)) {
+        if (const auto artist_id = media_library::compat_internal_id_of(link.ref)) {
           by_artist[*artist_id].insert(album_id);
           any = true;
         }
@@ -1318,7 +1376,7 @@ int main(int argc, char *argv[]) {
       for (std::size_t i = 0; i < snap.albums.size(); ++i) {
         const int album_id = snap.album_internal_ids[i];
         for (const auto &link : snap.albums[i].artists) {
-          const auto linked = library.internal_id_of(link.ref);
+          const auto linked = media_library::compat_internal_id_of(link.ref);
           if (linked && *linked == artist_id) {
             by_artist[artist_id].insert(album_id);
             break;
@@ -1368,7 +1426,7 @@ int main(int argc, char *argv[]) {
         if (it != album_tracks.end()) {
           for (const std::size_t index : it->second) {
             const auto &track = snap.tracks[index];
-            const auto track_id = library.internal_id_of(track.ref);
+            const auto track_id = media_library::compat_internal_id_of(track.ref);
             if (!track_id) {
               continue;
             }
@@ -1637,8 +1695,10 @@ int main(int argc, char *argv[]) {
     return jsonResponse(200, out.dump());
   });
 
+  // TODO(legacy): 跨库聚合后由媒体库层直接提供最近播放列表。
   CROW_ROUTE(app, "/api/recent")([] {
-    const auto snap = media_library::library().snapshot();
+    media_library::CatalogSnapshot snap;
+    media_library::compat_snapshot(snap);
     crow::json::wvalue out(crow::json::type::List);
     int i = 0;
     for (const int internal_id : snap.recent_play_track_ids) {
@@ -1656,33 +1716,27 @@ int main(int argc, char *argv[]) {
     return jsonResponse(200, out.dump());
   });
 
-  CROW_ROUTE(app, "/api/album/<int>/cover")([](int id) {
-    auto &library = media_library::library();
-    const auto ref =
-        library.ref_for_compat(media_library::EntityType::Album, id);
-    if (!ref) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    const auto cover_path = library.artwork_path(*ref);
-    if (!cover_path || cover_path->empty()) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    const std::string cover_real = storage::resolve(*cover_path);
-    if (!webdav::isWebdavUrl(cover_real)) {
-      fs::path cover(cover_real);
-      if (!fs::exists(cover) || !isUnderAnyRoot(cover)) {
-        return jsonResponse(404, "{\"erro\":true}");
-      }
-    }
-    return http_util::serveImage(*cover_path);
-  });
+  // TODO(legacy): 对外 id 仍是库内 int；改走 SourceRef 后这条路由可删除。
+  CROW_ROUTE(app, "/api/album/<int>/cover")
+      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
+          [](const crow::request &req, int id) {
+            const auto ref = media_library::compat_ref_for(
+                media_library::EntityType::Album, id);
+            if (!ref) {
+              return jsonResponse(404, "{\"erro\":true}");
+            }
+            media_library::ArtworkRef artwork;
+            artwork.owner = *ref;
+            return stream_http::serve_artwork(
+                req, artwork, req.method == crow::HTTPMethod::HEAD);
+          });
 
   CROW_ROUTE(app, "/api/track/<int>/file")
       .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
           [](const crow::request &req, int id) {
-            auto &library = media_library::library();
-            const auto ref =
-                library.ref_for_compat(media_library::EntityType::Track, id);
+            // TODO(legacy): 对外 id 仍是库内 int；改走 SourceRef 后这条路由可删除。
+            const auto ref = media_library::compat_ref_for(
+                media_library::EntityType::Track, id);
             if (!ref) {
               return jsonResponse(404, "{\"erro\":true}");
             }
@@ -1787,17 +1841,17 @@ int main(int argc, char *argv[]) {
   });
 
   CROW_ROUTE(app, "/api/track/<int>/file-meta")([](int id) {
-    auto &library = media_library::library();
-    const auto ref =
-        library.ref_for_compat(media_library::EntityType::Track, id);
+    // TODO(legacy): 直接读本地文件标签，只对本地库有意义。
+    const auto ref = media_library::compat_ref_for(
+        media_library::EntityType::Track, id);
     if (!ref) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    const auto source = library.resolve_playback(*ref, {});
-    if (!source.ok() || source.value().internal_locator.empty()) {
+    const auto source = media_library::media_router().resolve_stream(*ref, {});
+    if (!source.ok() || source.value().value.internal_locator.empty()) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    const std::string track_real = source.value().internal_locator;
+    const std::string track_real = source.value().value.internal_locator;
     if (!webdav::isWebdavUrl(track_real) && !fs::exists(track_real)) {
       return jsonResponse(404, "{\"erro\":true}");
     }
@@ -1835,18 +1889,18 @@ int main(int argc, char *argv[]) {
   });
 
   CROW_ROUTE(app, "/api/track/<int>/lyrics")([](int id) {
-    auto &library = media_library::library();
-    const auto ref =
-        library.ref_for_compat(media_library::EntityType::Track, id);
+    // TODO(legacy): 对外 id 仍是库内 int；改走 SourceRef 后这条路由可删除。
+    const auto ref = media_library::compat_ref_for(
+        media_library::EntityType::Track, id);
     if (!ref) {
       return jsonResponse(404, "{\"erro\":true}");
     }
     crow::json::wvalue out;
     out["text"] = "";
     out["synced"] = false;
-    const auto lyrics = library.get_lyrics(*ref, {});
+    const auto lyrics = media_library::media_router().resolve_lyrics(*ref, {});
     if (lyrics.ok()) {
-      const auto &value = lyrics.value();
+      const auto &value = lyrics.value().value;
       out["text"] = value.plain_text.value_or(std::string());
       out["synced"] = value.mode != media_library::LyricsMode::Unsynced;
     }

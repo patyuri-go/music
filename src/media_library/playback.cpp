@@ -1,10 +1,9 @@
 #include "media_library/playback.h"
 
-#include "api/webdav/webdav.h"
+#include "media_library/byte_stream.h"
 
 #include <algorithm>
 #include <chrono>
-#include <fstream>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -13,8 +12,6 @@
 
 namespace media_library {
 namespace {
-
-constexpr std::size_t kReadChunk = 65536;
 
 class SystemClock final : public Clock {
 public:
@@ -44,228 +41,7 @@ Error internal_error(std::string message) {
   return Error::make(ErrorCode::Internal, std::move(message));
 }
 
-// ---------------------------------------------------------------------------
-// 本地文件流
-// ---------------------------------------------------------------------------
-
-class LocalFileAudioStream final : public AudioStream {
-public:
-  static Result<std::unique_ptr<AudioStream>> open(const std::string &path,
-                                                   std::string mime_type) {
-    auto file = std::make_unique<std::ifstream>(path, std::ios::binary);
-    if (!*file) {
-      return Result<std::unique_ptr<AudioStream>>::failure(
-          Error::make(ErrorCode::NotFound, "audio file not found"));
-    }
-    file->seekg(0, std::ios::end);
-    const std::streamoff size = file->tellg();
-    file->seekg(0, std::ios::beg);
-    if (!*file) {
-      return Result<std::unique_ptr<AudioStream>>::failure(
-          internal_error("cannot stat audio file"));
-    }
-    StreamInfo info;
-    info.mime_type = std::move(mime_type);
-    info.size_bytes = static_cast<std::int64_t>(size);
-    info.seekable = true;
-    std::unique_ptr<AudioStream> stream(
-        new LocalFileAudioStream(std::move(file), std::move(info)));
-    return Result<std::unique_ptr<AudioStream>>::success(std::move(stream));
-  }
-
-  StreamInfo info() const override { return info_; }
-
-  Result<std::vector<std::byte>> read(std::size_t max_bytes) override {
-    if (max_bytes == 0) {
-      return Result<std::vector<std::byte>>::success({});
-    }
-    std::size_t want = std::min<std::size_t>(max_bytes, kReadChunk);
-    if (info_.size_bytes >= 0) {
-      const std::int64_t remaining = info_.size_bytes - offset_;
-      if (remaining <= 0) {
-        return Result<std::vector<std::byte>>::success({});
-      }
-      if (static_cast<std::int64_t>(want) > remaining) {
-        want = static_cast<std::size_t>(remaining);
-      }
-    }
-    std::vector<std::byte> out(want);
-    file_->read(reinterpret_cast<char *>(out.data()),
-                static_cast<std::streamsize>(want));
-    const std::streamsize got = file_->gcount();
-    if (got <= 0) {
-      file_->clear();
-      return Result<std::vector<std::byte>>::success({});
-    }
-    out.resize(static_cast<std::size_t>(got));
-    offset_ += got;
-    return Result<std::vector<std::byte>>::success(std::move(out));
-  }
-
-  Status seek(std::int64_t offset) override {
-    if (offset < 0) {
-      return Status::failure(
-          Error::make(ErrorCode::InvalidRequest, "negative seek offset"));
-    }
-    file_->clear();
-    file_->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    if (!*file_) {
-      return Status::failure(internal_error("cannot seek audio file"));
-    }
-    offset_ = offset;
-    return Status::success();
-  }
-
-private:
-  LocalFileAudioStream(std::unique_ptr<std::ifstream> file, StreamInfo info)
-      : file_(std::move(file)), info_(std::move(info)) {}
-
-  std::unique_ptr<std::ifstream> file_;
-  StreamInfo info_;
-  std::int64_t offset_ = 0;
-};
-
-// ---------------------------------------------------------------------------
-// 远端（WebDAV / HTTP）流
-//
-// webdav::Stream 是顺序句柄，seek 只能靠带 Range 重新开一次连接，
-// 因此这里维护「当前连接对应的起始偏移」，seek 先关后置。
-// ---------------------------------------------------------------------------
-
-class RemoteAudioStream final : public AudioStream {
-public:
-  static Result<std::unique_ptr<AudioStream>> open(const PlaybackSource &source) {
-    if (source.internal_locator.empty()) {
-      return Result<std::unique_ptr<AudioStream>>::failure(
-          internal_error("playback source has no locator"));
-    }
-    StreamInfo info;
-    info.mime_type = source.mime_type;
-    info.size_bytes = source.content_length.value_or(-1);
-    info.seekable = source.range_supported;
-    std::unique_ptr<AudioStream> stream(
-        new RemoteAudioStream(source.internal_locator, std::move(info)));
-    return Result<std::unique_ptr<AudioStream>>::success(std::move(stream));
-  }
-
-  ~RemoteAudioStream() override { close_handle(); }
-
-  StreamInfo info() const override { return info_; }
-
-  Result<std::vector<std::byte>> read(std::size_t max_bytes) override {
-    if (max_bytes == 0) {
-      return Result<std::vector<std::byte>>::success({});
-    }
-    if (!ensure_open()) {
-      return Result<std::vector<std::byte>>::failure(open_error_);
-    }
-    std::size_t want = std::min<std::size_t>(max_bytes, kReadChunk);
-    if (info_.size_bytes >= 0) {
-      const std::int64_t remaining = info_.size_bytes - offset_;
-      if (remaining <= 0) {
-        close_handle();
-        return Result<std::vector<std::byte>>::success({});
-      }
-      if (static_cast<std::int64_t>(want) > remaining) {
-        want = static_cast<std::size_t>(remaining);
-      }
-    }
-    std::vector<std::byte> out(want);
-    const long long got = handle_.read(reinterpret_cast<char *>(out.data()), want);
-    if (got <= 0) {
-      close_handle();
-      return Result<std::vector<std::byte>>::success({});
-    }
-    out.resize(static_cast<std::size_t>(got));
-    offset_ += got;
-    return Result<std::vector<std::byte>>::success(std::move(out));
-  }
-
-  Status seek(std::int64_t offset) override {
-    if (offset < 0) {
-      return Status::failure(
-          Error::make(ErrorCode::InvalidRequest, "negative seek offset"));
-    }
-    if (!info_.seekable) {
-      return Status::failure(
-          Error::make(ErrorCode::Unsupported, "audio stream is not seekable"));
-    }
-    if (info_.size_bytes >= 0 && offset > info_.size_bytes) {
-      return Status::failure(
-          Error::make(ErrorCode::InvalidRequest, "seek beyond end of stream"));
-    }
-    close_handle();
-    offset_ = offset;
-    return Status::success();
-  }
-
-private:
-  RemoteAudioStream(std::string locator, StreamInfo info)
-      : locator_(std::move(locator)), info_(std::move(info)) {}
-
-  bool ensure_open() {
-    if (open_) {
-      return true;
-    }
-    const webdav::Url base = webdav::resolveCredentials(locator_);
-    std::vector<std::string> extra;
-    if (info_.seekable) {
-      extra.push_back("Range: bytes=" + std::to_string(offset_) + "-");
-    }
-    webdav::Stream stream = webdav::openStream(base, base.path, extra);
-    if (stream.status != 200 && stream.status != 206) {
-      if (stream.close) {
-        stream.close();
-      }
-      open_error_ = Error::make(ErrorCode::ProviderUnavailable,
-                               "cannot open remote audio stream");
-      open_error_.retryable = stream.status == 0;
-      return false;
-    }
-    if (info_.size_bytes < 0) {
-      if (stream.length >= 0) {
-        info_.size_bytes =
-            stream.length + (stream.status == 206 ? offset_ : 0);
-      } else if (const auto it = stream.headers.find("content-range");
-                 it != stream.headers.end()) {
-        const std::size_t slash = it->second.find('/');
-        if (slash != std::string::npos) {
-          try {
-            info_.size_bytes = std::stoll(it->second.substr(slash + 1));
-          } catch (const std::exception &) {
-            info_.size_bytes = -1;
-          }
-        }
-      }
-    }
-    if (info_.mime_type.empty()) {
-      const auto it = stream.headers.find("content-type");
-      if (it != stream.headers.end()) {
-        info_.mime_type = it->second;
-      }
-    }
-    handle_ = std::move(stream);
-    open_ = true;
-    return true;
-  }
-
-  void close_handle() {
-    if (open_) {
-      if (handle_.close) {
-        handle_.close();
-      }
-      open_ = false;
-    }
-  }
-
-  std::string locator_;
-  StreamInfo info_;
-  std::int64_t offset_ = 0;
-  webdav::Stream handle_;
-  bool open_ = false;
-  Error open_error_;
-};
-
+// 把 PlaybackSource 变成字节流。音频与图片共用 byte_stream 的两个适配器。
 Result<std::unique_ptr<AudioStream>> make_audio_stream(
     const PlaybackSource &source) {
   if (source.internal_locator.empty()) {
@@ -273,12 +49,17 @@ Result<std::unique_ptr<AudioStream>> make_audio_stream(
         internal_error("playback source has no locator"));
   }
   switch (source.kind) {
-  case PlaybackKind::LocalFile:
-  case PlaybackKind::Cache:
-    return LocalFileAudioStream::open(source.internal_locator, source.mime_type);
+  case PlaybackKind::LocalFile: {
+    return make_file_stream(source.internal_locator, source.mime_type);
+  }
+  case PlaybackKind::Cache: {
+    return make_file_stream(source.internal_locator, source.mime_type);
+  }
   case PlaybackKind::WebDav:
-  case PlaybackKind::RemoteStream:
-    return RemoteAudioStream::open(source);
+  case PlaybackKind::RemoteStream: {
+    return make_http_stream(source.internal_locator, source.mime_type,
+                            source.content_length, source.range_supported);
+  }
   }
   return Result<std::unique_ptr<AudioStream>>::failure(
       Error::make(ErrorCode::Unsupported, "unsupported playback kind"));

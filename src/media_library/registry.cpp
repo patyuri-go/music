@@ -142,7 +142,8 @@ public:
     entry.library = std::move(library);
     entry.registration = registration;
     entry.capabilities = std::move(capabilities);
-    entry.health.state = HealthState::Ok;
+    entry.health.state = registration.initial_health;
+    entry.health.reason = registration.initial_health_reason;
     entry.health.checked_at = 0;
     entry.registration_order = next_order_++;
 

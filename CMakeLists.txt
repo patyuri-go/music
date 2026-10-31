@@ -29,9 +29,15 @@ add_executable(musicd
   ./src/media_library/media_router.cpp
   ./src/media_library/media_runtime.cpp
   ./src/media_library/library_directory.cpp
+  ./src/media_library/byte_stream.cpp
   ./src/media_library/playback.cpp
+  ./src/media_library/artwork.cpp
+  ./src/media_library/netease_library.cpp
   ./src/stream_http.cpp
   ./src/api/v1/v1.cpp
+  ./src/api/api-enhanced/transport.cpp
+  ./src/api/api-enhanced/ids.cpp
+  ./src/api/api-enhanced/client.cpp
   ./src/api/jellyfin/ids.cpp
   ./src/api/jellyfin/dto.cpp
   ./src/api/jellyfin/jellyfin.cpp
@@ -60,6 +66,7 @@ target_include_directories(musicd PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/jellyfin
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/playlist
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/webdav
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/api/api-enhanced
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio-asio-1-36-0/asio/include
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib

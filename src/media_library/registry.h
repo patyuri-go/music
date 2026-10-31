@@ -58,6 +58,11 @@ struct LibraryRegistration {
   int priority = 0;
   bool enabled = true;
   LibraryLimits limits;
+  // 注册时的初始健康状态。未登录/已知不可用时不必先 add 成 Ok 再被修正，
+  // 否则第一个请求会按 Ok 的顺序被打到注定失败的库上。
+  HealthState initial_health = HealthState::Ok;
+  // 初始健康的原因（如未登录 = AuthRequired），仅在非 Ok 时有意义。
+  std::optional<ErrorCode> initial_health_reason;
 };
 
 class LibraryRegistry {

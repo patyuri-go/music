@@ -158,6 +158,32 @@ public:
                                         const CallContext &ctx) = 0;
 };
 
+// 封面字节的定位信息。
+//
+// `locator` 是内部定位符（本地绝对路径或 http(s) URL），与
+// PlaybackSource::internal_locator 同级：只允许 ArtworkService 消费，
+// 绝不出进程，也不进 HTTP 响应。
+struct ArtworkLocation {
+  std::string locator;
+  std::string mime_type;                    // 未知时留空，由扩展名/响应头补
+  std::optional<std::int64_t> size_bytes;   // 未知表示不承诺 Range
+  std::optional<std::int64_t> expires_at;   // 远端带 token 的图片链接
+  // 本地库专有：虚拟路径，用于命中 image_cache 的缩放/转码产物。
+  // 远端库留空。只被 ArtworkService 使用，不出进程。
+  std::optional<std::string> cache_virtual_path;
+};
+
+// 可选能力：把封面描述变成可打开的字节位置。
+//
+// ArtworkProvider 只返回 ArtworkRef（描述），不含字节；真正出图由应用层
+// ArtworkService 统一负责，它需要每个库告诉它「字节在哪」。
+class ArtworkBytes {
+public:
+  virtual ~ArtworkBytes() = default;
+  virtual Result<ArtworkLocation> artwork_location(const ArtworkRef &ref,
+                                                   const CallContext &ctx) = 0;
+};
+
 class Library {
 public:
   virtual ~Library() = default;

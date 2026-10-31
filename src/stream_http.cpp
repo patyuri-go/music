@@ -14,6 +14,7 @@
 namespace stream_http {
 namespace {
 
+using media_library::ByteStream;
 using media_library::Error;
 using media_library::ErrorCode;
 using media_library::PlaybackService;
@@ -94,7 +95,7 @@ crow::response error_response(const Error &error) {
 }
 
 crow::response serve(const crow::request &req,
-                     std::shared_ptr<media_library::AudioStream> stream,
+                     std::shared_ptr<media_library::ByteStream> stream,
                      const std::string &library_id, bool head_only) {
   if (stream == nullptr) {
     return error_response(
@@ -206,12 +207,12 @@ crow::response serve_session(const crow::request &req,
   if (!session.ok()) {
     return error_response(session.error());
   }
-  Result<std::unique_ptr<media_library::AudioStream>> opened =
+  Result<std::unique_ptr<media_library::ByteStream>> opened =
       service->open_stream(session_id, media_library::CallContext{});
   if (!opened.ok()) {
     return error_response(opened.error());
   }
-  std::shared_ptr<media_library::AudioStream> stream(std::move(opened).value());
+  std::shared_ptr<media_library::ByteStream> stream(std::move(opened).value());
   return serve(req, std::move(stream), session.value().stream.origin.library_id,
                head_only);
 }
@@ -229,17 +230,60 @@ crow::response serve_track(const crow::request &req,
   if (!session.ok()) {
     return error_response(session.error());
   }
-  Result<std::unique_ptr<media_library::AudioStream>> opened =
+  Result<std::unique_ptr<media_library::ByteStream>> opened =
       service->open_stream(session.value().session_id,
                            media_library::CallContext{});
   if (!opened.ok()) {
     return error_response(opened.error());
   }
-  std::shared_ptr<media_library::AudioStream> stream(std::move(opened).value());
+  std::shared_ptr<media_library::ByteStream> stream(std::move(opened).value());
   crow::response res = serve(req, std::move(stream),
                              session.value().stream.origin.library_id,
                              head_only);
   res.add_header("X-Playback-Session", session.value().session_id);
+  return res;
+}
+
+crow::response serve_artwork(const crow::request &req,
+                             const media_library::ArtworkRef &artwork,
+                             bool head_only) {
+  const std::shared_ptr<media_library::ArtworkService> service =
+      media_library::artwork_service_ptr();
+  if (service == nullptr) {
+    return error_response(Error::make(ErrorCode::ProviderUnavailable,
+                                      "media runtime is not initialized"));
+  }
+
+  const media_library::CallContext ctx;
+  Result<media_library::ArtworkInfo> info = service->info(artwork, ctx);
+  if (!info.ok()) {
+    return error_response(info.error());
+  }
+
+  const std::string &etag = info.value().etag;
+  if (!etag.empty()) {
+    const auto &request_etag = req.get_header_value("If-None-Match");
+    if (!request_etag.empty() && request_etag == etag) {
+      crow::response not_modified(304);
+      not_modified.add_header("ETag", etag);
+      not_modified.add_header("Cache-Control", "public, max-age=3600");
+      return not_modified;
+    }
+  }
+
+  Result<std::unique_ptr<media_library::ByteStream>> opened =
+      service->open(artwork, ctx);
+  if (!opened.ok()) {
+    return error_response(opened.error());
+  }
+
+  std::shared_ptr<media_library::ByteStream> stream(std::move(opened).value());
+  crow::response res =
+      serve(req, std::move(stream), info.value().library_id, head_only);
+  if (!etag.empty()) {
+    res.add_header("ETag", etag);
+  }
+  res.add_header("Cache-Control", "public, max-age=3600");
   return res;
 }
 

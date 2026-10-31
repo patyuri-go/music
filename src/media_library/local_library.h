@@ -22,6 +22,7 @@ class LocalLibrary : public Library,
                      public StreamResolver,
                      public LyricsProvider,
                      public ArtworkProvider,
+                     public ArtworkBytes,
                      public std::enable_shared_from_this<LocalLibrary> {
 public:
   LocalLibrary(std::string library_id, std::string display_name,
@@ -59,6 +60,11 @@ public:
 
   Result<ArtworkRef> get_artwork(const SourceRef &owner,
                                  const CallContext &ctx) override;
+
+  // 把封面描述变成可打开的字节位置（ArtworkService 消费）。
+  // `locator` 与 cache_virtual_path 都是内部定位信息，不出进程。
+  Result<ArtworkLocation> artwork_location(const ArtworkRef &ref,
+                                           const CallContext &ctx) override;
 
   // 封面文件路径；仅传输层使用。
   std::optional<std::string> artwork_path(const SourceRef &owner) const;
