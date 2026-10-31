@@ -102,7 +102,15 @@ crow::response serve(const crow::request &req,
         Error::make(ErrorCode::Internal, "audio stream is null"));
   }
 
-  const StreamInfo info = stream->info();
+  StreamInfo info = stream->info();
+  // 远端流惰性连接：长度未知时先探测，否则 Content-Length 会退化成 0。
+  if (info.size_bytes < 0) {
+    const media_library::Status prepared = stream->prepare();
+    if (!prepared.ok()) {
+      return error_response(prepared.error());
+    }
+    info = stream->info();
+  }
   const std::string range = req.get_header_value("Range");
 
   std::int64_t size = info.size_bytes;

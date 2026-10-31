@@ -728,7 +728,19 @@ crow::response track_lyrics(const crow::request &req, const std::string &ref) {
 }
 
 crow::response track_artwork(const crow::request &req, const std::string &ref) {
-  return track_aspect(req, ref, "artwork");
+  // 字节出口：owner 是曲目本身，由 ArtworkService 经 MediaRouter 选源后
+  // 落到对应库的 ArtworkProvider/ArtworkBytes；locator 不出进程。
+  const std::optional<SourceRef> parsed = parse_ref_param(ref);
+  if (!parsed.has_value()) {
+    return bad_ref();
+  }
+  if (parsed->entity_type != EntityType::Track) {
+    return invalid("expected a track reference");
+  }
+  media_library::ArtworkRef artwork;
+  artwork.owner = *parsed;
+  return stream_http::serve_artwork(req, artwork,
+                                    req.method == crow::HTTPMethod::HEAD);
 }
 
 // ---------------------------------------------------------------------------

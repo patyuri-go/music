@@ -674,4 +674,288 @@ NeteaseClient::song_url(std::int64_t id, const std::string &level,
       });
 }
 
+namespace {
+
+std::string trim_cr(std::string line) {
+  while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+    line.pop_back();
+  }
+  return line;
+}
+
+bool parse_clock(const std::string &text, std::int64_t &out_ms) {
+  // "mm:ss" / "mm:ss.xx" / "mm:ss.xxx"
+  const std::size_t colon = text.find(':');
+  if (colon == std::string::npos || colon == 0) {
+    return false;
+  }
+  const std::string minutes = text.substr(0, colon);
+  const std::string rest = text.substr(colon + 1);
+  const std::size_t dot = rest.find('.');
+  const std::string seconds = dot == std::string::npos ? rest : rest.substr(0, dot);
+  const std::string fraction =
+      dot == std::string::npos ? std::string() : rest.substr(dot + 1);
+  if (minutes.empty() || seconds.empty()) {
+    return false;
+  }
+  for (char c : minutes) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+  }
+  for (char c : seconds) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+  }
+  std::int64_t frac_ms = 0;
+  if (!fraction.empty()) {
+    for (char c : fraction) {
+      if (c < '0' || c > '9') {
+        return false;
+      }
+    }
+    std::string digits = fraction;
+    if (digits.size() > 3) {
+      digits = digits.substr(0, 3);
+    }
+    while (digits.size() < 3) {
+      digits.push_back('0');
+    }
+    frac_ms = std::stoll(digits);
+  }
+  out_ms = std::stoll(minutes) * 60000 + std::stoll(seconds) * 1000 + frac_ms;
+  return true;
+}
+
+// 取一行开头的所有 [ ... ] 标签；第一个可解析的时间标签作为行时间，
+// 最后一个标签之后的内容作为正文。非 '[' 开头的行（例如平台混进来的
+// JSON 人员行）直接跳过。
+bool parse_lrc_line(const std::string &raw, std::int64_t &start_ms,
+                    std::string &text, std::int64_t &offset_ms) {
+  if (raw.empty() || raw.front() != '[') {
+    return false;
+  }
+  std::size_t pos = 0;
+  bool have_time = false;
+  while (pos < raw.size() && raw[pos] == '[') {
+    const std::size_t close = raw.find(']', pos);
+    if (close == std::string::npos) {
+      return false;
+    }
+    const std::string tag = raw.substr(pos + 1, close - pos - 1);
+    if (tag.rfind("offset:", 0) == 0) {
+      try {
+        offset_ms = std::stoll(tag.substr(7));
+      } catch (...) {
+        offset_ms = 0;
+      }
+    } else if (!have_time) {
+      std::int64_t value = 0;
+      if (parse_clock(tag, value)) {
+        start_ms = value;
+        have_time = true;
+      }
+    }
+    pos = close + 1;
+  }
+  if (!have_time) {
+    return false;
+  }
+  text = raw.substr(pos);
+  return true;
+}
+
+std::vector<std::pair<std::int64_t, std::string>>
+parse_lrc(const std::string &body) {
+  std::vector<std::pair<std::int64_t, std::string>> lines;
+  std::int64_t offset_ms = 0;
+  std::size_t begin = 0;
+  while (begin <= body.size()) {
+    const std::size_t end = body.find('\n', begin);
+    const std::string raw = trim_cr(
+        body.substr(begin, end == std::string::npos ? std::string::npos
+                                                    : end - begin));
+    std::int64_t start_ms = 0;
+    std::string text;
+    if (parse_lrc_line(raw, start_ms, text, offset_ms)) {
+      lines.emplace_back(start_ms, std::move(text));
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    begin = end + 1;
+  }
+  if (offset_ms != 0) {
+    for (auto &line : lines) {
+      line.first = std::max<std::int64_t>(0, line.first + offset_ms);
+    }
+  }
+  return lines;
+}
+
+// YRC：[lineStart,lineDur](wordStart,wordDur,0)word...
+// 实测 wordStart 是绝对毫秒；若出现相对值（< lineStart）则按相对处理。
+std::vector<NeteaseLyricLine> parse_yrc(const std::string &body) {
+  std::vector<NeteaseLyricLine> lines;
+  std::size_t begin = 0;
+  while (begin <= body.size()) {
+    const std::size_t end = body.find('\n', begin);
+    const std::string raw = trim_cr(
+        body.substr(begin, end == std::string::npos ? std::string::npos
+                                                    : end - begin));
+    if (!raw.empty() && raw.front() == '[') {
+      const std::size_t close = raw.find(']');
+      if (close != std::string::npos) {
+        const std::string head = raw.substr(1, close - 1);
+        const std::size_t comma = head.find(',');
+        if (comma != std::string::npos) {
+          try {
+            NeteaseLyricLine line;
+            line.start_ms = std::stoll(head.substr(0, comma));
+            const std::int64_t duration = std::stoll(head.substr(comma + 1));
+            line.end_ms = line.start_ms + duration;
+            std::size_t pos = close + 1;
+            while (pos < raw.size() && raw[pos] == '(') {
+              const std::size_t paren = raw.find(')', pos);
+              if (paren == std::string::npos) {
+                break;
+              }
+              const std::string word_head = raw.substr(pos + 1, paren - pos - 1);
+              std::int64_t word_start = 0;
+              std::int64_t word_duration = 0;
+              bool parsed = false;
+              const std::size_t c1 = word_head.find(',');
+              if (c1 != std::string::npos) {
+                const std::size_t c2 = word_head.find(',', c1 + 1);
+                if (c2 != std::string::npos) {
+                  try {
+                    word_start = std::stoll(word_head.substr(0, c1));
+                    word_duration = std::stoll(word_head.substr(c1 + 1, c2 - c1 - 1));
+                    parsed = true;
+                  } catch (...) {
+                    parsed = false;
+                  }
+                }
+              }
+              const std::size_t next = raw.find('(', paren + 1);
+              const std::string word_text =
+                  raw.substr(paren + 1, next == std::string::npos
+                                            ? std::string::npos
+                                            : next - paren - 1);
+              if (parsed) {
+                if (word_start < line.start_ms) {
+                  word_start += line.start_ms;
+                }
+                NeteaseLyricWord word;
+                word.start_ms = word_start;
+                if (word_duration > 0) {
+                  word.end_ms = word_start + word_duration;
+                }
+                word.text = word_text;
+                line.words.push_back(std::move(word));
+              }
+              line.text += word_text;
+              pos = next == std::string::npos ? raw.size() : next;
+            }
+            lines.push_back(std::move(line));
+          } catch (...) {
+            // 单个坏行不影响整首歌词。
+          }
+        }
+      }
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    begin = end + 1;
+  }
+  return lines;
+}
+
+} // namespace
+
+media_library::Result<NeteaseLyrics>
+NeteaseClient::lyric(std::int64_t id, const media_library::CallContext &ctx) {
+  using Result = media_library::Result<NeteaseLyrics>;
+  if (id <= 0) {
+    return Result::failure(media_library::Error::make(
+        media_library::ErrorCode::InvalidRequest, "netease lyric id is invalid"));
+  }
+  auto body = get_json("/lyric/new", {{"id", std::to_string(id)}}, ctx);
+  if (!body.ok()) {
+    return Result::failure(body.error());
+  }
+  return parse_body<NeteaseLyrics>(
+      body.value(), "/lyric/new", [](const crow::json::rvalue &json) {
+        NeteaseLyrics lyrics;
+        std::string lrc_text;
+        std::string tlyric_text;
+        std::string yrc_text;
+        if (json.has("lrc") && is_object(json["lrc"])) {
+          lrc_text = field_string(json["lrc"], "lyric");
+        }
+        if (json.has("tlyric") && is_object(json["tlyric"])) {
+          tlyric_text = field_string(json["tlyric"], "lyric");
+        }
+        if (json.has("yrc") && is_object(json["yrc"])) {
+          yrc_text = field_string(json["yrc"], "lyric");
+        }
+
+        // 翻译按行时间对齐后并入正文；空译文不合并。
+        std::vector<std::pair<std::int64_t, std::string>> translated =
+            parse_lrc(tlyric_text);
+
+        auto lines = parse_lrc(lrc_text);
+        if (!lines.empty()) {
+          lyrics.line_synced = true;
+        }
+
+        for (const auto &line : lines) {
+          NeteaseLyricLine out;
+          out.start_ms = line.first;
+          out.text = line.second;
+          if (!out.text.empty()) {
+            for (const auto &item : translated) {
+              if (item.first == out.start_ms && !item.second.empty()) {
+                out.text += " / " + item.second;
+                break;
+              }
+            }
+            lyrics.lines.push_back(std::move(out));
+          }
+          if (!lyrics.plain_text.empty()) {
+            lyrics.plain_text += '\n';
+          }
+          lyrics.plain_text += line.second;
+        }
+
+        // YRC 优先：有可解析行就是逐字同步。
+        auto word_lines = parse_yrc(yrc_text);
+        if (!word_lines.empty()) {
+          lyrics.word_synced = true;
+          std::string plain;
+          for (const auto &line : word_lines) {
+            if (!plain.empty()) {
+              plain += '\n';
+            }
+            plain += line.text;
+          }
+          if (!plain.empty()) {
+            lyrics.plain_text = std::move(plain);
+          }
+          lyrics.lines = std::move(word_lines);
+        }
+
+        // pureMusic：平台用「纯音乐，请欣赏」占位，那不是歌词。
+        // 清空后由媒体库层翻译成 NotFound（与本地库口径一致）。
+        if (field_bool(json, "pureMusic", false) && !lyrics.word_synced) {
+          lyrics.lines.clear();
+          lyrics.plain_text.clear();
+          lyrics.line_synced = false;
+        }
+        return lyrics;
+      });
+}
+
 } // namespace api_enhanced

@@ -28,6 +28,8 @@ class NeteaseLibrary : public Library,
                        public CatalogReader,
                        public Searcher,
                        public StreamResolver,
+                       public LyricsProvider,
+                       public ArtworkProvider,
                        public ArtworkBytes,
                        public std::enable_shared_from_this<NeteaseLibrary> {
 public:
@@ -63,7 +65,13 @@ public:
   Result<PlaybackSource> resolve_playback(const TrackRef &ref,
                                           const CallContext &ctx) override;
 
-  // N4 未实现：封面字节出口留到 N4，这里显式 Unsupported 而不是空 locator。
+  // N4：歌词（§9）与封面（§5）。
+  Result<Lyrics> get_lyrics(const TrackRef &ref,
+                            const CallContext &ctx) override;
+  Result<ArtworkRef> get_artwork(const SourceRef &owner,
+                                 const CallContext &ctx) override;
+
+  // 封面字节出口：locator 是远端 http 图片地址，只进 ArtworkService。
   Result<ArtworkLocation> artwork_location(const ArtworkRef &ref,
                                            const CallContext &ctx) override;
 
@@ -85,6 +93,11 @@ private:
   // 登录态快照：只用于把 fee==1 翻译成 playable/restriction。
   std::optional<api_enhanced::NeteaseLoginStatus> login_snapshot() const;
   bool member_active() const;
+
+  // 按 owner 类型取封面 URL：专辑/艺术家一次请求，曲目走 song/detail。
+  // 取不到返回 nullopt，由调用方翻译成 NotFound。
+  std::optional<std::string> picture_of(const SourceRef &owner,
+                                        const CallContext &ctx) const;
 
   std::string library_id_;
   std::string display_name_;

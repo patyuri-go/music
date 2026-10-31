@@ -116,6 +116,28 @@ struct NeteaseSongUrl {
   std::int64_t time_ms{0};
 };
 
+// 逐字歌词的一个词。start_ms 是相对整首歌的绝对毫秒。
+struct NeteaseLyricWord {
+  std::int64_t start_ms{0};
+  std::optional<std::int64_t> end_ms;
+  std::string text;
+};
+
+struct NeteaseLyricLine {
+  std::int64_t start_ms{0};
+  std::optional<std::int64_t> end_ms;
+  std::string text;
+  std::vector<NeteaseLyricWord> words;
+};
+
+// /lyric/new 的解析结果。翻译已按时间轴合并进 line.text（"原文 / 译文"）。
+struct NeteaseLyrics {
+  std::vector<NeteaseLyricLine> lines;
+  bool word_synced{false};
+  bool line_synced{false};
+  std::string plain_text;
+};
+
 template <typename T> struct NeteasePage {
   std::vector<T> items;
   bool has_more{false};
@@ -171,6 +193,11 @@ public:
   media_library::Result<NeteaseSongUrl>
   song_url(std::int64_t id, const std::string &level,
            const media_library::CallContext &ctx);
+
+  // /lyric/new?id=：lrc / tlyric / yrc 三路，解析成统一的行/词结构。
+  // 无歌词时返回空 lines（由媒体库层翻译成 NotFound）。
+  media_library::Result<NeteaseLyrics>
+  lyric(std::int64_t id, const media_library::CallContext &ctx);
 
   const NeteaseClientOptions &options() const noexcept { return options_; }
 

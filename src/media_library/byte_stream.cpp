@@ -125,6 +125,14 @@ public:
 
   StreamInfo info() const override { return info_; }
 
+  // 打开连接并从响应头补齐长度/mime；失败时把错误留给调用方。
+  Status prepare() override {
+    if (!ensure_open()) {
+      return Status::failure(open_error_);
+    }
+    return Status::success();
+  }
+
   Result<std::vector<std::byte>> read(std::size_t max_bytes) override {
     if (max_bytes == 0) {
       return Result<std::vector<std::byte>>::success({});

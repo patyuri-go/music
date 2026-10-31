@@ -22,10 +22,26 @@ std::int64_t now_ms() {
       .count();
 }
 
-// 封面身份用 picUrl 的哈希：同一张图得到同一个 tag，不同图必然不同。
+// 封面身份用图片 URL 的哈希：同一张图得到同一个 tag，不同图必然不同。
 // 仓库里没有 MD5 实现，这里沿用本地库的 std::hash 口径（见计划 §4.2）。
+//
+// 注意只用 URL 的 path：网易云图片 CDN 主机名会在 p1..p4 / m7 等之间轮换，
+// 同一张图两次请求可能拿到不同 host；按整串哈希会让 ETag 跨请求漂移，
+// 条件请求与客户端缓存全部失效。
+std::string artwork_key(const std::string &url) {
+  const std::size_t scheme = url.find("://");
+  if (scheme == std::string::npos) {
+    return url;
+  }
+  const std::size_t slash = url.find('/', scheme + 3);
+  if (slash == std::string::npos) {
+    return url;
+  }
+  return url.substr(slash);
+}
+
 std::string cache_tag_of(const std::string &key) {
-  return std::to_string(std::hash<std::string>{}(key));
+  return std::to_string(std::hash<std::string>{}(artwork_key(key)));
 }
 
 // publishTime 是毫秒时间戳；0/缺省视为「无日期」，不猜。
@@ -183,10 +199,12 @@ NeteaseLibrary::NeteaseLibrary(
 
 void NeteaseLibrary::initialize() {
   auto self = shared_from_this();
-  // 注册顺序与 LocalLibrary 一致：目录 → 搜索 → 播放 → 封面。
+  // 注册顺序与 LocalLibrary 一致：目录 → 搜索 → 播放 → 歌词 → 封面。
   register_capability<CatalogReader>(self);
   register_capability<Searcher>(self);
   register_capability<StreamResolver>(self);
+  register_capability<LyricsProvider>(self);
+  register_capability<ArtworkProvider>(self);
   register_capability<ArtworkBytes>(self);
 }
 
@@ -207,12 +225,12 @@ CapabilitySet NeteaseLibrary::capabilities() const {
     state.reason = reason;
     set.items.push_back(std::move(state));
   };
-  // N2 打开只读目录、搜索与直链解析；歌词/封面/歌单在 N4/N5。
+  // N2 打开只读目录、搜索与直链解析；N4 补歌词与封面；歌单在 N5。
   add(CapabilityId::CatalogRead, true, std::nullopt);
   add(CapabilityId::Search, true, std::nullopt);
   add(CapabilityId::StreamResolve, true, std::nullopt);
-  add(CapabilityId::LyricsRead, false, ErrorCode::Unsupported);
-  add(CapabilityId::ArtworkRead, false, ErrorCode::Unsupported);
+  add(CapabilityId::LyricsRead, true, std::nullopt);
+  add(CapabilityId::ArtworkRead, true, std::nullopt);
   add(CapabilityId::PlaylistRead, false, ErrorCode::Unsupported);
   add(CapabilityId::PlaylistWrite, false, ErrorCode::Unsupported);
   add(CapabilityId::FavoriteRead, false, ErrorCode::Unsupported);
@@ -870,6 +888,17 @@ NeteaseLibrary::resolve_playback(const TrackRef &ref, const CallContext &ctx) {
     return R::failure(std::move(error));
   }
 
+  // §4.6：VIP 曲 + 非会员 = 不可播。未登录时平台会给一段 45 秒试听直链
+  // （freeTrialInfo 非空），但按 §4.6 的限制矩阵这仍是「拒绝」，不是
+  // 「播一段」。会员用户拿到的试听片段（例如超出其音质权的等级）才按
+  // 试听处理（见下方 §8.1 的 trial 分支）。
+  if (url.value().free_trial && url.value().fee == 1 && !member_active()) {
+    Error error = Error::make(ErrorCode::PermissionDenied,
+                              "netease track requires a vip membership");
+    error.restriction = RestrictionCode::VipRequired;
+    return R::failure(std::move(error));
+  }
+
   PlaybackSource source;
   source.track = ref;
   source.kind = PlaybackKind::RemoteStream;
@@ -904,11 +933,168 @@ NeteaseLibrary::resolve_playback(const TrackRef &ref, const CallContext &ctx) {
   return R::success(std::move(source));
 }
 
+std::optional<std::string>
+NeteaseLibrary::picture_of(const SourceRef &owner,
+                           const CallContext &ctx) const {
+  std::shared_ptr<api_enhanced::NeteaseClient> client;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    client = client_;
+  }
+  if (client == nullptr) {
+    return std::nullopt;
+  }
+  const auto id = api_enhanced::platform_id_of(owner);
+  if (!id.has_value()) {
+    return std::nullopt;
+  }
+
+  switch (owner.entity_type) {
+  case EntityType::Album: {
+    auto album = client->album(id.value(), ctx);
+    if (album.ok() && !album.value().brief.pic_url.empty()) {
+      return album.value().brief.pic_url;
+    }
+    return std::nullopt;
+  }
+  case EntityType::Track: {
+    auto songs = client->song_detail({id.value()}, ctx);
+    if (!songs.ok()) {
+      return std::nullopt;
+    }
+    for (const auto &song : songs.value()) {
+      if (song.id == id.value() && !song.album.pic_url.empty()) {
+        return song.album.pic_url;
+      }
+    }
+    return std::nullopt;
+  }
+  case EntityType::Artist:
+  case EntityType::AlbumArtist: {
+    auto artist = client->artist(id.value(), ctx);
+    if (artist.ok() && !artist.value().pic_url.empty()) {
+      return artist.value().pic_url;
+    }
+    return std::nullopt;
+  }
+  default:
+    return std::nullopt;
+  }
+}
+
+Result<ArtworkRef> NeteaseLibrary::get_artwork(const SourceRef &owner,
+                                               const CallContext &ctx) {
+  if (owner.library_id != library_id_) {
+    return Result<ArtworkRef>::failure(
+        Error::make(ErrorCode::InvalidRequest, "invalid artwork owner"));
+  }
+
+  // 曲目的封面就是专辑封面：把 owner 换成专辑，与 Track::artwork 的
+  // owner/cache_tag 口径完全一致（同一个 ETag，不会因 CDN 域名不同而漂移）。
+  SourceRef target = owner;
+  if (owner.entity_type == EntityType::Track) {
+    std::shared_ptr<api_enhanced::NeteaseClient> client;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      client = client_;
+    }
+    const auto id = api_enhanced::platform_id_of(owner);
+    if (client != nullptr && id.has_value()) {
+      auto songs = client->song_detail({id.value()}, ctx);
+      if (songs.ok()) {
+        for (const auto &song : songs.value()) {
+          if (song.id != id.value() || song.album.id <= 0) {
+            continue;
+          }
+          auto album_ref =
+              api_enhanced::make_ref(EntityType::Album, song.album.id);
+          if (album_ref.ok()) {
+            target = std::move(album_ref).value();
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  const std::optional<std::string> picture = picture_of(target, ctx);
+  if (!picture.has_value() || picture->empty()) {
+    return Result<ArtworkRef>::failure(
+        Error::make(ErrorCode::NotFound, "netease artwork not found"));
+  }
+  return Result<ArtworkRef>::success(
+      ArtworkRef{target, "primary", std::nullopt, cache_tag_of(*picture)});
+}
+
 Result<ArtworkLocation>
-NeteaseLibrary::artwork_location(const ArtworkRef &ref, const CallContext &) {
-  (void)ref;
-  return Result<ArtworkLocation>::failure(
-      Error::make(ErrorCode::Unsupported, "netease artwork is not wired yet"));
+NeteaseLibrary::artwork_location(const ArtworkRef &ref, const CallContext &ctx) {
+  const std::optional<std::string> picture = picture_of(ref.owner, ctx);
+  if (!picture.has_value() || picture->empty()) {
+    return Result<ArtworkLocation>::failure(
+        Error::make(ErrorCode::NotFound, "netease artwork not found"));
+  }
+  ArtworkLocation location;
+  // locator 只进 ArtworkService；cache_virtual_path 留空（远端没有本地缓存键）。
+  location.locator = *picture;
+  location.mime_type = "image/jpeg";
+  return Result<ArtworkLocation>::success(std::move(location));
+}
+
+Result<Lyrics> NeteaseLibrary::get_lyrics(const TrackRef &ref,
+                                          const CallContext &ctx) {
+  using R = Result<Lyrics>;
+  if (ref.entity_type != EntityType::Track || ref.library_id != library_id_) {
+    return R::failure(
+        Error::make(ErrorCode::InvalidRequest, "invalid track reference"));
+  }
+  const auto id = api_enhanced::parse_platform_id(ref.entity_id);
+  if (!id.ok()) {
+    return R::failure(id.error());
+  }
+
+  std::shared_ptr<api_enhanced::NeteaseClient> client;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    client = client_;
+  }
+  if (client == nullptr) {
+    return R::failure(
+        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+  }
+
+  auto parsed = client->lyric(id.value(), ctx);
+  if (!parsed.ok()) {
+    return R::failure(parsed.error());
+  }
+  if (parsed.value().lines.empty()) {
+    // 无歌词（含纯音乐）：与本地库一致，返回 NotFound 让门面给 404。
+    return R::failure(Error::make(ErrorCode::NotFound, "lyrics not found"));
+  }
+
+  Lyrics lyrics;
+  lyrics.track = ref;
+  lyrics.mode = parsed.value().word_synced
+                    ? LyricsMode::WordSynced
+                    : (parsed.value().line_synced ? LyricsMode::LineSynced
+                                                  : LyricsMode::Unsynced);
+  if (!parsed.value().plain_text.empty()) {
+    lyrics.plain_text = parsed.value().plain_text;
+  }
+  for (const auto &line : parsed.value().lines) {
+    LyricLine out;
+    out.start_ms = line.start_ms;
+    out.end_ms = line.end_ms;
+    out.text = line.text;
+    for (const auto &word : line.words) {
+      LyricWord converted;
+      converted.start_ms = word.start_ms;
+      converted.end_ms = word.end_ms;
+      converted.text = word.text;
+      out.words.push_back(std::move(converted));
+    }
+    lyrics.lines.push_back(std::move(out));
+  }
+  return R::success(std::move(lyrics));
 }
 
 Result<std::shared_ptr<NeteaseLibrary>>
