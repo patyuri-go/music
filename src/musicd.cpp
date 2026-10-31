@@ -917,7 +917,8 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    media_library::initialize_media_runtime(std::move(setups));
+    media_library::initialize_media_runtime(std::move(setups),
+                                            cfg.library_priority);
   } catch (const std::exception &e) {
     std::cerr << "[fatal] 媒体库路由初始化失败: " << e.what() << std::endl;
     return 1;

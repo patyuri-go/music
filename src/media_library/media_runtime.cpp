@@ -5,6 +5,7 @@
 
 #include <optional>
 
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -35,7 +36,8 @@ Runtime &state() {
 
 } // namespace
 
-void initialize_media_runtime(std::vector<LibrarySetup> libraries) {
+void initialize_media_runtime(std::vector<LibrarySetup> libraries,
+                              std::vector<std::string> aggregate_order) {
   if (libraries.empty()) {
     throw std::invalid_argument(
         "initialize_media_runtime: no library to register");
@@ -82,6 +84,23 @@ void initialize_media_runtime(std::vector<LibrarySetup> libraries) {
   next.links = make_memory_entity_link_resolver(
       next.aspect_priority, make_registry_builtin_order(next.registry));
   next.aggregate_priority = make_memory_aggregate_priority();
+  // 配置里的 library_priority 是聚合分层的唯一出口。未注册的 id 只警告不报错：
+  // 被关闭的库（如 netease.enabled=false）留在配置里是正常情况。
+  if (!aggregate_order.empty()) {
+    for (const std::string &id : aggregate_order) {
+      if (next.registry->library(id) == nullptr) {
+        std::cerr << "[media] library_priority 引用了未注册的库: " << id
+                  << std::endl;
+      }
+    }
+    const Status ordered = next.aggregate_priority->set_order(aggregate_order);
+    if (!ordered.ok()) {
+      throw std::runtime_error(
+          "initialize_media_runtime: aggregate priority: " +
+          std::string(error_code_name(ordered.error().code)) + " " +
+          ordered.error().message);
+    }
+  }
   next.router = make_router(next.registry, next.links, next.aspect_priority,
                             next.aggregate_priority);
   next.media_router = make_media_router(next.router);

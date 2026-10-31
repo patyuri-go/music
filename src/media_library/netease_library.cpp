@@ -736,6 +736,7 @@ Result<Page<SearchHit>> NeteaseLibrary::search(const SearchQuery &query,
         }
         hit.artists = track.artists;
         hit.album_artists = track.album_artists;
+        hit.album = track.album;
         hit.artwork = track.artwork;
         hit.duration_ms = track.duration_ms;
         hit.playable = track.playable;

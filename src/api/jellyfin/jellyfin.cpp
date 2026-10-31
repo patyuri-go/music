@@ -19,7 +19,6 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <random>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -70,12 +69,6 @@ std::string lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(),
                  [](unsigned char c) { return std::tolower(c); });
   return s;
-}
-
-std::string trimCopy(const std::string &s) {
-  const std::size_t b = s.find_first_not_of(" \t\r\n");
-  const std::size_t e = s.find_last_not_of(" \t\r\n");
-  return (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
 }
 
 // 同时按原样与全小写注册路由，兼容 ASP.NET 的大小写不敏感路由。
@@ -163,139 +156,14 @@ crow::response emptyList() {
   return json(200, arr);
 }
 
-// ------------------------------------------------------------------ 排序/分页
+// -------------------------------------------------------------------- 分页
 
-struct Sortable {
-  std::string sortKey;
-  std::string addedAt;
-  int year = 0;
-  std::string albumKey;
-  std::string artistKey;
-  int playCount = 0;
-  std::string lastPlayed;
-  int discNo = 1;
-  int trackNo = 0;
-  crow::json::wvalue dto;
-};
-
-namespace {
-
-enum class SortField {
-  SortKey,
-  AlbumKey,
-  ArtistKey,
-  AddedAt,
-  Year,
-  PlayCount,
-  LastPlayed,
-  DiscNo,
-  TrackNo
-};
-
-int compareSortField(const Sortable &a, const Sortable &b, SortField f) {
-  switch (f) {
-  case SortField::SortKey: {
-    const std::string x = lower(a.sortKey);
-    const std::string y = lower(b.sortKey);
-    return x < y ? -1 : (x > y ? 1 : 0);
-  }
-  case SortField::AlbumKey: {
-    const std::string x = lower(a.albumKey);
-    const std::string y = lower(b.albumKey);
-    return x < y ? -1 : (x > y ? 1 : 0);
-  }
-  case SortField::ArtistKey: {
-    const std::string x = lower(a.artistKey);
-    const std::string y = lower(b.artistKey);
-    return x < y ? -1 : (x > y ? 1 : 0);
-  }
-  case SortField::AddedAt:
-    return a.addedAt < b.addedAt ? -1 : (a.addedAt > b.addedAt ? 1 : 0);
-  case SortField::Year:
-    return a.year < b.year ? -1 : (a.year > b.year ? 1 : 0);
-  case SortField::PlayCount:
-    return a.playCount < b.playCount ? -1 : (a.playCount > b.playCount ? 1 : 0);
-  case SortField::LastPlayed:
-    return a.lastPlayed < b.lastPlayed ? -1
-                                       : (a.lastPlayed > b.lastPlayed ? 1 : 0);
-  case SortField::DiscNo:
-    return a.discNo < b.discNo ? -1 : (a.discNo > b.discNo ? 1 : 0);
-  case SortField::TrackNo:
-    return a.trackNo < b.trackNo ? -1 : (a.trackNo > b.trackNo ? 1 : 0);
-  }
-  return 0;
-}
-
-} // namespace
-
-void sortItems(std::vector<Sortable> &items, const std::string &sortBy,
-               const std::string &order) {
-  // Jellyfin sends a comma separated list of sort keys. Apply every key we
-  // recognise, in order, as a tie-breaker chain. Unknown keys are ignored so
-  // that the order produced by the database query is preserved.
-  std::vector<SortField> fields;
-  bool random = false;
-  std::size_t start = 0;
-  while (start <= sortBy.size()) {
-    const std::size_t comma = sortBy.find(',', start);
-    std::string tok = (comma == std::string::npos)
-                          ? sortBy.substr(start)
-                          : sortBy.substr(start, comma - start);
-    tok = lower(trimCopy(tok));
-    if (tok == "random") {
-      random = true;
-    } else if (tok == "name" || tok == "sortname") {
-      fields.push_back(SortField::SortKey);
-    } else if (tok == "album") {
-      fields.push_back(SortField::AlbumKey);
-    } else if (tok == "albumartist" || tok == "artist") {
-      fields.push_back(SortField::ArtistKey);
-    } else if (tok == "datecreated" || tok == "datelastcontentadded" ||
-               tok == "datelastmediaadded") {
-      fields.push_back(SortField::AddedAt);
-    } else if (tok == "productionyear") {
-      fields.push_back(SortField::Year);
-    } else if (tok == "playcount") {
-      fields.push_back(SortField::PlayCount);
-    } else if (tok == "dateplayed" || tok == "datelastplayed") {
-      fields.push_back(SortField::LastPlayed);
-    } else if (tok == "parentindexnumber") {
-      fields.push_back(SortField::DiscNo);
-    } else if (tok == "indexnumber") {
-      fields.push_back(SortField::TrackNo);
-    }
-    if (comma == std::string::npos) {
-      break;
-    }
-    start = comma + 1;
-  }
-  if (random) {
-    std::mt19937 rng(std::random_device{}());
-    std::shuffle(items.begin(), items.end(), rng);
-    return;
-  }
-  if (fields.empty()) {
-    return;
-  }
-  std::stable_sort(items.begin(), items.end(),
-                   [&fields](const Sortable &a, const Sortable &b) {
-                     for (const SortField f : fields) {
-                       const int c = compareSortField(a, b, f);
-                       if (c != 0) {
-                         return c < 0;
-                       }
-                     }
-                     return false;
-                   });
-  if (order == "Descending") {
-    std::reverse(items.begin(), items.end());
-  }
-}
-
-crow::response respondItems(std::vector<Sortable> &items,
-                            const std::string &sortBy, const std::string &order,
+// 门面一律不排序：顺序完全由 media_library 决定（聚合结果按配置的
+// library_priority 分层，单库结果用该库自己的自然顺序）。客户端传来的
+// sortBy / sortOrder 被忽略——门面重排会打散聚合 tier，且远端库没有
+// 全量数据，无法给出「全局有序」的保证。
+crow::response respondItems(std::vector<crow::json::wvalue> &items,
                             int startIndex, int limit) {
-  sortItems(items, sortBy, order);
   const int total = static_cast<int>(items.size());
   int from = startIndex < 0 ? 0 : startIndex;
   if (from > total) {
@@ -307,7 +175,7 @@ crow::response respondItems(std::vector<Sortable> &items,
   }
   std::vector<crow::json::wvalue> out;
   for (int i = from; i < to; ++i) {
-    out.push_back(std::move(items[i].dto));
+    out.push_back(std::move(items[i]));
   }
   return json(200, queryResult(std::move(out), total, from));
 }
@@ -432,57 +300,30 @@ std::vector<std::string> splitCsv(const std::string &s) {
   return out;
 }
 
-Sortable remoteTrackSortable(const media_library::Track &track) {
-  Sortable s;
-  s.sortKey = track.title;
-  s.addedAt = track.user_data.added_at;
-  s.year = track.year.value_or(0);
-  s.albumKey = track.album.has_value() ? track.album->title : std::string();
-  const std::vector<IdPair> artists = artist_pairs_of(track.artists);
-  if (!artists.empty()) {
-    s.artistKey = artists.front().first;
-  }
-  s.playCount = track.user_data.play_count;
-  s.lastPlayed = track.user_data.last_played;
-  s.discNo = track.disc_no.value_or(0);
-  s.trackNo = track.track_no.value_or(0);
+crow::json::wvalue remoteTrackItem(const media_library::Track &track) {
+  const std::string album_key =
+      track.album.has_value() ? track.album->title : std::string();
   std::vector<std::pair<std::string, int>> genres;
   genres.reserve(track.genres.size());
   for (const auto &name : track.genres) {
     genres.emplace_back(name, 0);
   }
   // Path 是 Jellyfin 的文件系统字段，远端没有；locator 也不出进程。
-  s.dto = trackItem(track, itemId(track.ref),
-                    track.album.has_value() ? itemId(track.album->ref)
-                                            : std::string(),
-                    s.albumKey, std::string(), artists,
-                    album_artist_pairs_of(track.album_artists), genres);
-  return s;
+  return trackItem(track, itemId(track.ref),
+                   track.album.has_value() ? itemId(track.album->ref)
+                                           : std::string(),
+                   album_key, std::string(), artist_pairs_of(track.artists),
+                   album_artist_pairs_of(track.album_artists), genres);
 }
 
-
-
-Sortable remoteAlbumSortable(const media_library::Album &album) {
-  Sortable s;
-  s.sortKey = album.title;
-  s.year = album.year.value_or(0);
-  s.dto =
-      albumItem(album, itemId(album.ref), album_artist_pairs_of(album.artists),
-                0, album.artwork.has_value() ? "1" : "", 0);
-  return s;
+crow::json::wvalue remoteAlbumItem(const media_library::Album &album) {
+  return albumItem(album, itemId(album.ref),
+                   album_artist_pairs_of(album.artists), 0,
+                   album.artwork.has_value() ? "1" : "", 0);
 }
-
-
-
-
-
-// 搜索里的远端条目：SearchHit 只带描述字段，够造列表 DTO。
-
 
 // 搜索命中 → 列表条目。SearchHit 只带描述字段，够造列表 DTO。
-Sortable searchHitSortable(const media_library::SearchHit &hit) {
-  Sortable s;
-  s.sortKey = hit.title;
+crow::json::wvalue searchHitItem(const media_library::SearchHit &hit) {
   const std::string id = itemId(hit.ref);
   if (hit.kind == media_library::EntityType::Track) {
     media_library::Track track;
@@ -493,28 +334,30 @@ Sortable searchHitSortable(const media_library::SearchHit &hit) {
     track.artwork = hit.artwork;
     track.duration_ms = hit.duration_ms;
     track.playable = hit.playable;
-    const auto artists = artist_pairs_of(track.artists);
-    if (!artists.empty()) {
-      s.artistKey = artists.front().first;
-    }
-    s.dto = trackItem(track, id, std::string(), std::string(), std::string(),
-                      artists, album_artist_pairs_of(track.album_artists), {});
-  } else if (hit.kind == media_library::EntityType::Album) {
+    track.album = hit.album;
+    // 命中要能连回可打开的专辑页：没有 AlbumId/ParentId 的 Audio 条目
+    // 在客户端里点进去只会发 ParentId=<曲目 ref> 的请求，必然是空列表。
+    return trackItem(track, id,
+                     hit.album.has_value() ? itemId(hit.album->ref)
+                                           : std::string(),
+                     hit.album.has_value() ? hit.album->title : std::string(),
+                     std::string(), artist_pairs_of(track.artists),
+                     album_artist_pairs_of(track.album_artists), {});
+  }
+  if (hit.kind == media_library::EntityType::Album) {
     media_library::Album album;
     album.ref = hit.ref;
     album.title = hit.title;
     album.artists = hit.album_artists;
     album.artwork = hit.artwork;
-    s.dto = albumItem(album, id, album_artist_pairs_of(album.artists), 0,
-                      album.artwork.has_value() ? "1" : "", 0);
-  } else if (hit.kind == media_library::EntityType::Artist) {
-    media_library::Artist artist;
-    artist.ref = hit.ref;
-    artist.name = hit.title;
-    artist.artwork = hit.artwork;
-    s.dto = artistItem(artist, id, 0, artist.artwork.has_value() ? "1" : "");
+    return albumItem(album, id, album_artist_pairs_of(album.artists), 0,
+                     album.artwork.has_value() ? "1" : "", 0);
   }
-  return s;
+  media_library::Artist artist;
+  artist.ref = hit.ref;
+  artist.name = hit.title;
+  artist.artwork = hit.artwork;
+  return artistItem(artist, id, 0, artist.artwork.has_value() ? "1" : "");
 }
 
 // 列表查询只经 MediaRouter：
@@ -529,8 +372,7 @@ crow::response handleItems(const crow::request &req) {
   const std::string search = qs(req, "searchTerm");
   const int startIndex = qsInt(req, "startIndex", 0);
   const int limit = qsInt(req, "limit", 0);
-  const std::string sortBy = qs(req, "sortBy");
-  const std::string order = qs(req, "sortOrder");
+  // sortBy / sortOrder 一律不读：门面不重排，顺序由 media_library 给出。
 
   const std::optional<media_library::SourceRef> parentRef =
       parent.empty() ? std::nullopt : parseItemId(parent);
@@ -547,7 +389,7 @@ crow::response handleItems(const crow::request &req) {
     return out;
   };
 
-  std::vector<Sortable> items;
+  std::vector<crow::json::wvalue> items;
 
   if (!search.empty()) {
     media_library::SearchQuery query;
@@ -564,13 +406,28 @@ crow::response handleItems(const crow::request &req) {
     }
     query.page = media_library::PageRequest{
         std::nullopt, limit > 0 ? std::max(limit, 200) : 200};
+    // 客户端要的是哪几种实体就只回哪几种：库没按 types 过滤时也不能让
+    // 别的类型混进来（「专辑」页里出现 Audio 条目就是点不开的那种）。
+    const auto wanted = [&query](media_library::EntityType kind) {
+      return std::find(query.types.begin(), query.types.end(), kind) !=
+             query.types.end();
+    };
+    const bool all_kinds = query.types.empty();
     const auto page = media_library::media_router().search(query, {});
     if (page.ok()) {
       for (const auto &sourced : page.value().items) {
-        items.push_back(searchHitSortable(sourced.value));
+        const media_library::SearchHit &hit = sourced.value;
+        const bool keep =
+            all_kinds || wanted(hit.kind) ||
+            (hit.kind == media_library::EntityType::AlbumArtist &&
+             wanted(media_library::EntityType::Artist));
+        if (!keep) {
+          continue;
+        }
+        items.push_back(searchHitItem(hit));
       }
     }
-    return respondItems(items, sortBy, order, startIndex, limit);
+    return respondItems(items, startIndex, limit);
   }
 
   if (parentRef.has_value() &&
@@ -579,10 +436,10 @@ crow::response handleItems(const crow::request &req) {
         *parentRef, {std::nullopt, 1000000}, {});
     if (page.ok()) {
       for (const auto &track : page.value().value.items) {
-        items.push_back(remoteTrackSortable(track));
+        items.push_back(remoteTrackItem(track));
       }
     }
-    return respondItems(items, sortBy, order, startIndex, limit);
+    return respondItems(items, startIndex, limit);
   }
 
   std::vector<media_library::SourceRef> artist_refs;
@@ -622,10 +479,10 @@ crow::response handleItems(const crow::request &req) {
         if (!seen.insert(itemId(album.ref)).second) {
           continue;
         }
-        items.push_back(remoteAlbumSortable(album));
+        items.push_back(remoteAlbumItem(album));
       }
     }
-    return respondItems(items, sortBy, order, startIndex, limit);
+    return respondItems(items, startIndex, limit);
   }
 
   // Music 视图根等：路由器没有列举能力，远程媒体库又不允许全量扫描。

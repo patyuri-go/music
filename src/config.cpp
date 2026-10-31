@@ -56,6 +56,35 @@ std::vector<fs::path> toPathVector(const crow::json::rvalue &arr,
   return out;
 }
 
+// 逗号分隔的 library_id 列表（环境变量用）。空项被丢弃。
+std::vector<std::string> toIdVector(const std::string &text,
+                                    const std::string &source) {
+  std::vector<std::string> out;
+  std::size_t start = 0;
+  while (start <= text.size()) {
+    const std::size_t comma = text.find(',', start);
+    std::string part = (comma == std::string::npos)
+                           ? text.substr(start)
+                           : text.substr(start, comma - start);
+    const std::size_t first = part.find_first_not_of(" \t\r\n");
+    const std::size_t last = part.find_last_not_of(" \t\r\n");
+    if (first != std::string::npos) {
+      part = part.substr(first, last - first + 1);
+    } else {
+      part.clear();
+    }
+    if (!part.empty()) {
+      out.push_back(std::move(part));
+    }
+    if (comma == std::string::npos) {
+      break;
+    }
+    start = comma + 1;
+  }
+  (void)source;
+  return out;
+}
+
 } // namespace
 
 const Config &get() {
@@ -99,6 +128,10 @@ const Config &load(const std::string &file) {
   }
   if (const std::string value = envValue("NETEASE_REAL_IP"); !value.empty()) {
     loaded.netease.real_ip = value;
+  }
+  // 聚合优先级同样按 CLI > 配置文件 > 环境变量：这里先落环境变量，文件随后覆盖。
+  if (const std::string value = envValue("LIBRARY_PRIORITY"); !value.empty()) {
+    loaded.library_priority = toIdVector(value, "LIBRARY_PRIORITY");
   }
 
   std::ifstream input(file);
@@ -187,6 +220,23 @@ const Config &load(const std::string &file) {
       if (cache.has("revalidate_seconds")) {
         loaded.image_cache.revalidate_seconds =
             static_cast<int>(cache["revalidate_seconds"].i());
+      }
+    }
+    // 聚合优先级：["local-main", "netease-main"]，顺序即分层顺序。
+    if (json.has("library_priority")) {
+      const auto &lp = json["library_priority"];
+      if (lp.t() == crow::json::type::List) {
+        loaded.library_priority.clear();
+        for (const auto &item : lp) {
+          if (item.t() == crow::json::type::String) {
+            const std::string id = std::string(item.s());
+            if (!id.empty()) {
+              loaded.library_priority.push_back(id);
+            }
+          }
+        }
+      } else if (lp.t() == crow::json::type::String) {
+        loaded.library_priority = toIdVector(std::string(lp.s()), "library_priority");
       }
     }
     if (json.has("netease")) {
@@ -370,6 +420,25 @@ const Config &load(const std::string &file) {
     const bool https = base.rfind("https://", 0) == 0;
     if (!http && !https) {
       throw std::runtime_error("netease.api_base 必须是 http(s) URL: " + base);
+    }
+  }
+
+  // 聚合优先级：不允许空项与重复项——重复会让同一库落进两个 tier，
+  // 排序结果取决于遍历顺序，属于静默错乱，配置期就拦掉。
+  {
+    std::vector<std::string> seen;
+    seen.reserve(loaded.library_priority.size());
+    for (const std::string &id : loaded.library_priority) {
+      if (id.empty()) {
+        throw std::runtime_error("library_priority 不能包含空 library_id");
+      }
+      for (const std::string &other : seen) {
+        if (other == id) {
+          throw std::runtime_error("library_priority 出现重复的 library_id: " +
+                                   id);
+        }
+      }
+      seen.push_back(id);
     }
   }
 

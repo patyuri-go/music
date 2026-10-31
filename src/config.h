@@ -60,6 +60,11 @@ struct Config {
   fs::path playlist_dir{"./playlists"};
   ImageCacheConfig image_cache;
   NeteaseConfig netease;
+  // 聚合优先级：数组顺序即聚合分层顺序，靠前的库整组排在前面。
+  // 未列出的库追加到末尾（按健康状态与注册 priority 决胜）。
+  // 只影响「多库聚合结果」的顺序，不改变单库请求的路由。
+  // 留空 = 内建顺序（本地库优先，其次注册 priority 降序）。
+  std::vector<std::string> library_priority;
 };
 
 const Config &get();

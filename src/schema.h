@@ -31,6 +31,9 @@ inline constexpr const char *kArtistByName =
 inline constexpr const char *kArtistById = "SELECT * FROM artist WHERE id = ?";
 inline constexpr const char *kArtistInsert =
     "INSERT OR IGNORE INTO artist(name) VALUES (?)";
+// 搜索：艺术家名包含匹配（由媒体库层做归一，SQL 只负责粗筛）。
+inline constexpr const char *kArtistsSearchByName =
+    "SELECT * FROM artist WHERE name LIKE ? ORDER BY name LIMIT ?";
 
 // album
 // 注意：album 不再有单列 artist_id；艺术家一律经 album_artist 多对多。
@@ -42,6 +45,10 @@ inline constexpr const char *kAlbumsByArtist =
     "SELECT a.*, (SELECT group_concat(artist_id, ',') FROM album_artist "
     "WHERE album_id = a.id) FROM album a JOIN album_artist aa ON "
     "aa.album_id = a.id WHERE aa.artist_id = ? ORDER BY a.name";
+inline constexpr const char *kAlbumsSearchByName =
+    "SELECT a.*, (SELECT group_concat(artist_id, ',') FROM album_artist "
+    "WHERE album_id = a.id) FROM album a WHERE a.name LIKE ? "
+    "ORDER BY a.name LIMIT ?";
 inline constexpr const char *kAlbumUpsert =
     "INSERT OR IGNORE INTO album(name, artist_key) VALUES (?, ?)";
 inline constexpr const char *kAlbumByKey =

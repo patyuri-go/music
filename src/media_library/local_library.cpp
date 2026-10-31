@@ -418,49 +418,99 @@ Result<Page<Album>> LocalLibrary::list_artist_albums(const ArtistRef &ref,
 
 Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
                                              const CallContext &) {
-  repo::TrackRepo tracks(db_path_);
+  // types 决定出哪些实体：客户端「专辑」页要 Album，不能再拿曲目顶替
+  // （否则卡片是 Audio，点进去按专辑取子项必然为空）。
+  const bool all_types = query.types.empty();
+  const auto wants = [&query, all_types](EntityType type) {
+    return all_types || std::find(query.types.begin(), query.types.end(),
+                                  type) != query.types.end();
+  };
+  const bool want_tracks = wants(EntityType::Track);
+  const bool want_albums = wants(EntityType::Album);
+  const bool want_artists =
+      wants(EntityType::Artist) || wants(EntityType::AlbumArtist);
+
+  Page<SearchHit> page;
+  if (query.text.empty() ||
+      (!want_tracks && !want_albums && !want_artists)) {
+    return Result<Page<SearchHit>>::success(std::move(page));
+  }
+
   const int limit = query.page.limit > 0 ? query.page.limit : 50;
   std::vector<SearchHit> hits;
 
-  for (const auto &row : tracks.search(query.text, limit)) {
-    const Track track = build_track(row);
-    if (!query.artists.empty()) {
-      const bool match =
-          std::any_of(query.artists.begin(), query.artists.end(),
-                      [&](const std::string &name) {
-                        return contains_name(track.artists, name);
-                      });
-      if (!match) {
-        continue;
+  if (want_albums) {
+    repo::AlbumRepo albums(db_path_);
+    for (const auto &row : albums.search(query.text, limit)) {
+      const Album album = build_album(row);
+      SearchHit hit;
+      hit.kind = EntityType::Album;
+      hit.ref = album.ref;
+      hit.title = album.title;
+      hit.album_artists = album.artists;
+      if (!album.artists.empty()) {
+        hit.subtitle = album.artists.front().name;
       }
+      hit.artwork = album.artwork;
+      hits.push_back(std::move(hit));
     }
-    if (!query.album_artists.empty()) {
-      const bool match =
-          std::any_of(query.album_artists.begin(), query.album_artists.end(),
-                      [&](const std::string &name) {
-                        return contains_name(track.album_artists, name);
-                      });
-      if (!match) {
-        continue;
-      }
-    }
-
-    SearchHit hit;
-    hit.kind = EntityType::Track;
-    hit.ref = track.ref;
-    hit.title = track.title;
-    hit.artists = track.artists;
-    hit.album_artists = track.album_artists;
-    hit.artwork = track.artwork;
-    hit.duration_ms = track.duration_ms;
-    hit.playable = track.playable;
-    if (!track.artists.empty()) {
-      hit.subtitle = track.artists.front().name;
-    }
-    hits.push_back(std::move(hit));
   }
 
-  Page<SearchHit> page;
+  if (want_artists) {
+    repo::ArtistRepo artists(db_path_);
+    for (const auto &row : artists.search(query.text, limit)) {
+      const Artist artist = build_artist(row);
+      SearchHit hit;
+      hit.kind = EntityType::Artist;
+      hit.ref = artist.ref;
+      hit.title = artist.name;
+      hit.artwork = artist.artwork;
+      hits.push_back(std::move(hit));
+    }
+  }
+
+  if (want_tracks) {
+    repo::TrackRepo tracks(db_path_);
+    for (const auto &row : tracks.search(query.text, limit)) {
+      const Track track = build_track(row);
+      if (!query.artists.empty()) {
+        const bool match =
+            std::any_of(query.artists.begin(), query.artists.end(),
+                        [&](const std::string &name) {
+                          return contains_name(track.artists, name);
+                        });
+        if (!match) {
+          continue;
+        }
+      }
+      if (!query.album_artists.empty()) {
+        const bool match =
+            std::any_of(query.album_artists.begin(), query.album_artists.end(),
+                        [&](const std::string &name) {
+                          return contains_name(track.album_artists, name);
+                        });
+        if (!match) {
+          continue;
+        }
+      }
+
+      SearchHit hit;
+      hit.kind = EntityType::Track;
+      hit.ref = track.ref;
+      hit.title = track.title;
+      hit.artists = track.artists;
+      hit.album_artists = track.album_artists;
+      hit.album = track.album;
+      hit.artwork = track.artwork;
+      hit.duration_ms = track.duration_ms;
+      hit.playable = track.playable;
+      if (!track.artists.empty()) {
+        hit.subtitle = track.artists.front().name;
+      }
+      hits.push_back(std::move(hit));
+    }
+  }
+
   page.items = std::move(hits);
   page.has_more = false;
   return Result<Page<SearchHit>>::success(std::move(page));

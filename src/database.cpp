@@ -330,6 +330,18 @@ std::vector<Album> AlbumRepo::byArtist(int artist_id) {
   return result;
 }
 
+std::vector<Album> AlbumRepo::search(const std::string &query, int limit) {
+  std::vector<Album> result;
+  SQLite::Statement q(pdb_, schema::sql::kAlbumsSearchByName);
+  const std::string pattern = "%" + query + "%";
+  q.bind(1, pattern);
+  q.bind(2, limit);
+  while (q.executeStep()) {
+    result.push_back(readAlbum(q));
+  }
+  return result;
+}
+
 std::vector<int> AlbumRepo::artistIdsByAlbumId(int album_id) {
   std::vector<int> result;
   SQLite::Statement q(pdb_, schema::sql::kAlbumArtistsByAlbumId);
@@ -343,6 +355,18 @@ std::vector<int> AlbumRepo::artistIdsByAlbumId(int album_id) {
 // ArtistRepo
 
 ArtistRepo::ArtistRepo(const std::string &path)  : pdb_(db::conn(path)) {}
+
+std::vector<Artist> ArtistRepo::search(const std::string &query, int limit) {
+  std::vector<Artist> result;
+  SQLite::Statement q(pdb_, schema::sql::kArtistsSearchByName);
+  const std::string pattern = "%" + query + "%";
+  q.bind(1, pattern);
+  q.bind(2, limit);
+  while (q.executeStep()) {
+    result.push_back(readArtist(q));
+  }
+  return result;
+}
 
 std::optional<Artist> ArtistRepo::byId(int id) {
   SQLite::Statement q(pdb_, schema::sql::kArtistById);

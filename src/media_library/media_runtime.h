@@ -40,7 +40,11 @@ struct LibrarySetup {
 // 多库：一次性组装注册表、映射、路由、播放与封面服务。
 // 任一库注册失败即抛异常（调用方应事先跳过构造失败的库）。
 // 重复调用会先丢弃旧运行期（不关闭传入对象）。
-void initialize_media_runtime(std::vector<LibrarySetup> libraries);
+//
+// aggregate_order 是聚合优先级（配置里的 library_priority）：数组顺序即 tier
+// 顺序，只作用于多库聚合结果。留空则用内建顺序（本地优先 + 注册 priority）。
+void initialize_media_runtime(std::vector<LibrarySetup> libraries,
+                              std::vector<std::string> aggregate_order = {});
 
 // 兼容旧调用（等价于只注册一个库）。
 void initialize_media_runtime(std::shared_ptr<Library> library,

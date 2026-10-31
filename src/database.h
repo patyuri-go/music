@@ -100,6 +100,8 @@ public:
   explicit AlbumRepo(const std::string &path);
   std::optional<Album> byId(int id);
   std::vector<Album> byArtist(int artist_id);
+  // 专辑名包含匹配，供 Searcher 出 Album 命中。
+  std::vector<Album> search(const std::string &query, int limit);
   std::vector<int> artistIdsByAlbumId(int album_id);
 
 private:
@@ -110,6 +112,8 @@ class ArtistRepo {
 public:
   explicit ArtistRepo(const std::string &path);
   std::optional<Artist> byId(int id);
+  // 艺术家名包含匹配，供 Searcher 出 Artist 命中。
+  std::vector<Artist> search(const std::string &query, int limit);
 
 private:
   SQLite::Database &pdb_;

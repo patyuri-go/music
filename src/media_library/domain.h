@@ -167,6 +167,9 @@ struct SearchHit {
   std::optional<std::string> subtitle;
   std::vector<ArtistLink> artists;
   std::vector<AlbumArtistLink> album_artists;
+  // 曲目命中带上所属专辑：上层据此把列表条目连到可打开的专辑页，
+  // 避免「点进去什么都没有」。专辑/艺术家命中本字段为空。
+  std::optional<AlbumLink> album;
   std::optional<ArtworkRef> artwork;
   std::optional<std::int64_t> duration_ms;
   bool playable = true;
