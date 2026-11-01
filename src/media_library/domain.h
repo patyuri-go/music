@@ -107,11 +107,28 @@ struct LyricWord {
   std::string text;
 };
 
+// 辅助轨：挂在正文行上的第二语言文本。
+// 平台把「译文」与「注音」分两条轨给出，二者都按正文行的时间对齐，
+// 所以不是独立的时间轴，而是 line.aux 里的一条附属内容。
+enum class LyricAuxKind {
+  Translation,  // 译文（双语歌词的另一半）
+  Romanization, // 注音（romalrc / ruby，逐字读音）
+};
+
+struct LyricAux {
+  LyricAuxKind kind = LyricAuxKind::Translation;
+  std::string text;
+  // 逐字轨（ytlrc / 逐词注音）才有值；行级轨为空。
+  std::vector<LyricWord> words;
+};
+
 struct LyricLine {
   std::optional<std::int64_t> start_ms;
   std::optional<std::int64_t> end_ms;
   std::string text;
   std::vector<LyricWord> words;
+  // 同一行上可能同时有译文和注音，顺序按加入先后。
+  std::vector<LyricAux> aux;
 };
 
 struct Lyrics {

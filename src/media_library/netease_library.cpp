@@ -1,6 +1,7 @@
 #include "media_library/netease_library.h"
 
 #include "api/api-enhanced/ids.h"
+#include "media_library/lyric_parser.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1076,33 +1077,17 @@ Result<Lyrics> NeteaseLibrary::get_lyrics(const TrackRef &ref,
   if (!parsed.ok()) {
     return R::failure(parsed.error());
   }
-  if (parsed.value().lines.empty()) {
-    // 无歌词（含纯音乐）：与本地库一致，返回 NotFound 让门面给 404。
+  // pureMusic 的平台占位文本不是歌词；空正文同理。
+  if (parsed.value().pure_music || parsed.value().body.empty()) {
     return R::failure(Error::make(ErrorCode::NotFound, "lyrics not found"));
   }
 
-  Lyrics lyrics;
-  lyrics.track = ref;
-  lyrics.mode = parsed.value().word_synced
-                    ? LyricsMode::WordSynced
-                    : (parsed.value().line_synced ? LyricsMode::LineSynced
-                                                  : LyricsMode::Unsynced);
-  if (!parsed.value().plain_text.empty()) {
-    lyrics.plain_text = parsed.value().plain_text;
-  }
-  for (const auto &line : parsed.value().lines) {
-    LyricLine out;
-    out.start_ms = line.start_ms;
-    out.end_ms = line.end_ms;
-    out.text = line.text;
-    for (const auto &word : line.words) {
-      LyricWord converted;
-      converted.start_ms = word.start_ms;
-      converted.end_ms = word.end_ms;
-      converted.text = word.text;
-      out.words.push_back(std::move(converted));
-    }
-    lyrics.lines.push_back(std::move(out));
+  // 解析交给媒体库层：客户端只交原始文本，这里统一成行/词/辅助轨。
+  Lyrics lyrics = parse_platform_lyrics(ref, parsed.value().body,
+                                        parsed.value().translation,
+                                        parsed.value().romanization);
+  if (lyrics.lines.empty()) {
+    return R::failure(Error::make(ErrorCode::NotFound, "lyrics not found"));
   }
   return R::success(std::move(lyrics));
 }

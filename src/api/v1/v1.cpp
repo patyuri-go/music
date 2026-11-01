@@ -244,6 +244,27 @@ crow::json::wvalue lyrics_json(const Lyrics &lyrics) {
       words.push_back(std::move(item));
     }
     entry["words"] = std::move(words);
+    crow::json::wvalue::list aux;
+    aux.reserve(line.aux.size());
+    for (const LyricAux &item : line.aux) {
+      crow::json::wvalue node;
+      node["kind"] = item.kind == LyricAuxKind::Translation ? "translation"
+                                                           : "romanization";
+      node["text"] = item.text;
+      crow::json::wvalue::list aux_words;
+      aux_words.reserve(item.words.size());
+      for (const LyricWord &word : item.words) {
+        crow::json::wvalue w;
+        w["start_ms"] = word.start_ms;
+        w["end_ms"] = word.end_ms.has_value() ? crow::json::wvalue(*word.end_ms)
+                                              : crow::json::wvalue(nullptr);
+        w["text"] = word.text;
+        aux_words.push_back(std::move(w));
+      }
+      node["words"] = std::move(aux_words);
+      aux.push_back(std::move(node));
+    }
+    entry["aux"] = std::move(aux);
     lines.push_back(std::move(entry));
   }
   out["lines"] = std::move(lines);

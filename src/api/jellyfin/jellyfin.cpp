@@ -662,161 +662,95 @@ crow::response handleStream(const crow::request &req,
                                   req.method == crow::HTTPMethod::HEAD);
 }
 
-/// 解析单个 LRC 时间标签（mm:ss、mm:ss.xx 或 mm:ss:xx）为毫秒。
-bool parseLrcTimestamp(const std::string &s, long long &ms) {
-  // Split the timestamp by ':'. Supported forms:
-  //   [mm:ss]  [mm:ss.xx]  [mm:ss:xx]  [h:mm:ss]  [h:mm:ss.xx]
-  std::vector<std::string> parts;
-  {
-    std::string cur;
-    for (const char ch : s) {
-      if (ch == ':') {
-        parts.push_back(cur);
-        cur.clear();
-      } else {
-        cur.push_back(ch);
-      }
-    }
-    parts.push_back(cur);
-  }
-  if (parts.size() < 2 || parts.size() > 4) {
-    return false;
-  }
-  for (const auto &p : parts) {
-    if (p.empty()) {
-      return false;
+// 字符个数（按码点计）。Jellyfin 的 Cue.Position 是 Text 里的下标，
+// .NET 用 UTF-16 code unit：CJK 与 ASCII 都是 1，代理对算 2。
+std::size_t utf8_length(const std::string &text) {
+  std::size_t count = 0;
+  for (const char raw : text) {
+    if ((static_cast<unsigned char>(raw) & 0xC0) != 0x80) {
+      ++count;
     }
   }
-  // Optional fractional part on the last component (after '.' or ',').
-  long long frac_ms = 0;
-  {
-    std::string &last = parts.back();
-    const std::size_t dot = last.find_first_of(".,");
-    if (dot != std::string::npos) {
-      std::string digits;
-      for (std::size_t i = dot + 1; i < last.size(); ++i) {
-        if (std::isdigit(static_cast<unsigned char>(last[i]))) {
-          digits.push_back(last[i]);
-        }
-      }
-      if (!digits.empty()) {
-        frac_ms = static_cast<long long>(
-            std::atof(("0." + digits).c_str()) * 1000.0 + 0.5);
-      }
-      last = last.substr(0, dot);
-    }
-  }
-  const auto toInt = [](const std::string &p, long long &out) -> bool {
-    if (p.empty()) {
-      return false;
-    }
-    out = 0;
-    for (const char c : p) {
-      if (c < '0' || c > '9') {
-        return false;
-      }
-      out = out * 10 + (c - '0');
-    }
-    return true;
-  };
-  long long a = 0;
-  long long b = 0;
-  long long c = 0;
-  if (parts.size() == 2) {
-    // mm:ss
-    if (!toInt(parts[0], a) || !toInt(parts[1], b)) {
-      return false;
-    }
-    ms = (a * 60 + b) * 1000 + frac_ms;
-    return true;
-  }
-  if (!toInt(parts[0], a) || !toInt(parts[1], b) || !toInt(parts[2], c)) {
-    return false;
-  }
-  if (parts.size() == 3) {
-    if (parts[0].size() <= 1) {
-      // h:mm:ss
-      ms = (a * 3600 + b * 60 + c) * 1000 + frac_ms;
-    } else {
-      // mm:ss:cc (legacy centisecond form)
-      ms = (a * 60 + b) * 1000 + c * 10 + frac_ms;
-    }
-    return true;
-  }
-  // h:mm:ss:cc
-  long long d = 0;
-  if (!toInt(parts[3], d)) {
-    return false;
-  }
-  ms = (a * 3600 + b * 60 + c) * 1000 + d * 10 + frac_ms;
-  return true;
+  return count;
 }
 
-crow::json::wvalue buildLyricDto(const std::string &title,
+// 行内逐字轨 → Cue 数组。Position / EndPosition 是闭区间下标，
+// Start / End 是 100ns tick（毫秒 × 10000）。
+//
+// 词文本必须正好拼成整行，否则下标无从对齐 —— 这种情况宁可不给逐字轨，
+// 也不出半截 Cue 让客户端高亮错位。
+crow::json::wvalue::list buildCues(const media_library::LyricLine &line) {
+  crow::json::wvalue::list cues;
+  if (line.words.empty()) {
+    return cues;
+  }
+  std::string joined;
+  for (const media_library::LyricWord &word : line.words) {
+    joined += word.text;
+  }
+  if (joined != line.text) {
+    return cues;
+  }
+
+  std::size_t pos = 0;
+  for (std::size_t i = 0; i < line.words.size(); ++i) {
+    const media_library::LyricWord &word = line.words[i];
+    const std::size_t length = utf8_length(word.text);
+    if (length == 0) {
+      continue;
+    }
+    std::int64_t end_ms = word.start_ms;
+    if (word.end_ms.has_value()) {
+      end_ms = *word.end_ms;
+    } else if (i + 1 < line.words.size()) {
+      end_ms = line.words[i + 1].start_ms;
+    } else if (line.end_ms.has_value()) {
+      end_ms = *line.end_ms;
+    }
+    crow::json::wvalue cue;
+    cue["Position"] = static_cast<int>(pos);
+    cue["EndPosition"] = static_cast<int>(pos + length - 1);
+    cue["Start"] = word.start_ms * 10000LL;
+    cue["End"] = end_ms * 10000LL;
+    cues.push_back(std::move(cue));
+    pos += length;
+  }
+  return cues;
+}
+
+// 领域模型 → Jellyfin LyricDto。直接读结构，不再二次解析纯文本：
+// 之前按纯文本解析，正文里带 `[..]` 会被当成时间标签吞掉（实测 78 行
+// 的 Start 全丢）。逐字轨出 Cues；aux（译文/注音）不进 DTO。
+crow::json::wvalue buildLyricDto(const media_library::Lyrics &lyrics,
                                  long long duration_ms,
-                                 const std::string &lyrics, bool synced,
+                                 const std::string &title,
                                  const std::string &artist,
                                  const std::string &album) {
   crow::json::wvalue r;
   crow::json::wvalue::list lines;
-  std::string by;
-  std::string version;
-  long long offset_ms = 0;
-
-  std::size_t pos = 0;
-  while (pos <= lyrics.size()) {
-    const std::size_t nl = lyrics.find('\n', pos);
-    std::string raw = lyrics.substr(
-        pos, nl == std::string::npos ? std::string::npos : nl - pos);
-    pos = (nl == std::string::npos) ? lyrics.size() + 1 : nl + 1;
-    if (!raw.empty() && raw.back() == '\r') {
-      raw.pop_back();
-    }
-
-    std::vector<long long> starts;
-    std::size_t i = 0;
-    while (i < raw.size() && raw[i] == '[') {
-      const std::size_t close = raw.find(']', i);
-      if (close == std::string::npos) {
-        break;
+  for (const media_library::LyricLine &line : lyrics.lines) {
+    crow::json::wvalue node;
+    // 副字幕：LyricDto 没有独立的译文字段，客户端只渲染 `Text`。
+    // 用 `_BREAK_` 把原文与译文串在同一行（与 `?format=lrc` 的正文写法一致），
+    // 换行会占掉一行显示空间，也不便客户端自行拆成双行。
+    // `Cues` 的下标只覆盖 `_BREAK_` 之前的原文，译文不参与下标计算。
+    std::string text = line.text;
+    for (const media_library::LyricAux &aux : line.aux) {
+      if (aux.kind != media_library::LyricAuxKind::Translation) {
+        continue;
       }
-      const std::string tag = raw.substr(i + 1, close - i - 1);
-      long long ms = 0;
-      if (parseLrcTimestamp(tag, ms)) {
-        starts.push_back(ms);
-      } else {
-        const auto c2 = tag.find(':');
-        if (c2 != std::string::npos) {
-          const std::string key = lower(tag.substr(0, c2));
-          const std::string val = tag.substr(c2 + 1);
-          if (key == "by") {
-            by = val;
-          } else if (key == "ve") {
-            version = val;
-          } else if (key == "offset") {
-            offset_ms = std::atoll(val.c_str());
-          }
-        }
+      if (aux.text.empty()) {
+        continue;
       }
-      i = close + 1;
+      text += "_BREAK_" + aux.text;
+      break;
     }
-
-    const std::string text = raw.substr(i);
-    if (text.empty()) {
-      continue;
+    node["Text"] = text;
+    if (line.start_ms.has_value()) {
+      node["Start"] = *line.start_ms * 10000LL;
     }
-    if (starts.empty()) {
-      crow::json::wvalue line;
-      line["Text"] = text;
-      lines.push_back(std::move(line));
-    } else {
-      for (const long long ms : starts) {
-        crow::json::wvalue line;
-        line["Text"] = text;
-        line["Start"] = (ms + offset_ms) * 10000LL;
-        lines.push_back(std::move(line));
-      }
-    }
+    node["Cues"] = crow::json::wvalue(buildCues(line));
+    lines.push_back(std::move(node));
   }
 
   crow::json::wvalue meta;
@@ -827,20 +761,71 @@ crow::json::wvalue buildLyricDto(const std::string &title,
   if (!album.empty()) {
     meta["Album"] = album;
   }
-  if (!by.empty()) {
-    meta["By"] = by;
-  }
-  if (!version.empty()) {
-    meta["Version"] = version;
-  }
   meta["Length"] = duration_ms * 10000LL;
-  meta["IsSynced"] = synced;
+  meta["IsSynced"] = lyrics.mode != media_library::LyricsMode::Unsynced;
   r["Metadata"] = std::move(meta);
   r["Lyrics"] = crow::json::wvalue(lines);
   return r;
 }
 
-crow::response handleLyrics(const std::string &idstr) {
+// mm:ss.mmm（不含方括号）。分钟不封顶：LRC 允许 [123:45.678]。
+std::string lrcTimestamp(std::int64_t ms) {
+  if (ms < 0) {
+    ms = 0;
+  }
+  const std::int64_t minutes = ms / 60000;
+  const std::int64_t seconds = (ms / 1000) % 60;
+  const std::int64_t millis = ms % 1000;
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%02lld:%02lld.%03lld",
+                static_cast<long long>(minutes),
+                static_cast<long long>(seconds),
+                static_cast<long long>(millis));
+  return std::string(buf);
+}
+
+// 领域模型 → LRC 文本。门面负责序列化，媒体库层只出结构。
+//
+// 约定（用户给定的格式）：
+//   [ar:...] [ti:...] [offset:0] 三行头部，随后每行 [mm:ss.mmm]正文。
+//   同一行有译文时用 `_BREAK_` 接在正文之后：`原文_BREAK_译文`。
+//   注音不导出（只取译文）；没有行时间时统一补 [00:00.000]，不伪造进度。
+std::string buildLrcText(const media_library::Lyrics &lyrics,
+                         const std::string &title, const std::string &artist) {
+  std::string out;
+  if (!artist.empty()) {
+    out += "[ar:" + artist + "]\n";
+  }
+  if (!title.empty()) {
+    out += "[ti:" + title + "]\n";
+  }
+  out += "[offset:0]\n";
+
+  for (const media_library::LyricLine &line : lyrics.lines) {
+    std::string text = line.text;
+    for (const media_library::LyricAux &aux : line.aux) {
+      if (aux.kind != media_library::LyricAuxKind::Translation) {
+        continue;
+      }
+      if (aux.text.empty()) {
+        continue;
+      }
+      text += "_BREAK_" + aux.text;
+      break;
+    }
+    out += "[" + lrcTimestamp(line.start_ms.value_or(0)) + "]" + text + "\n";
+  }
+  return out;
+}
+
+crow::response plainTextResponse(int code, std::string body) {
+  crow::response res(code, std::move(body));
+  res.set_header("Content-Type", "text/plain; charset=utf-8");
+  return res;
+}
+
+crow::response handleLyrics(const std::string &idstr,
+                            const crow::request &req) {
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
       ref->entity_type != media_library::EntityType::Track) {
@@ -854,18 +839,21 @@ crow::response handleLyrics(const std::string &idstr) {
     return http_util::jsonResponse(404, "{}");
   }
   const auto &lyrics = lyricsResult.value().value;
-  const std::string plain = lyrics.plain_text.value_or(std::string());
-  if (plain.empty()) {
+  if (lyrics.lines.empty()) {
     return http_util::jsonResponse(404, "{}");
   }
   const auto &track = trackResult.value().value;
   const std::string artist =
       track.artists.empty() ? std::string() : track.artists.front().name;
+
+  // 默认出 Jellyfin LyricDto（客户端按它解析）；`?format=lrc` 才出 LRC 文本。
+  if (lower(qs(req, "format")) == "lrc") {
+    return plainTextResponse(200, buildLrcText(lyrics, track.title, artist));
+  }
+
   const std::string album = track.album ? track.album->title : std::string();
-  return json(200,
-              buildLyricDto(track.title, track.duration_ms.value_or(0), plain,
-                            lyrics.mode != media_library::LyricsMode::Unsynced,
-                            artist, album));
+  return json(200, buildLyricDto(lyrics, track.duration_ms.value_or(0),
+                                  track.title, artist, album));
 }
 
 crow::response handleArtists(const crow::request &req,
@@ -1289,8 +1277,8 @@ void run(const config::Config &cfg) {
 
   // 流媒体
   JF_ROUTE(app, "/Audio/<string>/Lyrics")
-  ([](const crow::request &, std::string itemId) {
-    return handleLyrics(itemId);
+  ([](const crow::request &req, std::string itemId) {
+    return handleLyrics(itemId, req);
   });
   JF_ROUTE(app, "/Audio/<string>/<string>")
       .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(

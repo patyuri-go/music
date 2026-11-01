@@ -8,6 +8,7 @@
 
 #include "api/playlist/playlist.h"
 #include "api/webdav/webdav.h"
+#include "media_library/lyric_parser.h"
 
 #include <SQLiteCpp/Database.h>
 #include <SQLiteCpp/Statement.h>
@@ -29,54 +30,6 @@ std::string lower(std::string text) {
     return static_cast<char>(std::tolower(c));
   });
   return text;
-}
-
-std::optional<long long> parse_timestamp(const std::string &text) {
-  std::vector<std::string> parts;
-  std::string current;
-  for (const char ch : text) {
-    if (ch == ':') {
-      parts.push_back(current);
-      current.clear();
-    } else {
-      current.push_back(ch);
-    }
-  }
-  parts.push_back(current);
-  if (parts.size() < 2 || parts.size() > 3) {
-    return std::nullopt;
-  }
-
-  long long fraction_ms = 0;
-  std::string &last = parts.back();
-  const std::size_t dot = last.find_first_of(".,");
-  if (dot != std::string::npos) {
-    std::string digits;
-    for (std::size_t i = dot + 1; i < last.size(); ++i) {
-      if (std::isdigit(static_cast<unsigned char>(last[i])) != 0) {
-        digits.push_back(last[i]);
-      }
-    }
-    if (!digits.empty()) {
-      fraction_ms =
-          static_cast<long long>(std::atof(("0." + digits).c_str()) * 1000.0);
-    }
-    last = last.substr(0, dot);
-  }
-
-  long long total = 0;
-  for (const auto &part : parts) {
-    if (part.empty()) {
-      return std::nullopt;
-    }
-    for (const char ch : part) {
-      if (std::isdigit(static_cast<unsigned char>(ch)) == 0) {
-        return std::nullopt;
-      }
-    }
-    total = total * 60 + std::stoll(part);
-  }
-  return total * 1000 + fraction_ms;
 }
 
 std::string mime_for(const std::string &format) {
@@ -567,7 +520,6 @@ Result<Lyrics> LocalLibrary::get_lyrics(const TrackRef &ref,
   }
 
   std::string text;
-  bool synced = false;
   {
     SQLite::Database &database = db::conn(db_path_);
     SQLite::Statement query(database, schema::sql::kTrackLyricsByTrackId);
@@ -577,52 +529,14 @@ Result<Lyrics> LocalLibrary::get_lyrics(const TrackRef &ref,
           Error::make(ErrorCode::NotFound, "lyrics not found"));
     }
     text = query.getColumn(0).getText();
-    synced = query.getColumn(1).getInt() != 0;
   }
   if (text.empty()) {
     return Result<Lyrics>::failure(
         Error::make(ErrorCode::NotFound, "lyrics not found"));
   }
 
-  Lyrics lyrics;
-  lyrics.track = ref;
-  lyrics.plain_text = text;
-
-  std::istringstream stream(text);
-  std::string raw_line;
-  bool parsed_timestamp = false;
-  while (std::getline(stream, raw_line)) {
-    if (!raw_line.empty() && raw_line.back() == '\r') {
-      raw_line.pop_back();
-    }
-    LyricLine line;
-    if (synced && raw_line.size() > 2 && raw_line.front() == '[') {
-      const std::size_t close = raw_line.find(']');
-      if (close != std::string::npos) {
-        const auto stamp =
-            parse_timestamp(raw_line.substr(1, close - 1));
-        if (stamp) {
-          line.start_ms = *stamp;
-          line.text = raw_line.substr(close + 1);
-          parsed_timestamp = true;
-          lyrics.lines.push_back(std::move(line));
-          continue;
-        }
-      }
-    }
-    line.text = raw_line;
-    lyrics.lines.push_back(std::move(line));
-  }
-
-  if (parsed_timestamp) {
-    lyrics.mode = LyricsMode::LineSynced;
-  } else {
-    lyrics.mode = LyricsMode::Unsynced;
-    for (auto &line : lyrics.lines) {
-      line.start_ms.reset();
-      line.end_ms.reset();
-    }
-  }
+  // 解析统一在媒体库层完成（与远端同一份实现）。
+  Lyrics lyrics = parse_plain_lyrics(ref, text);
   return Result<Lyrics>::success(std::move(lyrics));
 }
 
