@@ -186,7 +186,8 @@ PlaylistDirectory::list_playlists(const PageRequest &page,
     // has_more 永远为真，客户端会在同一页上无限翻下去。
     // 下一次从头（游标为空）的请求会重新尝试它。
     auto lease = registry_->acquire(entry.library_id,
-                                    CapabilityId::PlaylistRead, current_ms());
+                                    CapabilityId::PlaylistRead, current_ms(),
+                                    ctx.deadline_ms);
     if (!lease.ok()) {
       entry.done = true;
       status.state = source_state_from(lease.error().code);
@@ -286,7 +287,7 @@ PlaylistDirectory::get_playlist(const PlaylistRef &ref,
   }
 
   auto lease = registry_->acquire(ref.library_id, CapabilityId::PlaylistRead,
-                                  current_ms());
+                                  current_ms(), ctx.deadline_ms);
   if (!lease.ok()) {
     return Result<Sourced<Playlist>>::failure(lease.error());
   }

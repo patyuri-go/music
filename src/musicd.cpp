@@ -884,6 +884,8 @@ int main(int argc, char *argv[]) {
     transport.api_base = cfg.netease.api_base;
     transport.cookie = cfg.netease.cookie;
     transport.timeout_ms = cfg.netease.timeout_ms;
+transport.max_concurrency = cfg.netease.max_concurrency;
+transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     transport.real_ip = cfg.netease.real_ip;
 
     api_enhanced::NeteaseClientOptions client;

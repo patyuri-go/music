@@ -1259,8 +1259,17 @@ make_netease_library(const std::string &library_id,
                     "netease api_base is not a valid http(s) url"));
   }
 
+  // 每库一个节流实例：并发名额与请求间隔都是「该库自己的」。
+  auto throttled = api_enhanced::make_throttled_transport(
+      std::move(http), transport.max_concurrency,
+      transport.min_request_interval_ms);
+  if (throttled == nullptr) {
+    return Result<std::shared_ptr<NeteaseLibrary>>::failure(
+        Error::make(ErrorCode::Internal, "netease transport is not configured"));
+  }
+
   auto client =
-      std::make_shared<api_enhanced::NeteaseClient>(std::move(http),
+      std::make_shared<api_enhanced::NeteaseClient>(std::move(throttled),
                                                     client_options);
   auto library = std::make_shared<NeteaseLibrary>(library_id, display_name,
                                                   std::move(client), uid);

@@ -37,7 +37,13 @@ struct NeteaseConfig {
   std::string uid;
   int timeout_ms{8000};
   int metadata_ttl_ms{600000};
+  // 同时在飞的 HTTP 请求数上限。注意它同时被两层使用：
+  //   * 库级准入（注册表按库操作计数）；
+  //   * 传输层闸门（按真实 HTTP 请求计数）。
   int max_concurrency{4};
+  // 同一库任意两次 HTTP 请求「发起时刻」的最小间隔；0 表示不限。
+  // 只作用于真实请求：client 的 TTL 缓存命中不会占间隔。
+  int min_request_interval_ms{0};
   // 可选：透传 realIP，规避地域风控。
   std::string real_ip;
 };

@@ -19,6 +19,10 @@ struct NeteaseTransportOptions {
   // 明文凭据：只在构造 query 时使用，绝不写日志、错误或响应。
   std::string cookie;
   int timeout_ms{8000};
+  // 同时在飞的 HTTP 请求数上限（<=0 表示不限）。
+  int max_concurrency{4};
+  // 同一库两次请求「发起时刻」的最小间隔（0 表示不限）。
+  int min_request_interval_ms{0};
   // 可选：透传给 api-enhanced 的 realIP，规避地域风控。
   std::string real_ip;
 };
@@ -40,6 +44,20 @@ public:
 // api_base 非法时返回 nullptr。
 std::shared_ptr<NeteaseTransport>
 make_http_transport(const NeteaseTransportOptions &options);
+
+// 节流装饰器：给每个库一个独立实例，因此「每库独立」天然成立。
+// 两道闸门，都在这一层按「真实 HTTP 请求」计数：
+//   * max_concurrency  同时在飞的请求数上限（<=0 表示不限）；
+//   * min_interval_ms  同一库任意两次请求「发起时刻」之间的最小间隔（0 不限）。
+//
+// 缓存命中不会走到这一层（NeteaseClient 的 TTL 缓存拦在前面），所以只有
+// 真正要出网的请求才占名额、才推后时间线。
+//
+// 两道闸门都是阻塞等待，不返回 RateLimited：调用方只会慢一点，不会失败。
+// ctx.deadline_ms 到了则放弃等待并返回 Timeout。
+std::shared_ptr<NeteaseTransport>
+make_throttled_transport(std::shared_ptr<NeteaseTransport> inner,
+                         int max_concurrency, int min_interval_ms);
 
 // 测试用：按 path 返回固定 JSON，可注入失败，便于在没有 api-enhanced 的环境里
 // 覆盖客户端与媒体库对象的逻辑。

@@ -126,6 +126,11 @@ const Config &load(const std::string &file) {
       !value.empty()) {
     loaded.netease.max_concurrency = toInt(value, "NETEASE_MAX_CONCURRENCY");
   }
+  if (const std::string value = envValue("NETEASE_MIN_REQUEST_INTERVAL_MS");
+      !value.empty()) {
+    loaded.netease.min_request_interval_ms =
+        toInt(value, "NETEASE_MIN_REQUEST_INTERVAL_MS");
+  }
   if (const std::string value = envValue("NETEASE_REAL_IP"); !value.empty()) {
     loaded.netease.real_ip = value;
   }
@@ -273,6 +278,10 @@ const Config &load(const std::string &file) {
         loaded.netease.max_concurrency =
             static_cast<int>(ne["max_concurrency"].i());
       }
+      if (ne.has("min_request_interval_ms")) {
+        loaded.netease.min_request_interval_ms =
+            static_cast<int>(ne["min_request_interval_ms"].i());
+      }
       if (ne.has("real_ip")) {
         loaded.netease.real_ip = ne["real_ip"].s();
       }
@@ -410,6 +419,14 @@ const Config &load(const std::string &file) {
       loaded.netease.max_concurrency > 64) {
     throw std::runtime_error("netease.max_concurrency 超出范围 (1-64): " +
                              std::to_string(loaded.netease.max_concurrency));
+  }
+  if (loaded.netease.min_request_interval_ms < 0) {
+    throw std::runtime_error("netease.min_request_interval_ms 不能为负数");
+  }
+  if (loaded.netease.min_request_interval_ms > 60000) {
+    throw std::runtime_error(
+        "netease.min_request_interval_ms 超出范围 (0-60000): " +
+        std::to_string(loaded.netease.min_request_interval_ms));
   }
   if (loaded.netease.enabled && loaded.netease.api_base.empty()) {
     throw std::runtime_error("netease.api_base 不能为空");

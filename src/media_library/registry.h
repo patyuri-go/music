@@ -135,9 +135,14 @@ public:
   // 借一个库来做一次操作：查表 → 取实例 → 验能力 → 占并发名额（5.2.6）。
   // 成功返回的 LibraryLease 已经占用名额，析构即归还。
   // 判断「有没有资格」全部在注册表内部，调用方不做也不应重复这套顺序。
+  //
+  // 并发名额用满时不立即失败，而是排队等待（5.2.6 修订）：库被关停、禁用、
+  // 熔断、限流这四种「等也没用」的情况仍立即失败。deadline_ms 到达后放弃
+  // 排队并返回 Timeout。
   virtual Result<LibraryLease> acquire(std::string_view library_id,
                                        CapabilityId capability,
-                                       std::int64_t now_ms) = 0;
+                                       std::int64_t now_ms,
+                                       std::optional<std::int64_t> deadline_ms) = 0;
 
   // 能力集合可能随账号状态变化，显式刷新（5.2.4）。
   virtual Status refresh_capabilities(std::string_view library_id) = 0;
@@ -151,7 +156,9 @@ private:
   // admit 检查 enabled / stopping / 熔断窗口 / 限流窗口 / 并发上限，
   // 通过后占用一个并发名额，必须配对 release——用 acquire() 拿 LibraryLease，
   // 不要直接调这两个：外部调用顺序写错会泄漏名额或误清熔断。
-  virtual Status admit(std::string_view library_id, std::int64_t now_ms) = 0;
+  // 并发上限这一项会阻塞等待名额；deadline_ms 到达则返回 Timeout。
+  virtual Status admit(std::string_view library_id, std::int64_t now_ms,
+                       std::optional<std::int64_t> deadline_ms) = 0;
   virtual void release(std::string_view library_id,
                        const std::optional<Error> &error,
                        std::int64_t now_ms) = 0;

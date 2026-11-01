@@ -3,7 +3,10 @@
 #include "api/webdav/webdav.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -109,6 +112,131 @@ private:
   int timeout_ms_;
 };
 
+// 节流装饰器：一个实例只服务一个库。
+// 时间基准用 steady_clock——间隔是「等了多久」，不受系统时间调整影响。
+std::int64_t monotonic_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+class ThrottledTransport final : public NeteaseTransport {
+public:
+  ThrottledTransport(std::shared_ptr<NeteaseTransport> inner,
+                     int max_concurrency, int min_interval_ms)
+      : inner_(std::move(inner)),
+        max_concurrency_(max_concurrency > 0 ? max_concurrency : 0),
+        min_interval_ms_(min_interval_ms > 0 ? min_interval_ms : 0) {}
+
+  media_library::Result<std::string> get(
+      const std::string &path,
+      const std::vector<std::pair<std::string, std::string>> &query,
+      const media_library::CallContext &ctx) override {
+    if (!inner_) {
+      return media_library::Result<std::string>::failure(media_library::Error::make(
+          media_library::ErrorCode::ProviderUnavailable,
+          "netease transport is not configured"));
+    }
+
+    // 两道闸门都按「真实请求」计数，所以必须在 inner_->get() 之外持锁。
+    // 先等名额再等间隔：占着名额干等间隔会无谓压低并行度。
+    if (!acquire_slot(ctx)) {
+      return media_library::Result<std::string>::failure(deadline_error());
+    }
+    media_library::Result<std::string> result = inner_->get(path, query, ctx);
+    release_slot();
+    return result;
+  }
+
+private:
+  media_library::Error deadline_error() const {
+    media_library::Error error = media_library::Error::make(
+        media_library::ErrorCode::Timeout, "netease request deadline exceeded");
+    error.retryable = true;
+    return error;
+  }
+
+  // 拿名额 + 等到允许发起的时刻；成功时时间线已推到下一次。
+  bool acquire_slot(const media_library::CallContext &ctx) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const std::int64_t deadline =
+        ctx.deadline_ms.has_value() ? *ctx.deadline_ms : -1;
+
+    const auto too_late = [this, deadline]() {
+      return deadline >= 0 && monotonic_ms() >= deadline;
+    };
+    const auto wait_until = [this, &lock, deadline](std::int64_t target) {
+      if (deadline >= 0 && deadline < target) {
+        return false;
+      }
+      return cv_.wait_until(
+          lock,
+          std::chrono::steady_clock::time_point(
+              std::chrono::milliseconds(target)),
+          [this, deadline, target]() {
+            // 名额空出来或间隔到点都可能提前醒；deadline 先到就直接放弃。
+            if (deadline >= 0 && monotonic_ms() >= deadline) {
+              return true;
+            }
+            const bool slot_free =
+                max_concurrency_ == 0 || in_flight_ < max_concurrency_;
+            const bool time_reached = monotonic_ms() >= target;
+            return slot_free && time_reached;
+          });
+    };
+
+    while (max_concurrency_ > 0 && in_flight_ >= max_concurrency_) {
+      if (too_late()) {
+        return false;
+      }
+      // 名额释放时会 notify_all，这里不需要额外的时间上界：
+      // 上面的谓词在 deadline 到点后自己会返回 true。
+      cv_.wait(lock, [this, &too_late]() {
+        if (too_late()) {
+          return true;
+        }
+        return max_concurrency_ == 0 || in_flight_ < max_concurrency_;
+      });
+      if (too_late()) {
+        return false;
+      }
+    }
+
+    if (min_interval_ms_ > 0) {
+      const std::int64_t target = next_allowed_ms_;
+      if (!wait_until(target)) {
+        return false;
+      }
+      if (too_late()) {
+        return false;
+      }
+      // 现在允许发起：把时间线推到「本次发起时刻 + 间隔」。
+      next_allowed_ms_ = monotonic_ms() + min_interval_ms_;
+    }
+
+    ++in_flight_;
+    return true;
+  }
+
+  void release_slot() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (in_flight_ > 0) {
+      --in_flight_;
+    }
+    // 名额可能刚空出来；间隔也可能已到点。两种情况都值得唤醒。
+    cv_.notify_all();
+  }
+
+  std::shared_ptr<NeteaseTransport> inner_;
+  int max_concurrency_ = 0;
+  int min_interval_ms_ = 0;
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  int in_flight_ = 0;
+  std::int64_t next_allowed_ms_ = 0;
+};
+
 } // namespace
 
 std::shared_ptr<NeteaseTransport>
@@ -127,6 +255,21 @@ make_http_transport(const NeteaseTransportOptions &options) {
   }
   return std::make_shared<HttpTransport>(std::move(base), std::move(prefix),
                                          options.timeout_ms);
+}
+
+std::shared_ptr<NeteaseTransport>
+make_throttled_transport(std::shared_ptr<NeteaseTransport> inner,
+                         int max_concurrency, int min_interval_ms) {
+  if (inner == nullptr) {
+    return nullptr;
+  }
+  // 两道闸门都不限时直接返回原对象：少一层虚调用，也便于排查。
+  if (max_concurrency <= 0 && min_interval_ms <= 0) {
+    return inner;
+  }
+  return std::make_shared<ThrottledTransport>(std::move(inner),
+                                              max_concurrency,
+                                              min_interval_ms);
 }
 
 } // namespace api_enhanced

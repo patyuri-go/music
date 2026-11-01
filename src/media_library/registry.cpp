@@ -3,8 +3,10 @@
 #include <chrono>
 
 #include <algorithm>
+#include <condition_variable>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -92,6 +94,14 @@ bool is_open_circuit_failure(ErrorCode code) noexcept {
   return false;
 }
 
+// 与 CallContext::deadline_ms 同一时基（steady_clock 毫秒）。
+// 注意：不能与库返回的 now_ms（调用方传入）混用——后者只用于熔断/限流窗口。
+std::int64_t lease_now_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 struct Entry {
   std::shared_ptr<Library> library;
   LibraryRegistration registration;
@@ -170,6 +180,8 @@ public:
       closed = it->second.library;
       entries_.erase(it);
       rebuild_index_locked();
+      // 排队等名额的调用方需要醒来发现自己已无处可等。
+      cv_.notify_all();
     }
     // close() 在锁外调用：它可能阻塞，不能让注册表跟着卡住。
     if (closed) {
@@ -335,7 +347,8 @@ public:
 
   Result<LibraryLease> acquire(std::string_view library_id,
                                CapabilityId capability,
-                               std::int64_t now_ms) override {
+                               std::int64_t now_ms,
+                               std::optional<std::int64_t> deadline_ms) override {
     if (library_id.empty()) {
       return Result<LibraryLease>::failure(
           Error::make(ErrorCode::InvalidRequest, "library id is required"));
@@ -369,7 +382,8 @@ public:
     }
 
     // 5.2.6：并发上限、熔断、限流在这里统一拦截。
-    const Status admitted = admit(id, now_ms);
+    // 并发上限会排队等待名额，因此这一行可能阻塞；deadline 到了就放弃。
+    const Status admitted = admit(id, now_ms, deadline_ms);
     if (!admitted.ok()) {
       return Result<LibraryLease>::failure(admitted.error());
     }
@@ -377,7 +391,8 @@ public:
         LibraryLease(shared_from_this(), id, std::move(instance)));
   }
 
-  Status admit(std::string_view library_id, std::int64_t now_ms) override {
+  Status admit(std::string_view library_id, std::int64_t now_ms,
+               std::optional<std::int64_t> deadline_ms) override {
     std::unique_lock lock(mutex_);
     note_now_locked(now_ms);
 
@@ -413,18 +428,98 @@ public:
       error.library_id = entry.registration.library_id;
       return Status::failure(std::move(error));
     }
-    if (entry.in_flight >= entry.registration.limits.max_concurrency) {
-      // 5.2.6：超限直接 rate_limited，不排队。
-      Error error =
-          Error::make(ErrorCode::RateLimited, "library concurrency limit hit");
-      error.retryable = true;
-      error.retry_after = 50;
-      error.library_id = entry.registration.library_id;
-      return Status::failure(std::move(error));
+
+    // 并发名额用满时排队等待（5.2.6 修订：限流不再立即失败）。
+    // 条件变量配 shared_mutex 用 _any 版本；等待期间锁是释放的。
+    // 只等「名额」：release() / remove() / shutdown() 都会 notify_all。
+    // 每轮都重新查表，避免等待期间条目被移除导致悬空引用。
+    const std::string id(library_id);
+    while (true) {
+      const auto current = entries_.find(id);
+      if (current == entries_.end()) {
+        return Status::failure(
+            Error::make(ErrorCode::NotFound, "library not registered: " + id));
+      }
+      const Entry &now_entry = current->second;
+      if (now_entry.in_flight <
+          now_entry.registration.limits.max_concurrency) {
+        break;
+      }
+      const auto wake = [this, &id]() { return slot_or_gone_locked(id); };
+      if (deadline_ms.has_value()) {
+        const std::int64_t left = *deadline_ms - lease_now_ms();
+        if (left <= 0 ||
+            !cv_.wait_for(lock, std::chrono::milliseconds(left), wake)) {
+          Error error =
+              Error::make(ErrorCode::Timeout, "waiting for concurrency slot");
+          error.retryable = true;
+          error.library_id = id;
+          return Status::failure(std::move(error));
+        }
+      } else {
+        cv_.wait(lock, wake);
+      }
+      // 醒来后重跑全部「等也没用」的检查，并刷新 now_ms（可能等很久）。
+      now_ms = lease_now_ms();
+      note_now_locked(now_ms);
+      const auto again = entries_.find(id);
+      if (again == entries_.end()) {
+        return Status::failure(
+            Error::make(ErrorCode::NotFound, "library not registered: " + id));
+      }
+      const Entry &rechecked = again->second;
+      if (stopping_ || rechecked.stopping) {
+        return Status::failure(Error::make(
+            ErrorCode::ProviderUnavailable, "library is shutting down"));
+      }
+      if (!rechecked.registration.enabled) {
+        return Status::failure(
+            Error::make(ErrorCode::ProviderUnavailable, "library is disabled"));
+      }
+      if (rechecked.circuit_open_until_ms > now_ms) {
+        Error error = Error::make(ErrorCode::ProviderUnavailable,
+                                  "circuit is open for this library");
+        error.retryable = true;
+        error.retry_after = rechecked.circuit_open_until_ms - now_ms;
+        error.library_id = rechecked.registration.library_id;
+        return Status::failure(std::move(error));
+      }
+      if (rechecked.rate_limited_until_ms > now_ms) {
+        Error error =
+            Error::make(ErrorCode::RateLimited, "library is rate limited");
+        error.retryable = true;
+        error.retry_after = rechecked.rate_limited_until_ms - now_ms;
+        error.library_id = rechecked.registration.library_id;
+        return Status::failure(std::move(error));
+      }
     }
 
-    ++entry.in_flight;
+    {
+      const auto final_it = entries_.find(id);
+      if (final_it == entries_.end()) {
+        return Status::failure(
+            Error::make(ErrorCode::NotFound, "library not registered: " + id));
+      }
+      ++final_it->second.in_flight;
+    }
     return Status::success();
+  }
+
+  // 等待谓词：该库已有空名额，或已经等不下去了（关停/禁用/被移除）。
+  // 必须持锁调用；只读状态。
+  bool slot_or_gone_locked(const std::string &id) const {
+    if (stopping_) {
+      return true;
+    }
+    const auto it = entries_.find(id);
+    if (it == entries_.end()) {
+      return true;
+    }
+    const Entry &entry = it->second;
+    if (entry.stopping || !entry.registration.enabled) {
+      return true;
+    }
+    return entry.in_flight < entry.registration.limits.max_concurrency;
   }
 
   void release(std::string_view library_id, const std::optional<Error> &error,
@@ -439,6 +534,8 @@ public:
     Entry &entry = it->second;
     if (entry.in_flight > 0) {
       --entry.in_flight;
+      // 名额刚空出来：唤醒在 admit 里排队等它的调用方。
+      cv_.notify_all();
     }
 
     if (!error.has_value()) {
@@ -519,6 +616,8 @@ public:
       }
       entries_.clear();
       capability_index_.clear();
+      // 同上：让所有排队者醒来看到 stopping_。
+      cv_.notify_all();
     }
 
     for (auto &library : libraries) {
@@ -549,6 +648,9 @@ private:
   }
 
   mutable std::shared_mutex mutex_;
+  // 与 shared_mutex 搭配必须用 condition_variable_any。
+  // 只有 admit 在等并发名额；release / remove / shutdown 唤醒。
+  std::condition_variable_any cv_;
   std::unordered_map<std::string, Entry> entries_;
   std::map<CapabilityId, std::vector<std::string>> capability_index_;
   bool stopping_ = false;
@@ -561,16 +663,6 @@ private:
 // ---------------------------------------------------------------------------
 // LibraryLease：admit / release 配对的唯一入口。
 // ---------------------------------------------------------------------------
-
-namespace {
-
-std::int64_t lease_now_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
-} // namespace
 
 LibraryLease::LibraryLease(std::shared_ptr<LibraryRegistry> registry,
                            std::string library_id,

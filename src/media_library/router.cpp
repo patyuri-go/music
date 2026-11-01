@@ -207,7 +207,8 @@ bool Router::should_fall_back(ErrorCode code) noexcept {
 // ---------------------------------------------------------------------------
 
 Result<Track> Router::get_track(const TrackRef &ref, const CallContext &ctx) {
-  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms(),
+                              ctx.deadline_ms);
   if (!lease.ok()) {
     return Result<Track>::failure(lease.error());
   }
@@ -231,7 +232,8 @@ Result<Track> Router::get_track(const TrackRef &ref, const CallContext &ctx) {
 }
 
 Result<Album> Router::get_album(const AlbumRef &ref, const CallContext &ctx) {
-  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms(),
+                              ctx.deadline_ms);
   if (!lease.ok()) {
     return Result<Album>::failure(lease.error());
   }
@@ -256,7 +258,8 @@ Result<Album> Router::get_album(const AlbumRef &ref, const CallContext &ctx) {
 
 Result<Artist> Router::get_artist(const ArtistRef &ref,
                                   const CallContext &ctx) {
-  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms(),
+                              ctx.deadline_ms);
   if (!lease.ok()) {
     return Result<Artist>::failure(lease.error());
   }
@@ -282,7 +285,8 @@ Result<Artist> Router::get_artist(const ArtistRef &ref,
 Result<Page<Track>> Router::list_album_tracks(const AlbumRef &ref,
                                               const PageRequest &page,
                                               const CallContext &ctx) {
-  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms(),
+                              ctx.deadline_ms);
   if (!lease.ok()) {
     return Result<Page<Track>>::failure(lease.error());
   }
@@ -308,7 +312,8 @@ Result<Page<Track>> Router::list_album_tracks(const AlbumRef &ref,
 Result<Page<Album>> Router::list_artist_albums(const ArtistRef &ref,
                                                const PageRequest &page,
                                                const CallContext &ctx) {
-  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::CatalogRead, now_ms(),
+                              ctx.deadline_ms);
   if (!lease.ok()) {
     return Result<Page<Album>>::failure(lease.error());
   }
@@ -335,7 +340,8 @@ Result<Page<Album>> Router::list_artist_albums(const ArtistRef &ref,
 // 歌单读取走 PlaylistRead 能力，不走 CatalogReader。
 Result<Playlist> Router::get_playlist(const PlaylistRef &ref,
                                       const CallContext &ctx) {
-  auto lease = registry_->acquire(ref.library_id, CapabilityId::PlaylistRead, now_ms());
+  auto lease = registry_->acquire(ref.library_id, CapabilityId::PlaylistRead, now_ms(),
+                              ctx.deadline_ms);
   if (!lease.ok()) {
     return Result<Playlist>::failure(lease.error());
   }
@@ -361,7 +367,8 @@ Result<Playlist> Router::get_playlist(const PlaylistRef &ref,
 Result<Page<Playlist>> Router::list_playlists(const std::string &library_id,
                                               const PageRequest &page,
                                               const CallContext &ctx) {
-  auto lease = registry_->acquire(library_id, CapabilityId::PlaylistRead, now_ms());
+  auto lease = registry_->acquire(library_id, CapabilityId::PlaylistRead, now_ms(),
+                              ctx.deadline_ms);
   if (!lease.ok()) {
     return Result<Page<Playlist>>::failure(lease.error());
   }
@@ -388,7 +395,8 @@ Result<Page<Playlist>> Router::list_playlists(const std::string &library_id,
 Result<Page<SearchHit>> Router::search_in(const std::string &library_id,
                                           const SearchQuery &query,
                                           const CallContext &ctx) {
-  auto lease = registry_->acquire(library_id, CapabilityId::Search, now_ms());
+  auto lease = registry_->acquire(library_id, CapabilityId::Search, now_ms(),
+                              ctx.deadline_ms);
   if (!lease.ok()) {
     return Result<Page<SearchHit>>::failure(lease.error());
   }
@@ -538,7 +546,8 @@ Router::run_aspect(const SourceRef &ref, Aspect aspect, const CallContext &ctx,
     AspectAttempt attempt;
     attempt.library_id = candidate.library_id;
 
-    auto lease = registry_->acquire(candidate.library_id, capability_for(aspect), now_ms());
+    auto lease = registry_->acquire(candidate.library_id, capability_for(aspect), now_ms(),
+                           ctx.deadline_ms);
     if (!lease.ok()) {
       attempt.ok = false;
       attempt.error = lease.error().code;
@@ -695,7 +704,8 @@ Result<AggregatedPage<SearchHit>> Router::search(const SearchQuery &query,
     status.library_id = registration.library_id;
     const std::int64_t started = current_ms();
 
-    auto lease = registry_->acquire(registration.library_id, CapabilityId::Search, now_ms());
+    auto lease = registry_->acquire(registration.library_id, CapabilityId::Search, now_ms(),
+                           ctx.deadline_ms);
     if (!lease.ok()) {
       status.state = source_state_from(lease.error().code);
       status.error = lease.error();
