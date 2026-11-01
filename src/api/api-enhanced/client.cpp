@@ -210,6 +210,14 @@ NeteaseSong parse_song(const crow::json::rvalue &object) {
   song.cd = static_cast<int>(field_int64(object, "cd"));
   song.publish_time_ms = field_int64(object, "publishTime");
   song.alias = field_strings(object, "alia");
+  if (song.alias.empty()) {
+    // cloudsearch 走另一套字段名。
+    song.alias = field_strings(object, "alias");
+  }
+  song.translated_names = field_strings(object, "tns");
+  if (song.translated_names.empty()) {
+    song.translated_names = field_strings(object, "transNames");
+  }
   if (object.has("ar")) {
     song.artists = parse_artists(object["ar"]);
   }

@@ -50,8 +50,7 @@ std::optional<std::string> date_of(std::int64_t publish_time_ms) {
   if (publish_time_ms <= 0) {
     return std::nullopt;
   }
-  const std::time_t seconds =
-      static_cast<std::time_t>(publish_time_ms / 1000);
+  const std::time_t seconds = static_cast<std::time_t>(publish_time_ms / 1000);
   std::tm utc{};
   if (gmtime_r(&seconds, &utc) == nullptr) {
     return std::nullopt;
@@ -88,6 +87,55 @@ std::int64_t offset_of(const std::optional<std::string> &cursor) {
 
 std::optional<int> positive_or_nullopt(int value) {
   return value > 0 ? std::optional<int>(value) : std::nullopt;
+}
+
+// 备注字段按 `|` 拆段并去空白/去重。平台把「原曲《…》|动画《…》」
+// 塞在一条 alia 里，UI 上应该各占一对括号。
+std::vector<std::string> split_notes(const std::vector<std::string> &items) {
+  std::vector<std::string> out;
+  for (const std::string &raw : items) {
+    std::size_t begin = 0;
+    while (true) {
+      const std::size_t bar = raw.find('|', begin);
+      std::string piece = raw.substr(
+          begin, bar == std::string::npos ? std::string::npos : bar - begin);
+      const std::size_t first = piece.find_first_not_of(" \t\r\n");
+      const std::size_t last = piece.find_last_not_of(" \t\r\n");
+      piece = first == std::string::npos
+                  ? std::string()
+                  : piece.substr(first, last - first + 1);
+      if (!piece.empty() &&
+          std::find(out.begin(), out.end(), piece) == out.end()) {
+        out.push_back(std::move(piece));
+      }
+      if (bar == std::string::npos) {
+        break;
+      }
+      begin = bar + 1;
+    }
+  }
+  return out;
+}
+
+// 曲目标题补全：`歌名 (译名) [备注]…`。
+// tns（译名）在前用半角圆括号，alia（备注）在后每条各一对半角方括号；
+// 两个来源都没有时返回原名，不加任何空括号。只用于曲目，album/artist
+// 标题保持平台原名。
+std::string title_with_alias(const std::string &name,
+                             const std::vector<std::string> &translated,
+                             const std::vector<std::string> &alias) {
+  std::string out = name;
+  const std::vector<std::string> names = split_notes(translated);
+  for (const std::string &item : names) {
+    out += "(" + item + ")";
+  }
+  for (const std::string &item : split_notes(alias)) {
+    if (std::find(names.begin(), names.end(), item) != names.end()) {
+      continue;
+    }
+    out += "[" + item + "]";
+  }
+  return out;
 }
 
 // tags 可能是空串、逗号分隔串或数组；只有非空项才进 genres。
@@ -162,32 +210,30 @@ std::string mime_of(const std::string &format) {
 // 名字过滤沿用本地库语义：小写化后全等，避免「周杰伦」命中「周杰伦的徒弟」。
 bool contains_name(const std::vector<ArtistLink> &links,
                    const std::string &needle) {
-  return std::any_of(links.begin(), links.end(),
-                     [&needle](const ArtistLink &link) {
-                       return link.name.size() == needle.size() &&
-                              std::equal(link.name.begin(), link.name.end(),
-                                         needle.begin(), [](char a, char b) {
-                                           return std::tolower(
-                                                      static_cast<unsigned char>(a)) ==
-                                                  std::tolower(
-                                                      static_cast<unsigned char>(b));
-                                         });
-                     });
+  return std::any_of(
+      links.begin(), links.end(), [&needle](const ArtistLink &link) {
+        return link.name.size() == needle.size() &&
+               std::equal(link.name.begin(), link.name.end(), needle.begin(),
+                          [](char a, char b) {
+                            return std::tolower(
+                                       static_cast<unsigned char>(a)) ==
+                                   std::tolower(static_cast<unsigned char>(b));
+                          });
+      });
 }
 
 bool contains_name(const std::vector<AlbumArtistLink> &links,
                    const std::string &needle) {
-  return std::any_of(links.begin(), links.end(),
-                     [&needle](const AlbumArtistLink &link) {
-                       return link.name.size() == needle.size() &&
-                              std::equal(link.name.begin(), link.name.end(),
-                                         needle.begin(), [](char a, char b) {
-                                           return std::tolower(
-                                                      static_cast<unsigned char>(a)) ==
-                                                  std::tolower(
-                                                      static_cast<unsigned char>(b));
-                                         });
-                     });
+  return std::any_of(
+      links.begin(), links.end(), [&needle](const AlbumArtistLink &link) {
+        return link.name.size() == needle.size() &&
+               std::equal(link.name.begin(), link.name.end(), needle.begin(),
+                          [](char a, char b) {
+                            return std::tolower(
+                                       static_cast<unsigned char>(a)) ==
+                                   std::tolower(static_cast<unsigned char>(b));
+                          });
+      });
 }
 
 } // namespace
@@ -311,10 +357,10 @@ Track NeteaseLibrary::track_from_song(
     return track;
   }
   track.ref = ref.value();
-  track.title = song.name;
-  track.duration_ms =
-      song.duration_ms > 0 ? std::optional<std::int64_t>(song.duration_ms)
-                           : std::nullopt;
+  track.title = title_with_alias(song.name, song.translated_names, song.alias);
+  track.duration_ms = song.duration_ms > 0
+                          ? std::optional<std::int64_t>(song.duration_ms)
+                          : std::nullopt;
   track.track_no = positive_or_nullopt(song.no);
   track.disc_no = positive_or_nullopt(song.cd);
   track.date = date_of(song.publish_time_ms);
@@ -325,8 +371,7 @@ Track NeteaseLibrary::track_from_song(
     if (!artist_ref.ok()) {
       continue;
     }
-    track.artists.push_back(
-        ArtistLink{artist_ref.value(), artist.name});
+    track.artists.push_back(ArtistLink{artist_ref.value(), artist.name});
   }
 
   // al{} 只有 id/name/picUrl；专辑艺术家必须来自 /album 的 artists[]，
@@ -371,9 +416,8 @@ Track NeteaseLibrary::track_from_song(
   if (song.album.id > 0 && !picture.empty()) {
     auto owner = api_enhanced::make_ref(EntityType::Album, song.album.id);
     if (owner.ok()) {
-      track.artwork =
-          ArtworkRef{owner.value(), "primary", std::nullopt,
-                     cache_tag_of(picture)};
+      track.artwork = ArtworkRef{owner.value(), "primary", std::nullopt,
+                                 cache_tag_of(picture)};
     }
   }
 
@@ -395,8 +439,8 @@ Track NeteaseLibrary::track_from_song(
   return track;
 }
 
-Album
-NeteaseLibrary::album_from_brief(const api_enhanced::NeteaseAlbumBrief &brief) const {
+Album NeteaseLibrary::album_from_brief(
+    const api_enhanced::NeteaseAlbumBrief &brief) const {
   Album album;
   const auto ref = api_enhanced::make_ref(EntityType::Album, brief.id);
   if (!ref.ok()) {
@@ -413,19 +457,17 @@ NeteaseLibrary::album_from_brief(const api_enhanced::NeteaseAlbumBrief &brief) c
     if (!artist_ref.ok()) {
       continue;
     }
-    album.artists.push_back(
-        AlbumArtistLink{artist_ref.value(), artist.name});
+    album.artists.push_back(AlbumArtistLink{artist_ref.value(), artist.name});
   }
   if (brief.id > 0 && !brief.pic_url.empty()) {
-    album.artwork =
-        ArtworkRef{album.ref, "primary", std::nullopt,
-                   cache_tag_of(brief.pic_url)};
+    album.artwork = ArtworkRef{album.ref, "primary", std::nullopt,
+                               cache_tag_of(brief.pic_url)};
   }
   return album;
 }
 
-Artist
-NeteaseLibrary::artist_from_brief(const api_enhanced::NeteaseArtist &brief) const {
+Artist NeteaseLibrary::artist_from_brief(
+    const api_enhanced::NeteaseArtist &brief) const {
   Artist artist;
   const auto ref = api_enhanced::make_ref(EntityType::Artist, brief.id);
   if (!ref.ok()) {
@@ -435,9 +477,8 @@ NeteaseLibrary::artist_from_brief(const api_enhanced::NeteaseArtist &brief) cons
   artist.name = brief.name;
   artist.sort_name = brief.name;
   if (!brief.pic_url.empty()) {
-    artist.artwork =
-        ArtworkRef{artist.ref, "primary", std::nullopt,
-                   cache_tag_of(brief.pic_url)};
+    artist.artwork = ArtworkRef{artist.ref, "primary", std::nullopt,
+                                cache_tag_of(brief.pic_url)};
   }
   return artist;
 }
@@ -460,8 +501,8 @@ Result<Track> NeteaseLibrary::get_track(const TrackRef &ref,
     client = client_;
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   auto songs = client->song_detail({id.value()}, ctx);
@@ -512,8 +553,8 @@ Result<Album> NeteaseLibrary::get_album(const AlbumRef &ref,
     client = client_;
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   auto album = client->album(id.value(), ctx);
@@ -545,8 +586,8 @@ Result<Artist> NeteaseLibrary::get_artist(const ArtistRef &ref,
     client = client_;
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   auto artist = client->artist(id.value(), ctx);
@@ -579,8 +620,8 @@ Result<Page<Track>> NeteaseLibrary::list_album_tracks(const AlbumRef &ref,
     client = client_;
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   auto album = client->album(id.value(), ctx);
@@ -598,9 +639,8 @@ Result<Page<Track>> NeteaseLibrary::list_album_tracks(const AlbumRef &ref,
   const int limit = page.limit > 0 ? page.limit : 50;
 
   Page<Track> out;
-  for (std::int64_t i = offset;
-       i < static_cast<std::int64_t>(songs.size()) &&
-       static_cast<int>(out.items.size()) < limit;
+  for (std::int64_t i = offset; i < static_cast<std::int64_t>(songs.size()) &&
+                                static_cast<int>(out.items.size()) < limit;
        ++i) {
     out.items.push_back(track_from_song(songs[static_cast<std::size_t>(i)],
                                         album.value().brief, ctx));
@@ -608,8 +648,8 @@ Result<Page<Track>> NeteaseLibrary::list_album_tracks(const AlbumRef &ref,
   if (offset + static_cast<std::int64_t>(out.items.size()) <
       static_cast<std::int64_t>(songs.size())) {
     out.has_more = true;
-    out.next_cursor = std::to_string(offset +
-                                     static_cast<std::int64_t>(out.items.size()));
+    out.next_cursor =
+        std::to_string(offset + static_cast<std::int64_t>(out.items.size()));
   }
   return R::success(std::move(out));
 }
@@ -633,15 +673,15 @@ Result<Page<Album>> NeteaseLibrary::list_artist_albums(const ArtistRef &ref,
     client = client_;
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   const std::int64_t offset = offset_of(page.cursor);
   const int limit = std::clamp(page.limit > 0 ? page.limit : 50, 1, 100);
 
-  auto albums = client->artist_albums(
-      id.value(), limit, static_cast<int>(offset), ctx);
+  auto albums =
+      client->artist_albums(id.value(), limit, static_cast<int>(offset), ctx);
   if (!albums.ok()) {
     return R::failure(albums.error());
   }
@@ -675,15 +715,14 @@ Result<Page<SearchHit>> NeteaseLibrary::search(const SearchQuery &query,
     client = client_;
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   const bool all_types = query.types.empty();
   const auto wants = [&query, all_types](EntityType type) {
-    return all_types ||
-           std::find(query.types.begin(), query.types.end(), type) !=
-               query.types.end();
+    return all_types || std::find(query.types.begin(), query.types.end(),
+                                  type) != query.types.end();
   };
   const bool want_tracks = wants(EntityType::Track);
   const bool want_albums = wants(EntityType::Album);
@@ -693,8 +732,8 @@ Result<Page<SearchHit>> NeteaseLibrary::search(const SearchQuery &query,
     return R::success(Page<SearchHit>{});
   }
 
-  const int limit = std::clamp(query.page.limit > 0 ? query.page.limit : 50, 1,
-                               100);
+  const int limit =
+      std::clamp(query.page.limit > 0 ? query.page.limit : 50, 1, 100);
   const int offset = static_cast<int>(offset_of(query.page.cursor));
 
   Page<SearchHit> out;
@@ -798,15 +837,15 @@ Result<Page<SearchHit>> NeteaseLibrary::search(const SearchQuery &query,
           continue;
         }
         if (!query.artists.empty() &&
-            !contains_name(std::vector<ArtistLink>{
-                               ArtistLink{artist.ref, artist.name}},
-                           query.artists.front())) {
+            !contains_name(
+                std::vector<ArtistLink>{ArtistLink{artist.ref, artist.name}},
+                query.artists.front())) {
           continue;
         }
         SearchHit hit;
         if (as_album_artist) {
-          auto album_artist_ref = api_enhanced::make_ref(
-              EntityType::AlbumArtist, brief.id);
+          auto album_artist_ref =
+              api_enhanced::make_ref(EntityType::AlbumArtist, brief.id);
           if (!album_artist_ref.ok()) {
             continue;
           }
@@ -858,8 +897,8 @@ NeteaseLibrary::resolve_playback(const TrackRef &ref, const CallContext &ctx) {
     level = client_ != nullptr ? client_->options().default_level : "exhigh";
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   // fee==4 的曲目平台不会给直链，先按「限制」而不是「故障」返回。
@@ -872,7 +911,7 @@ NeteaseLibrary::resolve_playback(const TrackRef &ref, const CallContext &ctx) {
                                  });
     if (it != list.end() && it->fee == 4) {
       Error error = Error::make(ErrorCode::PermissionDenied,
-                               "netease track requires album purchase");
+                                "netease track requires album purchase");
       error.restriction = RestrictionCode::CopyrightUnavailable;
       return R::failure(std::move(error));
     }
@@ -885,7 +924,7 @@ NeteaseLibrary::resolve_playback(const TrackRef &ref, const CallContext &ctx) {
   if (url.value().url.empty()) {
     // 平台明确表示「这首播不了」：版权/会员/地区，属于限制不是故障。
     Error error = Error::make(ErrorCode::PermissionDenied,
-                             "netease track is not playable");
+                              "netease track is not playable");
     error.restriction = url.value().fee == 1
                             ? RestrictionCode::VipRequired
                             : RestrictionCode::CopyrightUnavailable;
@@ -906,10 +945,9 @@ NeteaseLibrary::resolve_playback(const TrackRef &ref, const CallContext &ctx) {
   PlaybackSource source;
   source.track = ref;
   source.kind = PlaybackKind::RemoteStream;
-  source.quality =
-      url.value().level_name.empty()
-          ? std::optional<std::string>(level)
-          : std::optional<std::string>(url.value().level_name);
+  source.quality = url.value().level_name.empty()
+                       ? std::optional<std::string>(level)
+                       : std::optional<std::string>(url.value().level_name);
   if (url.value().bitrate > 0) {
     source.bitrate_kbps = static_cast<int>(url.value().bitrate / 1000);
   }
@@ -1038,14 +1076,16 @@ Result<ArtworkRef> NeteaseLibrary::get_artwork(const SourceRef &owner,
 }
 
 Result<ArtworkLocation>
-NeteaseLibrary::artwork_location(const ArtworkRef &ref, const CallContext &ctx) {
+NeteaseLibrary::artwork_location(const ArtworkRef &ref,
+                                 const CallContext &ctx) {
   const std::optional<std::string> picture = picture_of(ref.owner, ctx);
   if (!picture.has_value() || picture->empty()) {
     return Result<ArtworkLocation>::failure(
         Error::make(ErrorCode::NotFound, "netease artwork not found"));
   }
   ArtworkLocation location;
-  // locator 只进 ArtworkService；cache_virtual_path 留空（远端没有本地缓存键）。
+  // locator 只进 ArtworkService；cache_virtual_path
+  // 留空（远端没有本地缓存键）。
   location.locator = *picture;
   location.mime_type = "image/jpeg";
   return Result<ArtworkLocation>::success(std::move(location));
@@ -1069,8 +1109,8 @@ Result<Lyrics> NeteaseLibrary::get_lyrics(const TrackRef &ref,
     client = client_;
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   auto parsed = client->lyric(id.value(), ctx);
@@ -1092,9 +1132,8 @@ Result<Lyrics> NeteaseLibrary::get_lyrics(const TrackRef &ref,
   return R::success(std::move(lyrics));
 }
 
-Result<Page<Playlist>>
-NeteaseLibrary::list_playlists(const PageRequest &page,
-                               const CallContext &ctx) {
+Result<Page<Playlist>> NeteaseLibrary::list_playlists(const PageRequest &page,
+                                                      const CallContext &ctx) {
   using R = Result<Page<Playlist>>;
   if (uid_.empty()) {
     // §12 N5：没配 uid 不是「没数据」，是可操作的配置错误。
@@ -1109,15 +1148,15 @@ NeteaseLibrary::list_playlists(const PageRequest &page,
     client = client_;
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   const std::int64_t offset = offset_of(page.cursor);
   const int limit = page.limit > 0 ? page.limit : 50;
 
-  auto fetched = client->user_playlists(uid_, limit,
-                                        static_cast<int>(offset), ctx);
+  auto fetched =
+      client->user_playlists(uid_, limit, static_cast<int>(offset), ctx);
   if (!fetched.ok()) {
     return R::failure(fetched.error());
   }
@@ -1147,8 +1186,8 @@ NeteaseLibrary::list_playlists(const PageRequest &page,
   // has_more 只认平台给的 more，不用「是否取满一页」去推断。
   if (!out.items.empty() && fetched.value().has_more) {
     out.has_more = true;
-    out.next_cursor = std::to_string(
-        offset + static_cast<std::int64_t>(out.items.size()));
+    out.next_cursor =
+        std::to_string(offset + static_cast<std::int64_t>(out.items.size()));
   }
   return R::success(std::move(out));
 }
@@ -1172,8 +1211,8 @@ Result<Playlist> NeteaseLibrary::get_playlist(const PlaylistRef &ref,
     client = client_;
   }
   if (client == nullptr) {
-    return R::failure(
-        Error::make(ErrorCode::ProviderUnavailable, "netease client is closed"));
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
   }
 
   auto detail = client->playlist(id.value(), ctx);
@@ -1196,7 +1235,8 @@ Result<Playlist> NeteaseLibrary::get_playlist(const PlaylistRef &ref,
   constexpr int kMaxPages = 20;
   const std::int64_t total = detail.value().track_count;
   for (int page_index = 0; page_index < kMaxPages; ++page_index) {
-    const std::int64_t offset = static_cast<std::int64_t>(page_index) * kPageSize;
+    const std::int64_t offset =
+        static_cast<std::int64_t>(page_index) * kPageSize;
     if (total > 0 && offset >= total) {
       break;
     }
@@ -1249,13 +1289,12 @@ make_netease_library(const std::string &library_id,
       std::move(http), transport.max_concurrency,
       transport.min_request_interval_ms);
   if (throttled == nullptr) {
-    return Result<std::shared_ptr<NeteaseLibrary>>::failure(
-        Error::make(ErrorCode::Internal, "netease transport is not configured"));
+    return Result<std::shared_ptr<NeteaseLibrary>>::failure(Error::make(
+        ErrorCode::Internal, "netease transport is not configured"));
   }
 
-  auto client =
-      std::make_shared<api_enhanced::NeteaseClient>(std::move(throttled),
-                                                    client_options);
+  auto client = std::make_shared<api_enhanced::NeteaseClient>(
+      std::move(throttled), client_options);
   auto library = std::make_shared<NeteaseLibrary>(library_id, display_name,
                                                   std::move(client), uid);
   library->initialize();

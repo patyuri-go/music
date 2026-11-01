@@ -73,7 +73,10 @@ struct NeteaseSong {
   // cd 可能是字符串（"1"），也可能是数字；0 表示缺省。
   int cd{0};
   std::int64_t publish_time_ms{0};
+  // alia：备注（原曲出处、影视剧名等），可能一条里用 `|` 分段。
   std::vector<std::string> alias;
+  // tns：译名。
+  std::vector<std::string> translated_names;
   std::vector<NeteaseArtistRef> artists;
   // al{} 只给 id/name/picUrl，没有艺术家。
   NeteaseAlbumBrief album;
