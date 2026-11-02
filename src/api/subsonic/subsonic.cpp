@@ -447,6 +447,133 @@ crow::response handle_playlist(const crow::request &req) {
 // 歌词
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 歌词（OpenSubsonic songLyrics v2）
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 一条可输出的歌词轨：正文行 + 可选的逐字时间。
+struct LyricTrack {
+  std::string text;
+  std::optional<std::int64_t> start_ms;
+  std::optional<std::int64_t> end_ms;
+  const std::vector<media_library::LyricWord> *words = nullptr;
+};
+
+// Subsonic 的 cue 用 **UTF-8 字节偏移** 而且是闭区间；跨行拼字时必须按字节累加，
+// 不能按码点数（中日常用字都是 3 字节，混排时按码点算一定错位）。
+crow::json::wvalue::list cue_list_of(const std::vector<media_library::LyricWord> &words,
+                                     std::optional<std::int64_t> line_end_ms) {
+  crow::json::wvalue::list cues;
+
+  std::string value;
+  for (const auto &word : words) {
+    value += word.text;
+  }
+
+  // end 的 all-or-none 契约：只要有一个词没有 end_ms，就要么全部补齐、要么全部省略。
+  // 这里统一补齐——用下一个词的起点，最后一个词退化到行尾。
+  bool any_end = false;
+  for (const auto &word : words) {
+    if (word.end_ms.has_value()) {
+      any_end = true;
+      break;
+    }
+  }
+
+  std::size_t byte_pos = 0;
+  for (std::size_t i = 0; i < words.size(); ++i) {
+    const media_library::LyricWord &word = words[i];
+    const std::size_t byte_start = byte_pos;
+    byte_pos += word.text.size();
+    const std::size_t byte_end = byte_pos == 0 ? 0 : byte_pos - 1;
+    if (word.text.empty()) {
+      continue;
+    }
+
+    crow::json::wvalue cue;
+    cue["start"] = word.start_ms;
+    if (any_end) {
+      std::int64_t end = word.start_ms;
+      if (word.end_ms.has_value()) {
+        end = *word.end_ms;
+      } else if (i + 1 < words.size()) {
+        end = words[i + 1].start_ms;
+      } else if (line_end_ms.has_value()) {
+        end = *line_end_ms;
+      }
+      cue["end"] = end;
+    }
+    cue["byteStart"] = static_cast<int>(byte_start);
+    cue["byteEnd"] = static_cast<int>(byte_end);
+    cue["value"] = word.text;
+    cues.push_back(std::move(cue));
+  }
+  return cues;
+}
+
+// 组装一个 structuredLyrics 元素。
+// kind 只在 enhanced 时输出：main / translation / pronunciation。
+crow::json::wvalue structured_lyrics(const std::string &lang, bool synced,
+                                     const std::vector<LyricTrack> &tracks,
+                                     const std::string &kind, bool enhanced) {
+  crow::json::wvalue::list lines;
+  crow::json::wvalue::list cue_lines;
+
+  for (std::size_t index = 0; index < tracks.size(); ++index) {
+    const LyricTrack &track = tracks[index];
+
+    crow::json::wvalue line;
+    line["value"] = track.text;
+    if (synced && track.start_ms.has_value()) {
+      line["start"] = *track.start_ms;
+    }
+    lines.push_back(std::move(line));
+
+    // cueLine 只在该轨真的有逐字时间、且整体是同步歌词时才给。
+    if (!enhanced || !synced || track.words == nullptr || track.words->empty()) {
+      continue;
+    }
+    std::string value;
+    for (const auto &word : *track.words) {
+      value += word.text;
+    }
+    crow::json::wvalue cue_line;
+    cue_line["index"] = static_cast<int>(index);
+    if (track.start_ms.has_value()) {
+      cue_line["start"] = *track.start_ms;
+    }
+    if (track.end_ms.has_value()) {
+      cue_line["end"] = *track.end_ms;
+    }
+    cue_line["value"] = value;
+    cue_line["cue"] = crow::json::wvalue(cue_list_of(*track.words, track.end_ms));
+    cue_lines.push_back(std::move(cue_line));
+  }
+
+  crow::json::wvalue node;
+  node["lang"] = lang;
+  node["synced"] = synced;
+  node["line"] = crow::json::wvalue(std::move(lines));
+  if (!cue_lines.empty()) {
+    node["cueLine"] = crow::json::wvalue(std::move(cue_lines));
+  }
+  if (enhanced) {
+    node["kind"] = kind;
+  }
+  return node;
+}
+
+std::string lyric_lang(const media_library::Lyrics &lyrics) {
+  if (lyrics.language.has_value() && !lyrics.language->empty()) {
+    return *lyrics.language;
+  }
+  return "und";
+}
+
+} // namespace
+
 crow::response handle_lyrics_by_song_id(const crow::request &req) {
   const std::shared_ptr<media_library::MediaRouter> router =
       media_library::media_router_ptr();
@@ -469,23 +596,66 @@ crow::response handle_lyrics_by_song_id(const crow::request &req) {
   }
   const media_library::Lyrics &lyrics = result.value().value;
 
-  crow::json::wvalue::list lines;
+  // enhanced=true 才出逐字（cueLine）与副轨（translation / pronunciation）。
+  // 缺省 false 时只回 kind=main 一条，与旧版客户端兼容。
+  const std::string enhanced_text = text(req, "enhanced");
+  const bool enhanced = enhanced_text == "true" || enhanced_text == "1" ||
+                        enhanced_text == "yes";
+
+  const bool synced = lyrics.mode != media_library::LyricsMode::Unsynced;
+  const std::string lang = lyric_lang(lyrics);
+
+  std::vector<LyricTrack> main_tracks;
+  main_tracks.reserve(lyrics.lines.size());
   for (const auto &line : lyrics.lines) {
-    crow::json::wvalue entry;
-    entry["value"] = line.text;
-    if (line.start_ms.has_value()) {
-      entry["start"] = *line.start_ms;
-    }
-    lines.push_back(std::move(entry));
+    LyricTrack track;
+    track.text = line.text;
+    track.start_ms = line.start_ms;
+    track.end_ms = line.end_ms;
+    track.words = &line.words;
+    main_tracks.push_back(std::move(track));
   }
 
-  crow::json::wvalue lyrics_node;
-  lyrics_node["id"] = *raw;
-  lyrics_node["line"] = crow::json::wvalue(std::move(lines));
-  lyrics_node["synced"] = lyrics.mode != media_library::LyricsMode::Unsynced;
-
   crow::json::wvalue::list structured;
-  structured.push_back(std::move(lyrics_node));
+  structured.push_back(
+      structured_lyrics(lang, synced, main_tracks, "main", enhanced));
+
+  if (enhanced) {
+    // 译文与注音各自是一条独立轨（kind 区分），行时间与正文行对齐。
+    const auto emit_aux = [&](media_library::LyricAuxKind kind,
+                              const char *name) {
+      std::vector<LyricTrack> tracks;
+      tracks.reserve(lyrics.lines.size());
+      bool any = false;
+      for (const auto &line : lyrics.lines) {
+        const media_library::LyricAux *found = nullptr;
+        for (const auto &aux : line.aux) {
+          if (aux.kind == kind && !aux.text.empty()) {
+            found = &aux;
+            break;
+          }
+        }
+        if (found == nullptr) {
+          // OpenSubsonic：副轨与正文轨**不要求 1:1 对齐**，缺译文的行直接不出，
+          // 不要用空串占位——客户端会把空行渲染成空白字幕。
+          continue;
+        }
+        LyricTrack track;
+        track.text = found->text;
+        track.start_ms = line.start_ms;
+        track.end_ms = line.end_ms;
+        track.words = &found->words;
+        any = true;
+        tracks.push_back(std::move(track));
+      }
+      if (any) {
+        structured.push_back(
+            structured_lyrics(lang, synced, tracks, name, enhanced));
+      }
+    };
+    emit_aux(media_library::LyricAuxKind::Translation, "translation");
+    emit_aux(media_library::LyricAuxKind::Romanization, "pronunciation");
+  }
 
   crow::json::wvalue lyrics_list;
   lyrics_list["structuredLyrics"] = crow::json::wvalue(std::move(structured));
