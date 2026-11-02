@@ -36,6 +36,11 @@ add_executable(musicd
   ./src/media_library/lyric_parser.cpp
   ./src/media_library/playlist_directory.cpp
   ./src/stream_http.cpp
+  ./src/api/subsonic/subsonic.cpp
+  ./src/api/subsonic/access_log.cpp
+  ./src/api/subsonic/envelope.cpp
+  ./src/api/subsonic/dto.cpp
+  ./src/api/subsonic/params.cpp
   ./src/api/v1/v1.cpp
   ./src/api/api-enhanced/transport.cpp
   ./src/api/api-enhanced/ids.cpp

@@ -48,6 +48,17 @@ struct NeteaseConfig {
   std::string real_ip;
 };
 
+// Subsonic / Navidrome 兼容门面（供第三方客户端使用）。
+// 独立端口运行，与 Jellyfin 门面平行；不做账号校验。
+struct SubsonicConfig {
+  bool enabled{false};
+  int port{4533};
+  std::string server_name{"musicd"};
+  int default_page_size{50};
+  // 每请求一行访问日志；凭据类参数（u/t/s/p）永不打印。
+  bool log_requests{true};
+};
+
 struct Config {
   fs::path db_path{"./music.db"};
   fs::path static_dir{"web"};
@@ -61,6 +72,7 @@ struct Config {
   bool jellyfin_enabled{true};
   int jellyfin_port{9000};
   std::string jellyfin_server_name{"musicd"};
+  SubsonicConfig subsonic;
   bool webdav_enabled{false};
   std::vector<WebdavRoot> webdav_roots;
   fs::path playlist_dir{"./playlists"};

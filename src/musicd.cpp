@@ -10,6 +10,7 @@
 #include "http_util.h"
 #include "image_cache.h"
 #include "jellyfin.h"
+#include "api/subsonic/subsonic.h"
 #include "media_library/error.h"
 #include "media_library/library_runtime.h"
 #include "media_library/media_runtime.h"
@@ -2443,17 +2444,27 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
   std::cout << "[boot] 生效端口 主=" << cfg.port << " Jellyfin="
             << (cfg.jellyfin_enabled ? std::to_string(cfg.jellyfin_port)
                                      : std::string("off"))
+            << " Subsonic="
+            << (cfg.subsonic.enabled ? std::to_string(cfg.subsonic.port)
+                                     : std::string("off"))
             << std::endl;
 
   std::thread jellyfin_thread;
   if (cfg.jellyfin_enabled) {
     jellyfin_thread = std::thread([&cfg]() { jellyfin::run(cfg); });
   }
+  std::thread subsonic_thread;
+  if (cfg.subsonic.enabled) {
+    subsonic_thread = std::thread([&cfg]() { subsonic::run(cfg); });
+  }
 
   app.port(cfg.port).multithreaded().concurrency(8).run();
 
   if (jellyfin_thread.joinable()) {
     jellyfin_thread.join();
+  }
+  if (subsonic_thread.joinable()) {
+    subsonic_thread.join();
   }
   media_library::shutdown_media_runtime();
   media_library::shutdown_library();

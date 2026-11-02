@@ -189,6 +189,25 @@ const Config &load(const std::string &file) {
         loaded.jellyfin_server_name = jf["server_name"].s();
       }
     }
+    if (json.has("subsonic")) {
+      const auto &sc = json["subsonic"];
+      if (sc.has("enabled")) {
+        loaded.subsonic.enabled = sc["enabled"].b();
+      }
+      if (sc.has("port")) {
+        loaded.subsonic.port = static_cast<int>(sc["port"].i());
+      }
+      if (sc.has("server_name")) {
+        loaded.subsonic.server_name = sc["server_name"].s();
+      }
+      if (sc.has("default_page_size")) {
+        loaded.subsonic.default_page_size =
+            static_cast<int>(sc["default_page_size"].i());
+      }
+      if (sc.has("log_requests")) {
+        loaded.subsonic.log_requests = sc["log_requests"].b();
+      }
+    }
     if (json.has("playlist_dir")) {
       loaded.playlist_dir = json["playlist_dir"].s();
     }
@@ -367,6 +386,18 @@ const Config &load(const std::string &file) {
   if (!jfName.empty()) {
     loaded.jellyfin_server_name = jfName;
   }
+  const std::string scEnabled = envValue("MUSIC_SUBSONIC_ENABLED");
+  if (!scEnabled.empty()) {
+    loaded.subsonic.enabled = toBool(scEnabled, "MUSIC_SUBSONIC_ENABLED");
+  }
+  const std::string scPort = envValue("MUSIC_SUBSONIC_PORT");
+  if (!scPort.empty()) {
+    loaded.subsonic.port = toInt(scPort, "MUSIC_SUBSONIC_PORT");
+  }
+  const std::string scLog = envValue("MUSIC_SUBSONIC_LOG_REQUESTS");
+  if (!scLog.empty()) {
+    loaded.subsonic.log_requests = toBool(scLog, "MUSIC_SUBSONIC_LOG_REQUESTS");
+  }
   const std::string wdEnabled = envValue("MUSIC_WEBDAV_ENABLED");
   if (!wdEnabled.empty()) {
     loaded.webdav_enabled = toBool(wdEnabled, "MUSIC_WEBDAV_ENABLED");
@@ -387,6 +418,23 @@ const Config &load(const std::string &file) {
       (loaded.jellyfin_port <= 0 || loaded.jellyfin_port > 65535)) {
     throw std::runtime_error("jellyfin_port 超出范围 (1-65535): " +
                              std::to_string(loaded.jellyfin_port));
+  }
+  if (loaded.subsonic.enabled) {
+    if (loaded.subsonic.port <= 0 || loaded.subsonic.port > 65535) {
+      throw std::runtime_error("subsonic.port 超出范围 (1-65535): " +
+                               std::to_string(loaded.subsonic.port));
+    }
+    if (loaded.subsonic.port == loaded.port ||
+        (loaded.jellyfin_enabled &&
+         loaded.subsonic.port == loaded.jellyfin_port)) {
+      throw std::runtime_error("subsonic.port 与其它监听端口冲突: " +
+                               std::to_string(loaded.subsonic.port));
+    }
+  }
+  if (loaded.subsonic.default_page_size <= 0 ||
+      loaded.subsonic.default_page_size > 500) {
+    throw std::runtime_error("subsonic.default_page_size 超出范围 (1-500): " +
+                             std::to_string(loaded.subsonic.default_page_size));
   }
   if (loaded.page_size <= 0) {
     throw std::runtime_error("page_size 必须为正数: " +
