@@ -207,6 +207,9 @@ const Config &load(const std::string &file) {
       if (sc.has("log_requests")) {
         loaded.subsonic.log_requests = sc["log_requests"].b();
       }
+      if (sc.has("cors_allow_origin")) {
+        loaded.subsonic.cors_allow_origin = sc["cors_allow_origin"].s();
+      }
     }
     if (json.has("playlist_dir")) {
       loaded.playlist_dir = json["playlist_dir"].s();
@@ -397,6 +400,11 @@ const Config &load(const std::string &file) {
   const std::string scLog = envValue("MUSIC_SUBSONIC_LOG_REQUESTS");
   if (!scLog.empty()) {
     loaded.subsonic.log_requests = toBool(scLog, "MUSIC_SUBSONIC_LOG_REQUESTS");
+  }
+  // 允许显式置空以关闭 CORS，所以不判 empty()。
+  const std::string scCors = envValue("MUSIC_SUBSONIC_CORS_ALLOW_ORIGIN");
+  if (std::getenv("MUSIC_SUBSONIC_CORS_ALLOW_ORIGIN") != nullptr) {
+    loaded.subsonic.cors_allow_origin = scCors;
   }
   const std::string wdEnabled = envValue("MUSIC_WEBDAV_ENABLED");
   if (!wdEnabled.empty()) {

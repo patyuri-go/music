@@ -57,9 +57,118 @@ struct Session {
   std::string server_version;
   bool log_requests = true;
   int default_page_size = 50;
+  // `*` = 回显任意 Origin；`a,b` = 白名单；空 = 关闭 CORS。
+  std::string cors_allow_origin{"*"};
 };
 
 Session g_session;
+
+// ---------------------------------------------------------------------------
+// CORS
+//
+// 浏览器里跑的 Web 客户端（典型是 https://localhost 的页面）直接打 4533 是**跨源**，
+// 响应缺 Access-Control-Allow-Origin 时浏览器会把响应当作不可读，前端只看到
+// "TypeError: Failed to fetch" —— 与服务端返回码无关，光看后端日志会以为一切正常。
+//
+// 三个实现要点：
+// 1) 走**全局中间件**而不是各 handler 自己加头。Crow 1.3.1 在 routing.h 里对
+//    OPTIONS 做了内建短路（直接 204 + Allow），请求根本到不了路由；但连接层
+//    complete_request() 在短路时仍会调用全局中间件的 after_handle，所以只有
+//    中间件这一层能同时覆盖「正常响应」和「预检响应」。
+// 2) 没有 Origin 头就不加任何 CORS 头，原生客户端（curl/手机 App）响应逐字节不变。
+// 3) 认证全在 query string（u/t/s/p），不用 cookie，所以不必发
+//    Access-Control-Allow-Credentials；回显 Origin 即可。
+
+// 回显值的来源：`*`（默认）= 回显任意来源；`a,b` = 白名单；空 = 关闭 CORS。
+std::string cors_origin_of(const std::string &origin) {
+  const std::string &configured = g_session.cors_allow_origin;
+  if (configured.empty()) {
+    return std::string();
+  }
+  if (configured == "*") {
+    return origin;
+  }
+  std::size_t begin = 0;
+  while (begin <= configured.size()) {
+    std::size_t end = configured.find(',', begin);
+    if (end == std::string::npos) {
+      end = configured.size();
+    }
+    std::size_t from = configured.find_first_not_of(" \t", begin);
+    std::size_t to = configured.find_last_not_of(" \t", end == 0 ? 0 : end - 1);
+    if (from != std::string::npos && to != std::string::npos && to >= from &&
+        configured.compare(from, to - from + 1, origin) == 0) {
+      return origin;
+    }
+    if (end == configured.size()) {
+      break;
+    }
+    begin = end + 1;
+  }
+  return std::string();
+}
+
+// 回显 Access-Control-Request-Headers 前先洗一遍：响应头里绝不能出现 CR/LF。
+std::string cors_sanitize(const std::string &value) {
+  std::string cleaned;
+  cleaned.reserve(value.size());
+  for (const char ch : value) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (c >= 0x20 && c < 0x7f) {
+      cleaned.push_back(ch);
+    }
+  }
+  return cleaned;
+}
+
+void apply_cors(const crow::request &req, crow::response &res) {
+  const std::string &configured = g_session.cors_allow_origin;
+  if (configured.empty()) {
+    return;  // 显式关闭。
+  }
+
+  if (req.method == crow::HTTPMethod::Options) {
+    // 预检走的是 Crow 的路由短路（http_connection::handle_url），发生在**请求头
+    // 解析之前**，所以这里拿不到 Origin，只能回 `*`。不是敷衍：真正的响应仍然
+    // 只对白名单来源回显 Origin，浏览器照样会拦掉不在名单里的页面。
+    // 白名单模式下预检无法按来源区分，宁可失败也不 fail-open。
+    if (configured != "*") {
+      return;
+    }
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
+    // 预检拿不到 Access-Control-Request-Headers，直接放行任意自定义头。
+    // 安全性不靠这里：凭据在 query string，且响应侧仍按 Origin 白名单收口。
+    res.set_header("Access-Control-Allow-Headers", "*");
+    res.set_header("Access-Control-Max-Age", "86400");
+    return;
+  }
+
+  const std::string origin = req.get_header_value("Origin");
+  if (origin.empty()) {
+    return;  // 原生客户端：响应逐字节不变。
+  }
+  const std::string echoed = cors_origin_of(origin);
+  if (echoed.empty()) {
+    return;
+  }
+  res.set_header("Access-Control-Allow-Origin", echoed);
+  res.set_header("Vary", "Origin");
+  // 浏览器默认读不到这些头；Web 播放器靠 Content-Range 算时长和拖动进度。
+  res.set_header("Access-Control-Expose-Headers",
+                 "Content-Length, Content-Range, Accept-Ranges, Content-Type");
+}
+
+struct CorsMiddleware {
+  struct context {};
+  void before_handle(crow::request & /*req*/, crow::response & /*res*/,
+                     context & /*ctx*/) {}
+  void after_handle(crow::request &req, crow::response &res, context & /*ctx*/) {
+    apply_cors(req, res);
+  }
+};
+
+using App = crow::Crow<CorsMiddleware>;
 
 // 构造一条成功响应。
 crow::response ok(crow::json::wvalue payload) {
@@ -671,7 +780,7 @@ crow::response handle_lyrics_by_song_id(const crow::request &req) {
 
 // 注册一个方法的两个路径形态：/rest/<m> 与 /rest/<m>.view。
 // handler 自己负责写访问日志（这样才能覆盖到「参数缺失」这类早退分支）。
-void route(crow::SimpleApp &app, const char *method_name,
+void route(App &app, const char *method_name,
            std::function<crow::response(const crow::request &)> handler) {
   const std::string base = std::string("/rest/") + method_name;
   const std::string dotted = base + ".view";
@@ -704,7 +813,7 @@ void route(crow::SimpleApp &app, const char *method_name,
   app.route_dynamic(dotted)(wrap);
 }
 
-void register_routes(crow::SimpleApp &app) {
+void register_routes(App &app) {
   route(app, "ping", handle_ping);
   route(app, "getLicense", handle_license);
   route(app, "getMusicFolders", handle_music_folders);
@@ -730,14 +839,19 @@ void run(const config::Config &cfg) {
   g_session.server_version = kServerVersion;
   g_session.log_requests = cfg.subsonic.log_requests;
   g_session.default_page_size = cfg.subsonic.default_page_size;
+  g_session.cors_allow_origin = cfg.subsonic.cors_allow_origin;
 
-  crow::SimpleApp app;
+  App app;
   register_routes(app);
 
   std::cerr << "[subsonic] 生效端口 " << cfg.subsonic.port
             << " server_name=" << cfg.subsonic.server_name
             << " page_size=" << cfg.subsonic.default_page_size
             << " log_requests=" << (cfg.subsonic.log_requests ? "on" : "off")
+            << " cors="
+            << (cfg.subsonic.cors_allow_origin.empty()
+                    ? "off"
+                    : cfg.subsonic.cors_allow_origin)
             << std::endl;
 
   // Crow 自己的 INFO 日志会把整条 URL（含 u=/t=/s=/p= 凭据）打出来，

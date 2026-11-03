@@ -57,6 +57,9 @@ struct SubsonicConfig {
   int default_page_size{50};
   // 每请求一行访问日志；凭据类参数（u/t/s/p）永不打印。
   bool log_requests{true};
+  // CORS 允许的来源：`*` 回显任意 Origin、`a,b` 白名单、空串关闭。
+  // 浏览器里的 Web 客户端是跨源访问，缺这个头会表现成 "Failed to fetch"。
+  std::string cors_allow_origin{"*"};
 };
 
 struct Config {
