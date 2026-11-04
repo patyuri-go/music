@@ -1,10 +1,12 @@
 #include "media_library/router.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -37,6 +39,87 @@ int aggregate_error_rank(ErrorCode code) noexcept {
   default:
     return 5;
   }
+}
+
+// 搜索分页参数上限。offset 上限与 Subsonic 门面一致，防止一次重放
+// 把上游拉穿。
+constexpr int kMaxSearchLimit = 200;
+constexpr int kMaxSearchOffset = 100000;
+// 单次向来源请求的条数。网易云内部会把 limit clamp 到 100。
+constexpr int kSourcePageSize = 100;
+
+void hash_mix(std::uint64_t &state, std::string_view value) {
+  for (const unsigned char byte : value) {
+    state ^= byte;
+    state *= 1099511628211ULL;
+  }
+  state ^= 0xffU;
+  state *= 1099511628211ULL;
+}
+
+// 游标只对同一组查询条件 + 同一组候选库顺序有效。条件或顺序变了就
+// 返回 invalid_request，让客户端重新搜索。
+std::uint64_t search_revision(
+    const SearchQuery &query,
+    const std::vector<LibraryRegistration> &candidates) {
+  std::uint64_t state = 1469598103934665603ULL;
+  hash_mix(state, query.text);
+  for (const EntityType type : query.types) {
+    hash_mix(state, std::to_string(static_cast<int>(type)));
+  }
+  for (const std::string &artist : query.artists) {
+    hash_mix(state, artist);
+  }
+  for (const std::string &artist : query.album_artists) {
+    hash_mix(state, artist);
+  }
+  hash_mix(state, query.library_id.value_or(std::string()));
+  hash_mix(state, query.locale.value_or(std::string()));
+  hash_mix(state, query.include_unplayable ? "1" : "0");
+  for (const LibraryRegistration &candidate : candidates) {
+    hash_mix(state, candidate.library_id);
+  }
+  return state;
+}
+
+std::string encode_search_cursor(int offset, std::uint64_t revision) {
+  return "rs1:" + std::to_string(offset) + ":" + std::to_string(revision);
+}
+
+bool parse_u64(std::string_view text, std::uint64_t &value) {
+  if (text.empty()) {
+    return false;
+  }
+  const char *begin = text.data();
+  const char *end = begin + text.size();
+  const auto parsed = std::from_chars(begin, end, value);
+  return parsed.ec == std::errc() && parsed.ptr == end;
+}
+
+bool decode_search_cursor(std::string_view text, int &offset,
+                          std::uint64_t &revision) {
+  constexpr std::string_view prefix = "rs1:";
+  if (text.size() <= prefix.size() ||
+      text.substr(0, prefix.size()) != prefix) {
+    return false;
+  }
+  text.remove_prefix(prefix.size());
+  const std::size_t separator = text.find(':');
+  if (separator == std::string_view::npos) {
+    return false;
+  }
+  std::uint64_t parsed_offset = 0;
+  std::uint64_t parsed_revision = 0;
+  if (!parse_u64(text.substr(0, separator), parsed_offset) ||
+      !parse_u64(text.substr(separator + 1), parsed_revision)) {
+    return false;
+  }
+  if (parsed_offset > static_cast<std::uint64_t>(kMaxSearchOffset)) {
+    return false;
+  }
+  offset = static_cast<int>(parsed_offset);
+  revision = parsed_revision;
+  return true;
 }
 
 class AggregatePriorityImpl final : public AggregatePriority {
@@ -122,6 +205,8 @@ std::string_view source_state_name(SourceState state) noexcept {
     return "timeout";
   case SourceState::Unsupported:
     return "unsupported";
+  case SourceState::Skipped:
+    return "skipped";
   }
   return "unavailable";
 }
@@ -653,7 +738,10 @@ Result<AspectResult<ArtworkRef>> Router::resolve_artwork(const SourceRef &owner,
 
 // ---------------------------------------------------------------------------
 // 5.3.4 多源聚合
-// 本轮只做第一页：next_cursor 恒为空，has_more 表示来源还有更多。
+//
+// 同层内保持各库返回的自然顺序：候选库按优先级分层，层内按注册顺序
+// 拼接，库内按来源自己的顺序。分页用「聚合 offset + 重放」：每次请求
+// 从聚合流头部重新消费并丢掉 offset 条，服务端不保留会话。
 // ---------------------------------------------------------------------------
 
 Result<AggregatedPage<SearchHit>> Router::search(const SearchQuery &query,
@@ -666,6 +754,14 @@ Result<AggregatedPage<SearchHit>> Router::search(const SearchQuery &query,
   // 候选为空不是错误：返回空结果 + 全部来源状态（这里状态也是空的）。
   std::vector<LibraryRegistration> candidates =
       registry_->candidates(CapabilityId::Search, true);
+  if (query.library_id.has_value()) {
+    candidates.erase(
+        std::remove_if(candidates.begin(), candidates.end(),
+                       [&query](const LibraryRegistration &registration) {
+                         return registration.library_id != *query.library_id;
+                       }),
+        candidates.end());
+  }
   if (candidates.empty()) {
     return Result<AggregatedPage<SearchHit>>::success(std::move(page));
   }
@@ -692,70 +788,194 @@ Result<AggregatedPage<SearchHit>> Router::search(const SearchQuery &query,
                             tier_of.at(b.library_id);
                    });
 
-  const int limit = query.page.limit > 0 ? query.page.limit : 50;
+  const std::uint64_t revision = search_revision(query, candidates);
 
-  std::vector<std::pair<std::size_t, SearchHit>> collected;
+  int skip = 0;
+  if (query.page.cursor.has_value() && !query.page.cursor->empty()) {
+    std::uint64_t cursor_revision = 0;
+    int cursor_offset = 0;
+    if (!decode_search_cursor(*query.page.cursor, cursor_offset,
+                              cursor_revision) ||
+        cursor_revision != revision) {
+      return Result<AggregatedPage<SearchHit>>::failure(
+          Error::make(ErrorCode::InvalidRequest, "invalid search cursor"));
+    }
+    skip = cursor_offset;
+  } else {
+    skip = std::clamp(query.page.offset, 0, kMaxSearchOffset);
+  }
+
+  const int limit = std::clamp(query.page.limit > 0 ? query.page.limit : 50,
+                               1, kMaxSearchLimit);
+
+  std::vector<SearchHit> items;
+  items.reserve(static_cast<std::size_t>(limit));
   std::vector<Error> failures;
+  std::map<std::string, SourceStatus> statuses;
   bool any_success = false;
-  bool any_source_has_more = false;
+  bool has_more = false;
+  // 聚合流按 ref 去重：上游深 offset 会重复返回前面的结果（网易云搜索
+  // 实测超过约 256 条后开始整页重复）。去重后的流才是稳定的聚合前缀。
+  std::unordered_set<std::string> seen_refs;
 
-  for (const LibraryRegistration &registration : candidates) {
-    SourceStatus status;
-    status.library_id = registration.library_id;
-    const std::int64_t started = current_ms();
+  int remaining_skip = skip;
+  std::size_t index = 0;
+  while (index < candidates.size()) {
+    const std::size_t tier = tier_of.at(candidates[index].library_id);
+    std::size_t group_end = index + 1;
+    while (group_end < candidates.size() &&
+           tier_of.at(candidates[group_end].library_id) == tier) {
+      ++group_end;
+    }
 
-    auto lease = registry_->acquire(registration.library_id, CapabilityId::Search, now_ms(),
-                           ctx.deadline_ms);
-    if (!lease.ok()) {
-      status.state = source_state_from(lease.error().code);
-      status.error = lease.error();
+    // 本层要凑出的前缀：跳过 remaining_skip、补齐本页，再多要一条用来
+    // 判断后面还有没有结果。
+    const int needed = remaining_skip +
+                       (limit - static_cast<int>(items.size())) + 1;
+    std::vector<SearchHit> tier_items;
+    tier_items.reserve(static_cast<std::size_t>(needed));
+    bool tier_has_more = false;
+
+    for (std::size_t i = index; i < group_end; ++i) {
+      const std::string &library_id = candidates[i].library_id;
+      SourceStatus status;
+      status.library_id = library_id;
+      const std::int64_t started = current_ms();
+
+      const int want = needed - static_cast<int>(tier_items.size());
+      if (want <= 0) {
+        status.state = SourceState::Skipped;
+        statuses[library_id] = std::move(status);
+        continue;
+      }
+
+      auto lease = registry_->acquire(library_id, CapabilityId::Search,
+                                      now_ms(), ctx.deadline_ms);
+      if (!lease.ok()) {
+        status.state = source_state_from(lease.error().code);
+        status.error = lease.error();
+        status.elapsed_ms = current_ms() - started;
+        statuses[library_id] = std::move(status);
+        failures.push_back(lease.error());
+        continue;
+      }
+
+      auto library = lease.value().library();
+      auto searcher = library->capability<Searcher>();
+      if (!searcher.has_value()) {
+        Error error = Error::make(ErrorCode::Unsupported, "no searcher");
+        error.library_id = library_id;
+        lease.value().finish(error);
+        status.state = source_state_from(error.code);
+        status.error = error;
+        status.elapsed_ms = current_ms() - started;
+        statuses[library_id] = std::move(status);
+        failures.push_back(std::move(error));
+        continue;
+      }
+
+      int collected = 0;
+      std::optional<std::string> source_cursor;
+      bool source_ok = true;
+      while (collected < want) {
+        SearchQuery part = query;
+        part.page.cursor = source_cursor;
+        part.page.offset = 0;
+        part.page.limit = kSourcePageSize;
+
+        Result<Page<SearchHit>> result = searcher->get().search(part, ctx);
+        if (!result.ok()) {
+          source_ok = false;
+          status.state = source_state_from(result.error().code);
+          status.error = result.error();
+          failures.push_back(result.error());
+          break;
+        }
+        any_success = true;
+
+        const std::size_t before = tier_items.size();
+        for (SearchHit &hit : result.value().items) {
+          std::string key = to_string(hit.ref);
+          if (!seen_refs.insert(std::move(key)).second) {
+            continue;
+          }
+          tier_items.push_back(std::move(hit));
+        }
+        const int added = static_cast<int>(tier_items.size() - before);
+        collected += added;
+        if (added == 0) {
+          // 整页都是已出现过的结果：该来源没有更多新结果了。
+          break;
+        }
+
+        if (result.value().items.empty()) {
+          break;
+        }
+        if (collected >= want) {
+          if (result.value().has_more ||
+              result.value().next_cursor.has_value()) {
+            tier_has_more = true;
+          }
+          break;
+        }
+        if (!result.value().has_more ||
+            !result.value().next_cursor.has_value()) {
+          break;
+        }
+        if (source_cursor.has_value() &&
+            *result.value().next_cursor == *source_cursor) {
+          break;
+        }
+        source_cursor = result.value().next_cursor;
+      }
+
+      status.item_count = collected;
       status.elapsed_ms = current_ms() - started;
-      page.sources.push_back(status);
-      failures.push_back(lease.error());
+      if (source_ok) {
+        lease.value().finish(std::nullopt);
+      } else {
+        lease.value().finish(status.error);
+      }
+      statuses[library_id] = std::move(status);
+
+      if (static_cast<int>(tier_items.size()) >= needed) {
+        // 本层后面的库排在这个前缀之后，不需要查。
+        for (std::size_t j = i + 1; j < group_end; ++j) {
+          SourceStatus skipped;
+          skipped.library_id = candidates[j].library_id;
+          skipped.state = SourceState::Skipped;
+          statuses[skipped.library_id] = std::move(skipped);
+        }
+        break;
+      }
+    }
+
+    const int available = static_cast<int>(tier_items.size());
+    if (remaining_skip >= available) {
+      remaining_skip -= available;
+      index = group_end;
       continue;
     }
 
-    auto library = lease.value().library();
-    auto searcher = library->capability<Searcher>();
-    if (!searcher.has_value()) {
-      Error error = Error::make(ErrorCode::Unsupported, "no searcher");
-      error.library_id = registration.library_id;
-      lease.value().finish(error);
-      status.state = source_state_from(error.code);
-      status.error = error;
-      status.elapsed_ms = current_ms() - started;
-      page.sources.push_back(status);
-      failures.push_back(std::move(error));
-      continue;
+    const int take = std::min(limit - static_cast<int>(items.size()),
+                              available - remaining_skip);
+    for (int i = 0; i < take; ++i) {
+      items.push_back(std::move(
+          tier_items[static_cast<std::size_t>(remaining_skip + i)]));
     }
-
-    Result<Page<SearchHit>> result = searcher->get().search(query, ctx);
-    status.elapsed_ms = current_ms() - started;
-    if (!result.ok()) {
-      lease.value().finish(result.error());
-      status.state = source_state_from(result.error().code);
-      status.error = result.error();
-      page.sources.push_back(status);
-      failures.push_back(result.error());
-      continue;
+    if (available > remaining_skip + take || tier_has_more) {
+      has_more = true;
     }
+    remaining_skip = 0;
+    index = group_end;
 
-    lease.value().finish(std::nullopt);
-    status.state = SourceState::Ok;
-    status.item_count = static_cast<int>(result.value().items.size());
-    page.sources.push_back(status);
-    any_success = true;
-    any_source_has_more = any_source_has_more || result.value().has_more;
-
-    const std::size_t tier = tier_of.at(registration.library_id);
-    for (SearchHit &hit : result.value().items) {
-      collected.emplace_back(tier, std::move(hit));
+    if (has_more) {
+      break;
     }
   }
 
   // 全部来源失败且没有任何结果 -> 整体错误（5.3.10）。
-  if (!any_success && collected.empty() && !failures.empty()) {
-    // 用下标而非指针挑选最优错误，避免指向容器元素的裸指针。
+  if (!any_success && items.empty() && !failures.empty()) {
     std::size_t chosen = 0;
     for (std::size_t i = 1; i < failures.size(); ++i) {
       if (aggregate_error_rank(failures[i].code) <
@@ -766,32 +986,29 @@ Result<AggregatedPage<SearchHit>> Router::search(const SearchQuery &query,
     return Result<AggregatedPage<SearchHit>>::failure(failures[chosen]);
   }
 
-  // 5.3.8 统一排序：第一层是聚合优先级（库分组），第二层是组内信号。
-  // 排序不依赖响应到达顺序，且以 SourceRef 字符串作稳定决胜项。
-  std::stable_sort(
-      collected.begin(), collected.end(),
-      [](const std::pair<std::size_t, SearchHit> &a,
-         const std::pair<std::size_t, SearchHit> &b) {
-        if (a.first != b.first) {
-          return a.first < b.first;
-        }
-        if (a.second.playable != b.second.playable) {
-          return a.second.playable;
-        }
-        if (a.second.title != b.second.title) {
-          return a.second.title < b.second.title;
-        }
-        return to_string(a.second.ref) < to_string(b.second.ref);
-      });
-
-  const std::size_t total = collected.size();
-  const std::size_t take = std::min<std::size_t>(
-      total, static_cast<std::size_t>(limit));
-  page.items.reserve(take);
-  for (std::size_t i = 0; i < take; ++i) {
-    page.items.push_back(std::move(collected[i].second));
+  // 未查询的候选库也给出状态，保证 sources 覆盖全部候选。
+  for (const LibraryRegistration &candidate : candidates) {
+    if (statuses.count(candidate.library_id) == 0) {
+      SourceStatus status;
+      status.library_id = candidate.library_id;
+      status.state = SourceState::Skipped;
+      statuses.emplace(candidate.library_id, std::move(status));
+    }
   }
-  page.has_more = total > take || any_source_has_more;
+  page.sources.reserve(candidates.size());
+  for (const LibraryRegistration &candidate : candidates) {
+    auto found = statuses.find(candidate.library_id);
+    if (found != statuses.end()) {
+      page.sources.push_back(std::move(found->second));
+    }
+  }
+
+  page.items = std::move(items);
+  page.has_more = has_more;
+  if (has_more) {
+    page.next_cursor = encode_search_cursor(
+        skip + static_cast<int>(page.items.size()), revision);
+  }
   return Result<AggregatedPage<SearchHit>>::success(std::move(page));
 }
 

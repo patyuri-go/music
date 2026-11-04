@@ -161,6 +161,9 @@ struct PlaybackSource {
 struct PageRequest {
   std::optional<std::string> cursor;
   int limit = 50;
+  // 仅聚合层使用：跳过前 offset 条再取 limit 条。与 cursor 互斥，单源库
+  // 不解释该字段（聚合层会把它重放成来源的分页请求）。
+  int offset = 0;
 };
 
 template <typename T> struct Page {
@@ -177,6 +180,8 @@ struct SearchQuery {
   PageRequest page;
   std::optional<std::string> locale;
   bool include_unplayable = false;
+  // 仅聚合层使用：限定单个库；空表示所有候选库。
+  std::optional<std::string> library_id;
 };
 
 struct SearchHit {

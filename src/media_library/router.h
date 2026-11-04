@@ -25,7 +25,9 @@ enum class SourceState {
   Unauthenticated,
   RateLimited,
   Timeout,
-  Unsupported
+  Unsupported,
+  // 聚合分页已凑满本页，该库排在当前前缀之后，本次没有查询。
+  Skipped
 };
 
 std::string_view source_state_name(SourceState state) noexcept;
@@ -141,7 +143,9 @@ public:
                                                    const CallContext &ctx);
 
   // ---- 5.3.4 多源聚合 ---------------------------------------------------
-  // 本轮只做第一页：next_cursor 恒为空，has_more 表示来源还有更多。
+  // 支持 PageRequest::offset（每次从聚合流头部重放并跳过）与 next_cursor
+  // （游标只编码聚合 offset，服务端不保留会话）。同层内保持各库返回的
+  // 自然顺序，不再按 title 重排。
   Result<AggregatedPage<SearchHit>> search(const SearchQuery &query,
                                            const CallContext &ctx) override;
 

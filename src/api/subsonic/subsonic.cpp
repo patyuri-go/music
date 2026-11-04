@@ -51,6 +51,15 @@ PlaylistRef playlist_ref_of(const SourceRef &ref) { return ref; }
 
 constexpr const char *kServerVersion = "0.1.0";
 
+// Subsonic search2/search3 的规范默认值是 20；单类最多回 100 条。
+constexpr int kSearchDefaultCount = 20;
+constexpr int kSearchMaxCount = 100;
+constexpr int kSearchMaxOffset = 100000;
+// getAlbum/getArtist 要完整列表：本地库按 limit 截断，网易云歌手专辑
+// 内部 clamp 到 100 并给 next_cursor，所以这里用大 limit + 游标循环。
+constexpr int kFetchAllPageSize = 1000000;
+constexpr int kFetchAllMaxPages = 1000;
+
 // 一次请求的公共上下文：服务器名与是否记日志。
 struct Session {
   std::string server_name;
@@ -289,18 +298,32 @@ crow::response handle_album(const crow::request &req) {
 
   crow::json::wvalue node = album_dto(album.value().value, true);
 
-  // song[] 与 songCount / duration 都来自同一次 list_album_tracks。
+  // song[] 与 songCount / duration 都来自同一批 list_album_tracks。
+  // 本地库给大 limit 会一次返回全部；网易云若还有 next_cursor 就继续跟。
   PageRequest page;
-  page.limit = 0;
-  media_library::Result<media_library::Sourced<media_library::Page<Track>>> tracks =
-      router->list_album_tracks(album_ref, page, CallContext{});
+  page.limit = kFetchAllPageSize;
   crow::json::wvalue::list songs;
   long long total_ms = 0;
-  if (tracks.ok()) {
-    for (const auto &item : tracks.value().value.items) {
+  std::optional<std::string> cursor;
+  for (int round = 0; round < kFetchAllMaxPages; ++round) {
+    page.cursor = cursor;
+    media_library::Result<media_library::Sourced<media_library::Page<Track>>>
+        tracks = router->list_album_tracks(album_ref, page, CallContext{});
+    if (!tracks.ok()) {
+      break;
+    }
+    const media_library::Page<Track> &value = tracks.value().value;
+    for (const auto &item : value.items) {
       total_ms += item.duration_ms.value_or(0);
       songs.push_back(song_dto(item));
     }
+    if (!value.has_more || !value.next_cursor.has_value()) {
+      break;
+    }
+    if (cursor.has_value() && *value.next_cursor == *cursor) {
+      break;
+    }
+    cursor = value.next_cursor;
   }
   node["songCount"] = static_cast<int>(songs.size());
   node["duration"] = static_cast<int>(total_ms / 1000);
@@ -340,14 +363,27 @@ crow::response handle_artist(const crow::request &req) {
   }
 
   PageRequest page;
-  page.limit = 0;
-  media_library::Result<media_library::Sourced<media_library::Page<Album>>> albums =
-      router->list_artist_albums(artist_ref, page, CallContext{});
+  page.limit = kFetchAllPageSize;
   crow::json::wvalue::list album_list;
-  if (albums.ok()) {
-    for (const auto &item : albums.value().value.items) {
+  std::optional<std::string> cursor;
+  for (int round = 0; round < kFetchAllMaxPages; ++round) {
+    page.cursor = cursor;
+    media_library::Result<media_library::Sourced<media_library::Page<Album>>>
+        albums = router->list_artist_albums(artist_ref, page, CallContext{});
+    if (!albums.ok()) {
+      break;
+    }
+    const media_library::Page<Album> &value = albums.value().value;
+    for (const auto &item : value.items) {
       album_list.push_back(album_dto(item, false));
     }
+    if (!value.has_more || !value.next_cursor.has_value()) {
+      break;
+    }
+    if (cursor.has_value() && *value.next_cursor == *cursor) {
+      break;
+    }
+    cursor = value.next_cursor;
   }
 
   crow::json::wvalue node =
@@ -416,73 +452,73 @@ crow::response handle_search(const crow::request &req, bool id3) {
     return failure_response(Code::Ok, "media runtime is not initialized");
   }
 
-  media_library::SearchQuery query;
-  query.text = text(req, "query");
-  if (query.text.empty()) {
+  const std::string search_text = text(req, "query");
+  if (search_text.empty()) {
     return failure_response(Code::MissingParameter, "query is required");
   }
 
-  const int song_count = integer(req, "songCount", 0);
-  const int album_count = integer(req, "albumCount", 0);
-  const int artist_count = integer(req, "artistCount", 0);
+  const auto count_of = [&req](const char *name) {
+    return std::clamp(integer(req, name, kSearchDefaultCount), 0,
+                      kSearchMaxCount);
+  };
+  const auto offset_of = [&req](const char *name) {
+    return std::clamp(integer(req, name, 0), 0, kSearchMaxOffset);
+  };
+  const int song_count = count_of("songCount");
+  const int album_count = count_of("albumCount");
+  const int artist_count = count_of("artistCount");
+  const int song_offset = offset_of("songOffset");
+  const int album_offset = offset_of("albumOffset");
+  const int artist_offset = offset_of("artistOffset");
 
-  // 三类都要，才能在聚合结果里按类型各取所需；条数在下面各自截断。
-  query.types.push_back(EntityType::Track);
-  query.types.push_back(EntityType::Album);
-  query.types.push_back(EntityType::Artist);
-
-  const int wanted = song_count + album_count + artist_count;
-  query.page.limit = wanted > 0 ? wanted : g_session.default_page_size;
-  if (query.page.limit < 0) {
-    query.page.limit = g_session.default_page_size;
-  }
-
-  // musicFolderId：按 ref.library_id 精确过滤（参数名大小写不敏感）。
+  // musicFolderId：限定到单个库（参数名大小写不敏感）。
   const std::string folder = text(req, "musicFolderId");
 
-  media_library::Result<media_library::RoutedPage<media_library::SearchHit>>
-      result = router->search(query, CallContext{});
-  if (!result.ok()) {
-    return failure_response(code_of(result.error().code),
-                            error_name(result.error().code));
-  }
+  // 三类各自有自己的 count/offset，不能合成一次查询：Router 的 limit
+  // 是整条聚合流的总条数，合查会让某一类把其它类饿死。
+  const auto search_type = [&](EntityType type, int count, int offset,
+                               crow::json::wvalue::list &out)
+      -> std::optional<crow::response> {
+    if (count <= 0) {
+      return std::nullopt;
+    }
+    media_library::SearchQuery query;
+    query.text = search_text;
+    query.types.push_back(type);
+    query.page.limit = count;
+    query.page.offset = offset;
+    if (!folder.empty()) {
+      query.library_id = folder;
+    }
+    media_library::Result<media_library::RoutedPage<media_library::SearchHit>>
+        result = router->search(query, CallContext{});
+    if (!result.ok()) {
+      return failure_response(code_of(result.error().code),
+                              error_name(result.error().code));
+    }
+    for (const auto &item : result.value().items) {
+      out.push_back(search_hit_dto(item.value));
+    }
+    return std::nullopt;
+  };
 
-  // 路由器已按 library_priority 分层排好序；这里只按类型分桶并截断，
-  // 绝不重排——否则远端条目会插进本地组里。
   crow::json::wvalue::list songs;
   crow::json::wvalue::list albums;
   crow::json::wvalue::list artists;
-  const int song_limit = song_count > 0 ? song_count : g_session.default_page_size;
-  const int album_limit =
-      album_count > 0 ? album_count : g_session.default_page_size;
-  const int artist_limit =
-      artist_count > 0 ? artist_count : g_session.default_page_size;
-
-  for (const auto &item : result.value().items) {
-    const media_library::SearchHit &hit = item.value;
-    if (!folder.empty() && hit.ref.library_id != folder) {
-      continue;
-    }
-    switch (hit.kind) {
-    case EntityType::Track:
-      if (static_cast<int>(songs.size()) < song_limit) {
-        songs.push_back(search_hit_dto(hit));
-      }
-      break;
-    case EntityType::Album:
-      if (static_cast<int>(albums.size()) < album_limit) {
-        albums.push_back(search_hit_dto(hit));
-      }
-      break;
-    case EntityType::Artist:
-    case EntityType::AlbumArtist:
-      if (static_cast<int>(artists.size()) < artist_limit) {
-        artists.push_back(search_hit_dto(hit));
-      }
-      break;
-    default:
-      break;
-    }
+  if (auto error = search_type(EntityType::Track, song_count, song_offset,
+                               songs);
+      error.has_value()) {
+    return std::move(*error);
+  }
+  if (auto error = search_type(EntityType::Album, album_count, album_offset,
+                               albums);
+      error.has_value()) {
+    return std::move(*error);
+  }
+  if (auto error = search_type(EntityType::Artist, artist_count, artist_offset,
+                               artists);
+      error.has_value()) {
+    return std::move(*error);
   }
 
   const char *kind_album = id3 ? "albumID3" : "album";
