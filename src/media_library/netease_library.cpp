@@ -348,9 +348,7 @@ void NeteaseLibrary::probe_health(const CallContext &ctx) {
 }
 
 Track NeteaseLibrary::track_from_song(
-    const api_enhanced::NeteaseSong &song,
-    const std::optional<api_enhanced::NeteaseAlbumBrief> &album,
-    const CallContext &) const {
+    const api_enhanced::NeteaseSong &song, const CallContext &) const {
   Track track;
   const auto ref = api_enhanced::make_ref(EntityType::Track, song.id);
   if (!ref.ok()) {
@@ -374,15 +372,7 @@ Track NeteaseLibrary::track_from_song(
     track.artists.push_back(ArtistLink{artist_ref.value(), artist.name});
   }
 
-  // al{} 只有 id/name/picUrl；专辑艺术家必须来自 /album 的 artists[]，
-  // 拿不到时降级成曲目艺术家（不失败，只记一条日志）。
-  api_enhanced::NeteaseAlbumBrief brief;
-  if (album.has_value()) {
-    brief = *album;
-  } else {
-    brief = song.album;
-  }
-
+  // 曲目只带自己的艺术家（song.ar[]），不再附带专辑艺术家。
   if (song.album.id > 0) {
     auto album_ref = api_enhanced::make_ref(EntityType::Album, song.album.id);
     if (album_ref.ok()) {
@@ -390,29 +380,8 @@ Track NeteaseLibrary::track_from_song(
     }
   }
 
-  const std::vector<api_enhanced::NeteaseArtistRef> *album_artists =
-      &brief.artists;
-  if (album_artists->empty()) {
-    // 拿不到专辑艺术家：降级为曲目艺术家，保持 album_artists 非空。
-    album_artists = &song.artists;
-    if (!song.artists.empty()) {
-      std::cerr << "[netease] album artists fallback to track artists (track "
-                << song.id << ")\n";
-    }
-  }
-  for (const auto &artist : *album_artists) {
-    auto artist_ref =
-        api_enhanced::make_ref(EntityType::AlbumArtist, artist.id);
-    if (!artist_ref.ok()) {
-      continue;
-    }
-    track.album_artists.push_back(
-        AlbumArtistLink{artist_ref.value(), artist.name});
-  }
-
   // 封面 owner 是专辑：网易云封面本来就是专辑封面。
-  const std::string &picture =
-      !brief.pic_url.empty() ? brief.pic_url : song.album.pic_url;
+  const std::string &picture = song.album.pic_url;
   if (song.album.id > 0 && !picture.empty()) {
     auto owner = api_enhanced::make_ref(EntityType::Album, song.album.id);
     if (owner.ok()) {
@@ -519,20 +488,8 @@ Result<Track> NeteaseLibrary::get_track(const TrackRef &ref,
         Error::make(ErrorCode::NotFound, "netease track not found"));
   }
 
-  // 专辑艺术家必须额外反查一次 /album（命中进程内缓存时零开销）。
-  // 失败只降级，不让整次 get_track 失败。
-  std::optional<api_enhanced::NeteaseAlbumBrief> brief;
-  if (it->album.id > 0) {
-    auto album = client->album(it->album.id, ctx);
-    if (album.ok()) {
-      brief = album.value().brief;
-    } else {
-      std::cerr << "[netease] album lookup failed for track " << it->id << ": "
-                << error_code_name(album.error().code) << "\n";
-    }
-  }
-
-  return R::success(track_from_song(*it, brief, ctx));
+  // 不再为专辑艺术家额外反查 /album：曲目只带自己的艺术家。
+  return R::success(track_from_song(*it, ctx));
 }
 
 Result<Album> NeteaseLibrary::get_album(const AlbumRef &ref,
@@ -643,7 +600,7 @@ Result<Page<Track>> NeteaseLibrary::list_album_tracks(const AlbumRef &ref,
                                 static_cast<int>(out.items.size()) < limit;
        ++i) {
     out.items.push_back(track_from_song(songs[static_cast<std::size_t>(i)],
-                                        album.value().brief, ctx));
+                                        ctx));
   }
   if (offset + static_cast<std::int64_t>(out.items.size()) <
       static_cast<std::int64_t>(songs.size())) {
@@ -752,7 +709,7 @@ Result<Page<SearchHit>> NeteaseLibrary::search(const SearchQuery &query,
       note_error(page_result.error());
     } else {
       for (const auto &song : page_result.value().items) {
-        Track track = track_from_song(song, std::nullopt, ctx);
+        Track track = track_from_song(song, ctx);
         if (track.ref.entity_id.empty()) {
           continue;
         }
@@ -760,10 +717,8 @@ Result<Page<SearchHit>> NeteaseLibrary::search(const SearchQuery &query,
             !contains_name(track.artists, query.artists.front())) {
           continue;
         }
-        if (!query.album_artists.empty() &&
-            !contains_name(track.album_artists, query.album_artists.front())) {
-          continue;
-        }
+        // 曲目不再带专辑艺术家，无法按 album_artists 过滤，直接跳过该条件；
+        // 专辑命中仍在下方按 album.artists 过滤。
         if (!track.playable && !query.include_unplayable) {
           continue;
         }
@@ -1257,7 +1212,7 @@ Result<Playlist> NeteaseLibrary::get_playlist(const PlaylistRef &ref,
         continue;
       }
       // 这里已经为造 ref 解析过整首歌，直接留下完整 Track，别让上层再查一遍。
-      Track track = track_from_song(song, std::nullopt, ctx);
+      Track track = track_from_song(song, ctx);
       if (track.ref.entity_id.empty()) {
         continue;
       }

@@ -68,8 +68,11 @@ crow::json::wvalue song_dto(const media_library::Track &track) {
 
   const std::string artist = join_names(track.artists);
   node["artist"] = artist;
+  // 没有专辑艺术家就整个字段不输出，不要拿艺术家顶替。
   const std::string album_artist = join_album_artist_names(track.album_artists);
-  node["albumArtist"] = album_artist.empty() ? artist : album_artist;
+  if (!album_artist.empty()) {
+    node["albumArtist"] = album_artist;
+  }
 
   if (track.track_no.has_value()) {
     node["track"] = *track.track_no;

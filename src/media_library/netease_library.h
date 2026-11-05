@@ -90,10 +90,8 @@ public:
   HealthSnapshot health() const;
 
 private:
-  // 平台响应 → 领域对象。album 参数可空：曲目自带的 al{} 已经够用。
+  // 平台响应 → 领域对象。曲目只带自己的艺术家，不带专辑艺术家。
   Track track_from_song(const api_enhanced::NeteaseSong &song,
-                        const std::optional<api_enhanced::NeteaseAlbumBrief>
-                            &album,
                         const CallContext &ctx) const;
   Album album_from_brief(const api_enhanced::NeteaseAlbumBrief &brief) const;
   Artist artist_from_brief(const api_enhanced::NeteaseArtist &brief) const;
