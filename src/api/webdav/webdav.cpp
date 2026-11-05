@@ -875,17 +875,7 @@ Url resolveCredentials(const std::string &url) {
   if (!u.user.empty() || !u.pass.empty()) {
     return u;
   }
-  for (const auto &root : config::get().webdav_roots) {
-    Url c;
-    if (parseUrl(root.url, c) && c.host == u.host && c.port == u.port) {
-      u.user = root.user;
-      u.pass = root.pass;
-      break;
-    }
-  }
-  if (!u.user.empty() || !u.pass.empty()) {
-    return u;
-  }
+  // 凭据只存数据库（WebDAV 扫描根），不再从配置文件读取。
   try {
     SQLite::Database &db = db::conn(config::get().db_path.string());
     SQLite::Statement q(db, schema::sql::kScanRootCredentials);

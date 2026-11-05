@@ -9,12 +9,6 @@
 namespace config {
 namespace fs = std::filesystem;
 
-struct WebdavRoot {
-  std::string url;
-  std::string user;
-  std::string pass;
-};
-
 struct ImageCacheConfig {
   bool enabled{true};
   fs::path dir{"./img_tmp"};
@@ -25,9 +19,21 @@ struct ImageCacheConfig {
   int revalidate_seconds{300};
 };
 
+// 本地媒体库：全局只允许一个，id 可配（默认 local-main）。
+// 扫描根（含 WebDAV 凭据）不进配置文件，存在数据库的 scan_roots 表里。
+struct LocalLibraryConfig {
+  std::string id{"local-main"};
+  bool follow_symlinks{true};
+  bool scan_on_start{true};
+  int scan_threads{4};
+  fs::path playlist_dir{"./playlists"};
+};
+
 // 网易云音乐（经 api-enhanced 适配）。
 // cookie 是明文凭据：只在这里与请求头发送路径上存在，绝不进日志/错误/响应。
+// id 目前必须是 netease-main：实体引用由 api-enhanced 的常量生成。
 struct NeteaseConfig {
+  std::string id{"netease-main"};
   bool enabled{false};
   std::string api_base{"http://127.0.0.1:3000"};
   std::string cookie;
@@ -62,30 +68,29 @@ struct SubsonicConfig {
   std::string cors_allow_origin{"*"};
 };
 
+// 单个方面的媒体库优先顺序。aspect：metadata / lyrics / stream / artwork / search。
+// search 控制多库聚合列表（搜索结果等）的分层顺序。
+struct LibraryPriorityConfig {
+  std::string aspect;
+  std::vector<std::string> library_ids;
+};
+
 struct Config {
   fs::path db_path{"./music.db"};
   fs::path static_dir{"web"};
+  // 主服务端口（配置文件键名 main_port）。
   int port{5666};
   int page_size{50};
-  bool follow_symlinks{true};
-  bool scan_on_start{true};
-  int scan_threads{4};
-  std::vector<fs::path> scan_roots{"/opt/music"};
   bool transcode_enabled{false};
   bool jellyfin_enabled{true};
   int jellyfin_port{9000};
   std::string jellyfin_server_name{"musicd"};
   SubsonicConfig subsonic;
-  bool webdav_enabled{false};
-  std::vector<WebdavRoot> webdav_roots;
-  fs::path playlist_dir{"./playlists"};
   ImageCacheConfig image_cache;
+  LocalLibraryConfig local;
   NeteaseConfig netease;
-  // 聚合优先级：数组顺序即聚合分层顺序，靠前的库整组排在前面。
-  // 未列出的库追加到末尾（按健康状态与注册 priority 决胜）。
-  // 只影响「多库聚合结果」的顺序，不改变单库请求的路由。
-  // 留空 = 内建顺序（本地库优先，其次注册 priority 降序）。
-  std::vector<std::string> library_priority;
+  // 每个方面一条顺序；数组顺序无意义。未配置的方面走内建顺序。
+  std::vector<LibraryPriorityConfig> library_priority;
 };
 
 const Config &get();

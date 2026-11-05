@@ -38,8 +38,8 @@ Runtime &state() {
 
 } // namespace
 
-void initialize_media_runtime(std::vector<LibrarySetup> libraries,
-                              std::vector<std::string> aggregate_order) {
+void initialize_media_runtime_impl(std::vector<LibrarySetup> libraries,
+                                   const std::vector<PriorityOrder> &orders) {
   if (libraries.empty()) {
     throw std::invalid_argument(
         "initialize_media_runtime: no library to register");
@@ -86,19 +86,38 @@ void initialize_media_runtime(std::vector<LibrarySetup> libraries,
   next.links = make_memory_entity_link_resolver(
       next.aspect_priority, make_registry_builtin_order(next.registry));
   next.aggregate_priority = make_memory_aggregate_priority();
-  // 配置里的 library_priority 是聚合分层的唯一出口。未注册的 id 只警告不报错：
-  // 被关闭的库（如 netease.enabled=false）留在配置里是正常情况。
-  if (!aggregate_order.empty()) {
-    for (const std::string &id : aggregate_order) {
+  // 配置里的 library_priority 是优先级唯一出口：每个 aspect 一条顺序。
+  // 未注册的 id 只警告不报错：被关闭的库（如 netease.enabled=false）留在
+  // 配置里是正常情况。
+  for (const PriorityOrder &order : orders) {
+    for (const std::string &id : order.library_ids) {
       if (next.registry->library(id) == nullptr) {
-        std::cerr << "[media] library_priority 引用了未注册的库: " << id
-                  << std::endl;
+        std::cerr << "[media] library_priority(" << order.aspect
+                  << ") 引用了未注册的库: " << id << std::endl;
       }
     }
-    const Status ordered = next.aggregate_priority->set_order(aggregate_order);
+    if (order.aspect == "search") {
+      const Status ordered =
+          next.aggregate_priority->set_order(order.library_ids);
+      if (!ordered.ok()) {
+        throw std::runtime_error(
+            "initialize_media_runtime: search priority: " +
+            std::string(error_code_name(ordered.error().code)) + " " +
+            ordered.error().message);
+      }
+      continue;
+    }
+    const std::optional<Aspect> aspect = parse_aspect(order.aspect);
+    if (!aspect.has_value()) {
+      std::cerr << "[media] library_priority.aspect 未知: " << order.aspect
+                << std::endl;
+      continue;
+    }
+    const Status ordered =
+        next.aspect_priority->set_order(*aspect, order.library_ids);
     if (!ordered.ok()) {
       throw std::runtime_error(
-          "initialize_media_runtime: aggregate priority: " +
+          "initialize_media_runtime: " + order.aspect + " priority: " +
           std::string(error_code_name(ordered.error().code)) + " " +
           ordered.error().message);
     }
@@ -113,6 +132,20 @@ void initialize_media_runtime(std::vector<LibrarySetup> libraries,
 
   std::lock_guard<std::mutex> lock(mutex());
   state() = std::move(next);
+}
+
+void initialize_media_runtime(std::vector<LibrarySetup> libraries,
+                              const std::vector<PriorityOrder> &orders) {
+  initialize_media_runtime_impl(std::move(libraries), orders);
+}
+
+void initialize_media_runtime(std::vector<LibrarySetup> libraries,
+                              std::vector<std::string> aggregate_order) {
+  std::vector<PriorityOrder> orders;
+  if (!aggregate_order.empty()) {
+    orders.push_back(PriorityOrder{"search", std::move(aggregate_order)});
+  }
+  initialize_media_runtime(std::move(libraries), orders);
 }
 
 void initialize_media_runtime(std::shared_ptr<Library> library,

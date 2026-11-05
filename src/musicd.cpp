@@ -84,25 +84,8 @@ void bootstrap() {
             << std::endl;
 
   {
+    // 扫描根（本地与 WebDAV）只存数据库，配置文件不再声明。
     repo::ScanRootRepo roots(cfg.db_path.string());
-    const auto existing = roots.list();
-    const auto ensureRoot = [&existing, &roots](const std::string &path) {
-      if (path.empty()) {
-        return;
-      }
-      for (const auto &r : existing) {
-        if (r.path == path) {
-          return;
-        }
-      }
-      roots.add(path, "", "", deriveRootName(path), rootTypeOf(path));
-    };
-    for (const auto &root : cfg.scan_roots) {
-      ensureRoot(root.string());
-    }
-    for (const auto &w : cfg.webdav_roots) {
-      ensureRoot(w.url);
-    }
     for (const auto &r : roots.list()) {
       if (r.name.empty()) {
         roots.updateName(r.id, deriveRootName(r.path));
@@ -110,7 +93,7 @@ void bootstrap() {
     }
   }
 
-  if (cfg.scan_on_start) {
+  if (cfg.local.scan_on_start) {
     scanner::enqueueJob("scan-all", [] { scanner::scanAllBlocking(); });
   }
 
@@ -680,7 +663,7 @@ void runIdsParallel(const std::vector<int> &ids,
   if (ids.empty()) {
     return;
   }
-  int threads = config::get().scan_threads;
+  int threads = config::get().local.scan_threads;
   if (threads < 1) {
     threads = 1;
   }
@@ -861,7 +844,7 @@ int main(int argc, char *argv[]) {
 
   // 主服务与 Jellyfin 兼容层共用同一个 Library 对象。
   try {
-    media_library::initialize_library("local-main", cfg.jellyfin_server_name,
+    media_library::initialize_library(cfg.local.id, cfg.jellyfin_server_name,
                                       cfg.db_path.string());
   } catch (const std::exception &e) {
     std::cerr << "[fatal] 媒体库初始化失败: " << e.what() << std::endl;
@@ -872,7 +855,7 @@ int main(int argc, char *argv[]) {
   std::vector<media_library::LibrarySetup> setups;
   {
     media_library::MediaRuntimeOptions options;
-    options.library_id = "local-main";
+    options.library_id = cfg.local.id;
     options.display_name = cfg.jellyfin_server_name;
     options.platform = media_library::PlatformKind::Local;
     options.priority = 100;
@@ -896,8 +879,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     client.metadata_ttl_ms = cfg.netease.metadata_ttl_ms;
 
     auto netease = media_library::make_netease_library(
-        std::string(api_enhanced::kNetEaseLibraryId), "网易云音乐", transport,
-        client, cfg.netease.uid);
+        cfg.netease.id, "网易云音乐", transport, client, cfg.netease.uid);
     if (!netease.ok()) {
       // 配置错误或 api-enhanced 不可用都不该拖垮本地库。
       std::cerr << "[netease] 未启用: "
@@ -905,7 +887,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                 << netease.error().message << std::endl;
     } else {
       media_library::MediaRuntimeOptions options;
-      options.library_id = std::string(api_enhanced::kNetEaseLibraryId);
+      options.library_id = cfg.netease.id;
       options.display_name = "网易云音乐";
       options.platform = media_library::PlatformKind::NetEase;
       // 低于本地库：同实体优先本地文件，远端只做补充。
@@ -919,9 +901,16 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     }
   }
 
+  std::vector<media_library::PriorityOrder> priority_orders;
+  priority_orders.reserve(cfg.library_priority.size());
+  for (const auto &entry : cfg.library_priority) {
+    priority_orders.push_back(
+        media_library::PriorityOrder{entry.aspect, entry.library_ids});
+  }
+
   try {
     media_library::initialize_media_runtime(std::move(setups),
-                                            cfg.library_priority);
+                                            priority_orders);
   } catch (const std::exception &e) {
     std::cerr << "[fatal] 媒体库路由初始化失败: " << e.what() << std::endl;
     return 1;

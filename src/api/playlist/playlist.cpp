@@ -36,7 +36,7 @@ std::string makeId() {
 }
 
 fs::path dirPath() {
-  fs::path dir = config::get().playlist_dir;
+  fs::path dir = config::get().local.playlist_dir;
   std::error_code ec;
   fs::create_directories(dir, ec);
   return dir;

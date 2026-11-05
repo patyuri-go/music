@@ -524,7 +524,7 @@ void scanWebdavTree(const webdav::Url &base, const std::vector<DirTask> &starts,
 
   ScanCtx ctx;
   ctx.only_new = only_new;
-  const int threads = std::max(1, config::get().scan_threads);
+  const int threads = std::max(1, config::get().local.scan_threads);
   beginActivePaths(threads);
 
   DirProcessor process = [&](ScanCtx &c, const DirTask &task, int slot) {
@@ -749,13 +749,13 @@ void scanLocalTree(const repo::ScanRoot &sr, const std::vector<DirTask> &starts,
   rp.scanning = true;
   try {
     const auto options =
-        config::get().follow_symlinks
+        config::get().local.follow_symlinks
             ? fs::directory_options::follow_directory_symlink
             : fs::directory_options::none;
 
     ScanCtx ctx;
     ctx.only_new = only_new;
-    const int threads = std::max(1, config::get().scan_threads);
+    const int threads = std::max(1, config::get().local.scan_threads);
     beginActivePaths(threads);
 
     DirProcessor process = [&](ScanCtx &c, const DirTask &task, int slot) {

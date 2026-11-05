@@ -14,6 +14,9 @@ namespace {
 Config g_config;
 bool g_loaded = false;
 
+// 网易云实体引用由 api-enhanced 的常量生成，库 id 不能改成别的值。
+constexpr const char *kNeteaseLibraryId = "netease-main";
+
 std::string envValue(const char *key) {
   const char *value = std::getenv(key);
   return value == nullptr ? std::string{} : std::string{value};
@@ -42,23 +45,8 @@ bool toBool(const std::string &text, const std::string &source) {
   throw std::runtime_error(source + " 不是合法布尔值: " + text);
 }
 
-std::vector<fs::path> toPathVector(const crow::json::rvalue &arr,
-                                   const std::string &source) {
-  std::vector<fs::path> out;
-  if (!arr || arr.t() != crow::json::type::List) {
-    return out;
-  }
-  for (const auto &item : arr) {
-    if (item.t() == crow::json::type::String) {
-      out.push_back(std::string(item.s()));
-    }
-  }
-  return out;
-}
-
 // 逗号分隔的 library_id 列表（环境变量用）。空项被丢弃。
-std::vector<std::string> toIdVector(const std::string &text,
-                                    const std::string &source) {
+std::vector<std::string> toIdVector(const std::string &text) {
   std::vector<std::string> out;
   std::size_t start = 0;
   while (start <= text.size()) {
@@ -81,8 +69,22 @@ std::vector<std::string> toIdVector(const std::string &text,
     }
     start = comma + 1;
   }
-  (void)source;
   return out;
+}
+
+bool known_aspect(const std::string &aspect) {
+  return aspect == "metadata" || aspect == "lyrics" || aspect == "stream" ||
+         aspect == "artwork" || aspect == "search";
+}
+
+void check_library_id(const std::string &id, const std::string &what) {
+  if (id.empty()) {
+    throw std::runtime_error(what + " 的 id 不能为空");
+  }
+  if (id.find(':') != std::string::npos || id.find('|') != std::string::npos ||
+      id.find('=') != std::string::npos) {
+    throw std::runtime_error(what + " 的 id 不能包含 ':' '|' '=': " + id);
+  }
 }
 
 } // namespace
@@ -134,10 +136,6 @@ const Config &load(const std::string &file) {
   if (const std::string value = envValue("NETEASE_REAL_IP"); !value.empty()) {
     loaded.netease.real_ip = value;
   }
-  // 聚合优先级同样按 CLI > 配置文件 > 环境变量：这里先落环境变量，文件随后覆盖。
-  if (const std::string value = envValue("LIBRARY_PRIORITY"); !value.empty()) {
-    loaded.library_priority = toIdVector(value, "LIBRARY_PRIORITY");
-  }
 
   std::ifstream input(file);
   if (input.is_open()) {
@@ -153,23 +151,11 @@ const Config &load(const std::string &file) {
     if (json.has("static_dir")) {
       loaded.static_dir = json["static_dir"].s();
     }
-    if (json.has("port")) {
-      loaded.port = static_cast<int>(json["port"].i());
+    if (json.has("main_port")) {
+      loaded.port = static_cast<int>(json["main_port"].i());
     }
     if (json.has("page_size")) {
       loaded.page_size = static_cast<int>(json["page_size"].i());
-    }
-    if (json.has("follow_symlinks")) {
-      loaded.follow_symlinks = json["follow_symlinks"].b();
-    }
-    if (json.has("scan_roots")) {
-      loaded.scan_roots = toPathVector(json["scan_roots"], "scan_roots");
-    }
-    if (json.has("scan_on_start")) {
-      loaded.scan_on_start = json["scan_on_start"].b();
-    }
-    if (json.has("scan_threads")) {
-      loaded.scan_threads = static_cast<int>(json["scan_threads"].i());
     }
     if (json.has("transcode")) {
       const auto &tc = json["transcode"];
@@ -211,9 +197,6 @@ const Config &load(const std::string &file) {
         loaded.subsonic.cors_allow_origin = sc["cors_allow_origin"].s();
       }
     }
-    if (json.has("playlist_dir")) {
-      loaded.playlist_dir = json["playlist_dir"].s();
-    }
     if (json.has("image_cache")) {
       const auto &cache = json["image_cache"];
       if (cache.has("enabled")) {
@@ -249,86 +232,135 @@ const Config &load(const std::string &file) {
             static_cast<int>(cache["revalidate_seconds"].i());
       }
     }
-    // 聚合优先级：["local-main", "netease-main"]，顺序即分层顺序。
+
+    // 媒体库：本地库只允许一个；网易云库最多一个；出现未知 type 直接报错。
+    if (json.has("libraries")) {
+      const auto &libs = json["libraries"];
+      if (libs.t() != crow::json::type::List) {
+        throw std::runtime_error("libraries 必须是数组");
+      }
+      int local_count = 0;
+      int netease_count = 0;
+      for (const auto &item : libs) {
+        if (item.t() != crow::json::type::Object) {
+          throw std::runtime_error("libraries 的每一项必须是对象");
+        }
+        const std::string type =
+            item.has("type") ? std::string(item["type"].s()) : std::string{};
+        const std::string id =
+            item.has("id") ? std::string(item["id"].s()) : std::string{};
+        if (type == "local") {
+          if (++local_count > 1) {
+            throw std::runtime_error("libraries 只允许一个 type=local 的本地库");
+          }
+          if (!id.empty()) {
+            loaded.local.id = id;
+          }
+          if (item.has("follow_symlinks")) {
+            loaded.local.follow_symlinks = item["follow_symlinks"].b();
+          }
+          if (item.has("scan_on_start")) {
+            loaded.local.scan_on_start = item["scan_on_start"].b();
+          }
+          if (item.has("scan_threads")) {
+            loaded.local.scan_threads =
+                static_cast<int>(item["scan_threads"].i());
+          }
+          if (item.has("playlist_dir")) {
+            loaded.local.playlist_dir = item["playlist_dir"].s();
+          }
+        } else if (type == "netease") {
+          if (++netease_count > 1) {
+            throw std::runtime_error("libraries 最多允许一个 type=netease 的库");
+          }
+          // 出现在 libraries 里即视为启用，除非显式 enabled=false。
+          loaded.netease.enabled = true;
+          if (!id.empty()) {
+            loaded.netease.id = id;
+          }
+          if (item.has("enabled")) {
+            loaded.netease.enabled = item["enabled"].b();
+          }
+          if (item.has("api_base")) {
+            loaded.netease.api_base = item["api_base"].s();
+          }
+          if (item.has("cookie")) {
+            loaded.netease.cookie = item["cookie"].s();
+          }
+          if (item.has("default_level")) {
+            loaded.netease.default_level = item["default_level"].s();
+          }
+          if (item.has("uid")) {
+            const auto &uid = item["uid"];
+            // uid 在 JSON 里可能是数字或字符串，两种都接受。
+            if (uid.t() == crow::json::type::Number) {
+              loaded.netease.uid = std::to_string(uid.i());
+            } else if (uid.t() == crow::json::type::String) {
+              loaded.netease.uid = uid.s();
+            }
+          }
+          if (item.has("timeout_ms")) {
+            loaded.netease.timeout_ms =
+                static_cast<int>(item["timeout_ms"].i());
+          }
+          if (item.has("metadata_ttl_ms")) {
+            loaded.netease.metadata_ttl_ms =
+                static_cast<int>(item["metadata_ttl_ms"].i());
+          }
+          if (item.has("max_concurrency")) {
+            loaded.netease.max_concurrency =
+                static_cast<int>(item["max_concurrency"].i());
+          }
+          if (item.has("min_request_interval_ms")) {
+            loaded.netease.min_request_interval_ms =
+                static_cast<int>(item["min_request_interval_ms"].i());
+          }
+          if (item.has("real_ip")) {
+            loaded.netease.real_ip = item["real_ip"].s();
+          }
+        } else {
+          throw std::runtime_error("libraries 存在未知 type: " + type +
+                                   "（只支持 local / netease）");
+        }
+      }
+      if (local_count == 0) {
+        throw std::runtime_error("libraries 必须包含一个 type=local 的本地库");
+      }
+    }
+
+    // 方面优先级：[{ "aspect": "metadata", "priority": ["local-main", ...] }]
     if (json.has("library_priority")) {
       const auto &lp = json["library_priority"];
-      if (lp.t() == crow::json::type::List) {
-        loaded.library_priority.clear();
-        for (const auto &item : lp) {
-          if (item.t() == crow::json::type::String) {
-            const std::string id = std::string(item.s());
-            if (!id.empty()) {
-              loaded.library_priority.push_back(id);
+      if (lp.t() != crow::json::type::List) {
+        throw std::runtime_error("library_priority 必须是数组");
+      }
+      loaded.library_priority.clear();
+      for (const auto &item : lp) {
+        if (item.t() != crow::json::type::Object) {
+          throw std::runtime_error(
+              "library_priority 的每一项必须是 {aspect, priority} 对象");
+        }
+        LibraryPriorityConfig entry;
+        if (item.has("aspect")) {
+          entry.aspect = item["aspect"].s();
+        }
+        if (entry.aspect.empty()) {
+          throw std::runtime_error("library_priority 项缺少 aspect");
+        }
+        if (item.has("priority")) {
+          const auto &ids = item["priority"];
+          if (ids.t() != crow::json::type::List) {
+            throw std::runtime_error("library_priority.priority 必须是数组: " +
+                                     entry.aspect);
+          }
+          for (const auto &value : ids) {
+            if (value.t() == crow::json::type::String &&
+                !std::string(value.s()).empty()) {
+              entry.library_ids.push_back(std::string(value.s()));
             }
           }
         }
-      } else if (lp.t() == crow::json::type::String) {
-        loaded.library_priority = toIdVector(std::string(lp.s()), "library_priority");
-      }
-    }
-    if (json.has("netease")) {
-      const auto &ne = json["netease"];
-      if (ne.has("enabled")) {
-        loaded.netease.enabled = ne["enabled"].b();
-      }
-      if (ne.has("api_base")) {
-        loaded.netease.api_base = ne["api_base"].s();
-      }
-      if (ne.has("cookie")) {
-        loaded.netease.cookie = ne["cookie"].s();
-      }
-      if (ne.has("default_level")) {
-        loaded.netease.default_level = ne["default_level"].s();
-      }
-      if (ne.has("uid")) {
-        const auto &uid = ne["uid"];
-        // uid 在 JSON 里可能是数字或字符串，两种都接受。
-        if (uid.t() == crow::json::type::Number) {
-          loaded.netease.uid = std::to_string(uid.i());
-        } else if (uid.t() == crow::json::type::String) {
-          loaded.netease.uid = uid.s();
-        }
-      }
-      if (ne.has("timeout_ms")) {
-        loaded.netease.timeout_ms = static_cast<int>(ne["timeout_ms"].i());
-      }
-      if (ne.has("metadata_ttl_ms")) {
-        loaded.netease.metadata_ttl_ms =
-            static_cast<int>(ne["metadata_ttl_ms"].i());
-      }
-      if (ne.has("max_concurrency")) {
-        loaded.netease.max_concurrency =
-            static_cast<int>(ne["max_concurrency"].i());
-      }
-      if (ne.has("min_request_interval_ms")) {
-        loaded.netease.min_request_interval_ms =
-            static_cast<int>(ne["min_request_interval_ms"].i());
-      }
-      if (ne.has("real_ip")) {
-        loaded.netease.real_ip = ne["real_ip"].s();
-      }
-    }
-    if (json.has("webdav")) {
-      const auto &wd = json["webdav"];
-      if (wd.has("enabled")) {
-        loaded.webdav_enabled = wd["enabled"].b();
-      }
-      if (wd.has("roots") && wd["roots"].t() == crow::json::type::List) {
-        for (const auto &item : wd["roots"]) {
-          WebdavRoot root;
-          if (item.has("url")) {
-            root.url = item["url"].s();
-          }
-          if (item.has("user")) {
-            root.user = item["user"].s();
-          }
-          if (item.has("pass")) {
-            root.pass = item["pass"].s();
-          }
-          if (!root.url.empty()) {
-            loaded.webdav_roots.push_back(root);
-          }
-        }
+        loaded.library_priority.push_back(std::move(entry));
       }
     }
   }
@@ -352,26 +384,15 @@ const Config &load(const std::string &file) {
   }
   const std::string follow = envValue("MUSIC_FOLLOW_SYMLINKS");
   if (!follow.empty()) {
-    loaded.follow_symlinks = toBool(follow, "MUSIC_FOLLOW_SYMLINKS");
-  }
-  const std::string roots = envValue("MUSIC_ROOTS");
-  if (!roots.empty()) {
-    loaded.scan_roots.clear();
-    std::stringstream ss(roots);
-    std::string item;
-    while (std::getline(ss, item, ':')) {
-      if (!item.empty()) {
-        loaded.scan_roots.push_back(item);
-      }
-    }
+    loaded.local.follow_symlinks = toBool(follow, "MUSIC_FOLLOW_SYMLINKS");
   }
   const std::string scanOnStart = envValue("MUSIC_SCAN_ON_START");
   if (!scanOnStart.empty()) {
-    loaded.scan_on_start = toBool(scanOnStart, "MUSIC_SCAN_ON_START");
+    loaded.local.scan_on_start = toBool(scanOnStart, "MUSIC_SCAN_ON_START");
   }
   const std::string scanThreads = envValue("MUSIC_SCAN_THREADS");
   if (!scanThreads.empty()) {
-    loaded.scan_threads = toInt(scanThreads, "MUSIC_SCAN_THREADS");
+    loaded.local.scan_threads = toInt(scanThreads, "MUSIC_SCAN_THREADS");
   }
   const std::string transcode = envValue("MUSIC_TRANSCODE");
   if (!transcode.empty()) {
@@ -406,25 +427,18 @@ const Config &load(const std::string &file) {
   if (std::getenv("MUSIC_SUBSONIC_CORS_ALLOW_ORIGIN") != nullptr) {
     loaded.subsonic.cors_allow_origin = scCors;
   }
-  const std::string wdEnabled = envValue("MUSIC_WEBDAV_ENABLED");
-  if (!wdEnabled.empty()) {
-    loaded.webdav_enabled = toBool(wdEnabled, "MUSIC_WEBDAV_ENABLED");
-  }
-  if (!loaded.webdav_roots.empty()) {
-    loaded.webdav_enabled = true;
-  }
   const std::string playlistDir = envValue("MUSIC_PLAYLIST_DIR");
   if (!playlistDir.empty()) {
-    loaded.playlist_dir = playlistDir;
+    loaded.local.playlist_dir = playlistDir;
   }
 
   if (loaded.port <= 0 || loaded.port > 65535) {
-    throw std::runtime_error("port 超出范围 (1-65535): " +
+    throw std::runtime_error("main_port 超出范围 (1-65535): " +
                              std::to_string(loaded.port));
   }
   if (loaded.jellyfin_enabled &&
       (loaded.jellyfin_port <= 0 || loaded.jellyfin_port > 65535)) {
-    throw std::runtime_error("jellyfin_port 超出范围 (1-65535): " +
+    throw std::runtime_error("jellyfin.port 超出范围 (1-65535): " +
                              std::to_string(loaded.jellyfin_port));
   }
   if (loaded.subsonic.enabled) {
@@ -448,9 +462,10 @@ const Config &load(const std::string &file) {
     throw std::runtime_error("page_size 必须为正数: " +
                              std::to_string(loaded.page_size));
   }
-  if (loaded.scan_threads < 1 || loaded.scan_threads > 256) {
-    throw std::runtime_error("scan_threads 超出范围 (1-256): " +
-                             std::to_string(loaded.scan_threads));
+  check_library_id(loaded.local.id, "本地库");
+  if (loaded.local.scan_threads < 1 || loaded.local.scan_threads > 256) {
+    throw std::runtime_error("本地库 scan_threads 超出范围 (1-256): " +
+                             std::to_string(loaded.local.scan_threads));
   }
   if (loaded.image_cache.dir.empty()) {
     throw std::runtime_error("image_cache.dir 不能为空");
@@ -463,6 +478,11 @@ const Config &load(const std::string &file) {
   }
   if (loaded.image_cache.revalidate_seconds < 0) {
     throw std::runtime_error("image_cache.revalidate_seconds 不能为负数");
+  }
+  if (loaded.netease.id != kNeteaseLibraryId) {
+    throw std::runtime_error(
+        std::string("netease 库 id 必须是 ") + kNeteaseLibraryId +
+        "（实体引用由 api-enhanced 生成）: " + loaded.netease.id);
   }
   if (loaded.netease.timeout_ms <= 0) {
     throw std::runtime_error("netease.timeout_ms 必须为正数: " +
@@ -496,22 +516,39 @@ const Config &load(const std::string &file) {
     }
   }
 
-  // 聚合优先级：不允许空项与重复项——重复会让同一库落进两个 tier，
-  // 排序结果取决于遍历顺序，属于静默错乱，配置期就拦掉。
+  // 优先级：aspect 必须已知且不重复；同一条里不允许空项与重复项——
+  // 重复会让同一库落进两个 tier，排序结果取决于遍历顺序，属于静默错乱。
   {
-    std::vector<std::string> seen;
-    seen.reserve(loaded.library_priority.size());
-    for (const std::string &id : loaded.library_priority) {
-      if (id.empty()) {
-        throw std::runtime_error("library_priority 不能包含空 library_id");
+    std::vector<std::string> seen_aspects;
+    for (const LibraryPriorityConfig &entry : loaded.library_priority) {
+      if (!known_aspect(entry.aspect)) {
+        throw std::runtime_error(
+            "library_priority.aspect 未知: " + entry.aspect +
+            "（支持 metadata / lyrics / stream / artwork / search）");
       }
-      for (const std::string &other : seen) {
-        if (other == id) {
-          throw std::runtime_error("library_priority 出现重复的 library_id: " +
-                                   id);
+      for (const std::string &other : seen_aspects) {
+        if (other == entry.aspect) {
+          throw std::runtime_error("library_priority.aspect 重复: " +
+                                   entry.aspect);
         }
       }
-      seen.push_back(id);
+      seen_aspects.push_back(entry.aspect);
+
+      std::vector<std::string> seen;
+      seen.reserve(entry.library_ids.size());
+      for (const std::string &id : entry.library_ids) {
+        if (id.empty()) {
+          throw std::runtime_error("library_priority 不能包含空 library_id");
+        }
+        for (const std::string &other : seen) {
+          if (other == id) {
+            throw std::runtime_error(
+                "library_priority(" + entry.aspect + ") 出现重复的 library_id: " +
+                id);
+          }
+        }
+        seen.push_back(id);
+      }
     }
   }
 
@@ -522,7 +559,8 @@ const Config &load(const std::string &file) {
 
 void setPort(int port) {
   if (port <= 0 || port > 65535) {
-    throw std::runtime_error("port 超出范围 (1-65535): " + std::to_string(port));
+    throw std::runtime_error("main_port 超出范围 (1-65535): " +
+                             std::to_string(port));
   }
   get();
   g_config.port = port;
@@ -530,7 +568,7 @@ void setPort(int port) {
 
 void setJellyfinPort(int port) {
   if (port <= 0 || port > 65535) {
-    throw std::runtime_error("jellyfin_port 超出范围 (1-65535): " +
+    throw std::runtime_error("jellyfin.port 超出范围 (1-65535): " +
                              std::to_string(port));
   }
   get();
