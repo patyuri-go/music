@@ -42,7 +42,8 @@ std::vector<LyricLine> parse_yrc_track(const std::string &text);
 std::vector<LyricLine> parse_enhanced_lrc_track(const std::string &text);
 
 // 把一条文本轨按行时间对齐到已解析的行上，作为辅助轨追加。
-// 空文本行不追加；对齐不上的行丢弃（不猜时间）。
+// 空文本行是平台的间奏占位，必须保留：主行会补 `······`，副轨保留空串，
+// 用来阻止客户端沿用上一句；对齐不上的行丢弃（不猜时间）。
 void attach_aux_track(std::vector<LyricLine> &lines,
                       const std::vector<LyricTrackLine> &track,
                       LyricAuxKind kind);
@@ -55,12 +56,15 @@ bool looks_time_tagged(const std::string &text);
 
 // 本地库的统一入口：一段原始歌词文本 → Lyrics（无辅助轨）。
 // 有可解析时间标签则 LineSynced，否则 Unsynced（清掉所有时间字段）。
+// 带时间轴的空行（间奏）只在持续超过 3 秒时补 `······`，否则删除。
 Lyrics parse_plain_lyrics(const TrackRef &track, const std::string &text);
 
 // 远端平台的统一入口：正文 + 可选辅助轨 → Lyrics。
 //   body        LRC 或 YRC 文本（YRC 优先，逐字同步）
 //   translation 译文轨（LRC，可为空）
 //   romanization 注音轨（LRC，可为空）
+// 正文的空行（间奏）只在持续超过 3 秒时补 `······`，否则删除；
+// 辅助轨只保留空串占位。
 Lyrics parse_platform_lyrics(const TrackRef &track, const std::string &body,
                              const std::string &translation,
                              const std::string &romanization);

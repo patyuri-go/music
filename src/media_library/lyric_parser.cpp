@@ -232,6 +232,36 @@ std::int64_t normalize_start(std::int64_t start, std::int64_t offset_ms) {
   return std::max<std::int64_t>(0, start + offset_ms);
 }
 
+// 间奏占位：平台在间奏处给出的是「有时间戳、正文为空」的行，不是点。
+// 只有持续超过 3 秒的空行才补 `······`；短空行只是换行/停顿，直接删除。
+// 时长优先用行自带的 end_ms（YRC），否则用下一行的开始时间推算；
+// 末行没有 end_ms 时无法判断，按“不超过 3 秒”处理并删除。
+constexpr const char *kInterludePlaceholder = "······";
+constexpr std::int64_t kInterludeMinDurationMs = 3000;
+
+void normalize_interlude_placeholders(std::vector<LyricLine> &lines) {
+  std::vector<LyricLine> kept;
+  kept.reserve(lines.size());
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    LyricLine &line = lines[i];
+    if (!line.start_ms.has_value() || !line.text.empty()) {
+      kept.push_back(std::move(line));
+      continue;
+    }
+    std::int64_t duration_ms = -1;
+    if (line.end_ms.has_value()) {
+      duration_ms = *line.end_ms - *line.start_ms;
+    } else if (i + 1 < lines.size() && lines[i + 1].start_ms.has_value()) {
+      duration_ms = *lines[i + 1].start_ms - *line.start_ms;
+    }
+    if (duration_ms > kInterludeMinDurationMs) {
+      line.text = kInterludePlaceholder;
+      kept.push_back(std::move(line));
+    }
+  }
+  lines = std::move(kept);
+}
+
 // 行时间对齐：先找完全相同的时间，其次容差内最近的，最后（行数相同时）按序号。
 void attach_one(std::vector<LyricLine> &lines,
                 const std::vector<LyricTrackLine> &track,
@@ -239,9 +269,6 @@ void attach_one(std::vector<LyricLine> &lines,
   constexpr std::int64_t kToleranceMs = 1200;
   const bool same_count = lines.size() == track.size();
   for (std::size_t i = 0; i < track.size(); ++i) {
-    if (track[i].text.empty()) {
-      continue;
-    }
     const std::int64_t stamp = track[i].start_ms;
     std::size_t best = lines.size();
     std::int64_t best_delta = -1;
@@ -263,6 +290,8 @@ void attach_one(std::vector<LyricLine> &lines,
     }
     LyricAux aux;
     aux.kind = kind;
+    // 空文本也要保留：这是副轨在该时间点的“无内容”占位，
+    // 用来阻止客户端把上一句的译文/注音回退套到这里。
     aux.text = track[i].text;
     lines[best].aux.push_back(std::move(aux));
   }
@@ -462,6 +491,10 @@ Lyrics parse_plain_lyrics(const TrackRef &track, const std::string &text) {
       }
       lines.push_back(entry);
     }
+    // 本地带时间轴的歌词同样处理间奏：超过 3 秒补占位，短空行删除。
+    normalize_interlude_placeholders(lines);
+    // 纯文本视图与处理后的行保持一致，避免它还保留被删掉的空行。
+    lyrics.plain_text = plain_text_of(lines);
     const bool any_words = std::any_of(
         lines.begin(), lines.end(),
         [](const LyricLine &line) { return !line.words.empty(); });
@@ -516,6 +549,11 @@ Lyrics parse_platform_lyrics(const TrackRef &track, const std::string &body,
     attach_aux_track(lines, parse_lrc_track(romanization),
                      LyricAuxKind::Romanization);
   }
+
+  // 先挂副轨再处理间奏：短空行连同它的空副轨一起删除，
+  // 避免删行后副轨被错误地对到相邻的正文行。
+  // 超过 3 秒的空行补成主行占位 `······`，副轨仍保留空串用于精确对齐。
+  normalize_interlude_placeholders(lines);
 
   if (lines.empty()) {
     return lyrics;

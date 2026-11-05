@@ -810,17 +810,25 @@ crow::response handle_lyrics_by_song_id(const crow::request &req) {
       for (const auto &line : lyrics.lines) {
         const media_library::LyricAux *found = nullptr;
         for (const auto &aux : line.aux) {
-          if (aux.kind == kind && !aux.text.empty()) {
+          if (aux.kind != kind) {
+            continue;
+          }
+          // 同一行可能同时有空占位和真实文本，优先真实文本。
+          if (found == nullptr || (found->text.empty() && !aux.text.empty())) {
             found = &aux;
+          }
+          if (!found->text.empty()) {
             break;
           }
         }
         if (found == nullptr) {
-          // OpenSubsonic：副轨与正文轨**不要求 1:1 对齐**，缺译文的行直接不出，
-          // 不要用空串占位——客户端会把空行渲染成空白字幕。
+          // 该行没有对应的副轨内容：不输出，保持 OpenSubsonic 允许的
+          // 「副轨与正文轨不要求 1:1」。
           continue;
         }
         LyricTrack track;
+        // 空串也是有效占位：媒体库层保留的间奏位置必须原样传出去，
+        // 否则客户端找不到精确时间点，会沿用上一条译文/注音。
         track.text = found->text;
         track.start_ms = line.start_ms;
         track.end_ms = line.end_ms;
