@@ -48,6 +48,16 @@ std::string join_album_artist_names(
   return out;
 }
 
+// OpenSubsonic 的 ArtistID3 最小形态：id + name。
+// 多位艺术家必须是数组里的多个对象，不能塞进一个 id/name。
+template <typename Link>
+crow::json::wvalue artist_link_dto(const Link &link) {
+  crow::json::wvalue node;
+  node["id"] = id_of(link.ref);
+  node["name"] = link.name;
+  return node;
+}
+
 } // namespace
 
 int duration_seconds(const media_library::Track &track) {
@@ -68,10 +78,26 @@ crow::json::wvalue song_dto(const media_library::Track &track) {
 
   const std::string artist = join_names(track.artists);
   node["artist"] = artist;
+  // OpenSubsonic：artists 是数组，客户端据此把每位艺术家渲染成独立链接。
+  // 只给 artist 字符串时，多人合作会被当成一个合并后的艺术家。
+  if (!track.artists.empty()) {
+    crow::json::wvalue::list artists;
+    for (const auto &link : track.artists) {
+      artists.push_back(artist_link_dto(link));
+    }
+    node["artists"] = std::move(artists);
+    node["displayArtist"] = artist;
+  }
   // 没有专辑艺术家就整个字段不输出，不要拿艺术家顶替。
   const std::string album_artist = join_album_artist_names(track.album_artists);
   if (!album_artist.empty()) {
     node["albumArtist"] = album_artist;
+    crow::json::wvalue::list album_artists;
+    for (const auto &link : track.album_artists) {
+      album_artists.push_back(artist_link_dto(link));
+    }
+    node["albumArtists"] = std::move(album_artists);
+    node["displayAlbumArtist"] = album_artist;
   }
 
   if (track.track_no.has_value()) {
@@ -140,6 +166,15 @@ crow::json::wvalue album_dto(const media_library::Album &album,
   node["artistId"] = album.artists.empty()
                          ? std::string()
                          : id_of(album.artists.front().ref);
+  // 专辑同样给 OpenSubsonic artists 数组，避免多人专辑只暴露合并后的字符串。
+  if (!album.artists.empty()) {
+    crow::json::wvalue::list artists;
+    for (const auto &link : album.artists) {
+      artists.push_back(artist_link_dto(link));
+    }
+    node["artists"] = std::move(artists);
+    node["displayArtist"] = artist;
+  }
   if (album.year.has_value()) {
     node["year"] = *album.year;
   }
