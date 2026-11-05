@@ -34,6 +34,10 @@ crow::json::wvalue playlist_dto(const media_library::Playlist &playlist,
 crow::json::wvalue music_folder_dto(const std::string &library_id,
                                     const std::string &name);
 
+// <user>：Subsonic 账号。本服务不校验账号，只返回一个合成用户；
+// username 为空时用 "admin" 兜底。
+crow::json::wvalue user_dto(const std::string &username);
+
 // SearchHit 命中 -> 对应 DTO（内部按 kind 分派）。
 crow::json::wvalue search_hit_dto(const media_library::SearchHit &hit);
 

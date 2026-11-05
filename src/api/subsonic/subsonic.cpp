@@ -223,6 +223,20 @@ crow::response handle_license(const crow::request &) {
   return ok(std::move(payload));
 }
 
+// OpenSubsonic 扩展声明：客户端（Feishin 等）靠这个判断服务端是否支持
+// getLyricsBySongId 的结构化歌词及 v2 的 enhanced 字段。只宣告真正实现的扩展。
+crow::response handle_open_subsonic_extensions(const crow::request &) {
+  crow::json::wvalue entry;
+  entry["name"] = "songLyrics";
+  entry["versions"] = crow::json::wvalue::list{1, 2};
+  crow::json::wvalue::list extensions;
+  extensions.push_back(std::move(entry));
+  crow::json::wvalue payload;
+  payload["openSubsonicExtensions"] =
+      crow::json::wvalue(std::move(extensions));
+  return ok(std::move(payload));
+}
+
 crow::response handle_music_folders(const crow::request &) {
   const std::shared_ptr<media_library::LibraryRegistry> registry =
       media_library::library_registry_ptr();
@@ -239,6 +253,27 @@ crow::response handle_music_folders(const crow::request &) {
   crow::json::wvalue payload;
   payload["musicFolders"] = crow::json::wvalue::object();
   payload["musicFolders"]["musicFolder"] = crow::json::wvalue(std::move(folders));
+  return ok(std::move(payload));
+}
+
+// ---------------------------------------------------------------------------
+// 账号
+// ---------------------------------------------------------------------------
+
+// 本服务不校验账号：只回一个合成用户，用户名取客户端传来的值。
+// getUsers 没有 username 参数，退回凭据参数 u；两者都空时用 "admin"。
+crow::response handle_user(const crow::request &req) {
+  crow::json::wvalue payload;
+  payload["user"] = user_dto(text(req, "username"));
+  return ok(std::move(payload));
+}
+
+crow::response handle_users(const crow::request &req) {
+  crow::json::wvalue payload;
+  crow::json::wvalue::list users;
+  users.push_back(user_dto(text(req, "u")));
+  payload["users"] = crow::json::wvalue::object();
+  payload["users"]["user"] = crow::json::wvalue(std::move(users));
   return ok(std::move(payload));
 }
 
@@ -852,7 +887,10 @@ void route(App &app, const char *method_name,
 void register_routes(App &app) {
   route(app, "ping", handle_ping);
   route(app, "getLicense", handle_license);
+  route(app, "getOpenSubsonicExtensions", handle_open_subsonic_extensions);
   route(app, "getMusicFolders", handle_music_folders);
+  route(app, "getUser", handle_user);
+  route(app, "getUsers", handle_users);
   route(app, "getSong", handle_song);
   route(app, "getAlbum", handle_album);
   route(app, "getArtist", handle_artist);

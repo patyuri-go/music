@@ -207,6 +207,25 @@ crow::json::wvalue music_folder_dto(const std::string &library_id,
   return node;
 }
 
+crow::json::wvalue user_dto(const std::string &username) {
+  crow::json::wvalue node;
+  node["username"] = username.empty() ? "admin" : username;
+  node["email"] = "";
+  node["scrobblingEnabled"] = false;
+  // 只打开门面确实提供的能力：下载、歌单、封面。
+  node["adminRole"] = false;
+  node["settingsRole"] = false;
+  node["downloadRole"] = true;
+  node["uploadRole"] = false;
+  node["playlistRole"] = true;
+  node["coverArtRole"] = true;
+  node["commentRole"] = false;
+  node["podcastRole"] = false;
+  node["shareRole"] = false;
+  node["videoConversionRole"] = false;
+  return node;
+}
+
 crow::json::wvalue search_hit_dto(const media_library::SearchHit &hit) {
   using media_library::EntityType;
   switch (hit.kind) {
