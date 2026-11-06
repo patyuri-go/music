@@ -52,6 +52,7 @@ struct NeteaseAlbumBrief {
   std::vector<NeteaseArtistRef> artists;
   std::int64_t publish_time_ms{0};
   std::vector<std::string> tags;
+  std::string description;
 };
 
 // 可选音质清单里的一档（l/m/h/sq/hr），不是实际播放音质。
@@ -98,6 +99,7 @@ struct NeteaseArtist {
   std::string pic_url;
   std::int64_t album_size{0};
   std::int64_t music_size{0};
+  std::string brief_desc;
 };
 
 struct NeteaseSongUrl {

@@ -26,6 +26,15 @@ crow::json::wvalue album_dto(const media_library::Album &album,
 crow::json::wvalue artist_dto(const media_library::Artist &artist,
                               int album_count);
 
+// <artistInfo2>：艺术家描述（getArtistInfo2）。只有 biography 一个字段有值，
+// 其余（musicBrainzId / lastFmUrl / *_ImageUrl）本服务不提供，不写。
+// similarArtist 固定给空数组，客户端按数组取值时不必判空。
+crow::json::wvalue artist_info_dto(const media_library::ArtistInfo &info);
+
+// <albumInfo2>：专辑描述（getAlbumInfo2）。描述走 notes 字段
+// （Subsonic 里专辑的说明就是这个键），其余字段同上留空不写。
+crow::json::wvalue album_info_dto(const media_library::AlbumInfo &info);
+
 // <playlist>：歌单。
 crow::json::wvalue playlist_dto(const media_library::Playlist &playlist,
                                 bool include_entries);

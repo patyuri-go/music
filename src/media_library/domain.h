@@ -83,11 +83,24 @@ struct Album {
   std::optional<ArtworkRef> artwork;
 };
 
+// 专辑的补充信息。与 Album 分开查询：列表页不需要简介，详情页才取。
+struct AlbumInfo {
+  AlbumRef ref;
+  std::string description;
+};
+
 struct Artist {
   ArtistRef ref;
   std::string name;
   std::string sort_name;
   std::optional<ArtworkRef> artwork;
+};
+
+// 艺术家的补充信息。ref 用 SourceRef 保留原始类型：
+// 同一个平台 ID 既可能是 Artist，也可能是 AlbumArtist。
+struct ArtistInfo {
+  SourceRef ref;
+  std::string description;
 };
 
 struct Playlist {

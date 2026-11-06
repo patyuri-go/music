@@ -179,6 +179,7 @@ NeteaseAlbumBrief parse_album_brief(const crow::json::rvalue &object) {
   album.pic_url = field_string(object, "picUrl");
   album.publish_time_ms = field_int64(object, "publishTime");
   album.tags = field_strings(object, "tags");
+  album.description = field_string(object, "description");
   if (object.has("artists")) {
     album.artists = parse_artists(object["artists"]);
   }
@@ -242,6 +243,7 @@ NeteaseArtist parse_artist(const crow::json::rvalue &object) {
   artist.pic_url = field_string(object, "picUrl");
   artist.album_size = field_int64(object, "albumSize");
   artist.music_size = field_int64(object, "musicSize");
+  artist.brief_desc = field_string(object, "briefDesc");
   return artist;
 }
 

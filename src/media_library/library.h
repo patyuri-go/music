@@ -149,6 +149,16 @@ public:
                                          const CallContext &ctx) = 0;
 };
 
+// 补充信息能力：与主实体查询分开，列表页不请求简介。
+class InfoProvider {
+public:
+  virtual ~InfoProvider() = default;
+  virtual Result<AlbumInfo> get_album_info(const AlbumRef &ref,
+                                           const CallContext &ctx) = 0;
+  virtual Result<ArtistInfo> get_artist_info(const SourceRef &ref,
+                                             const CallContext &ctx) = 0;
+};
+
 class StreamResolver {
 public:
   virtual ~StreamResolver() = default;

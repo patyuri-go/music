@@ -29,8 +29,10 @@ namespace subsonic {
 namespace {
 
 using media_library::Album;
+using media_library::AlbumInfo;
 using media_library::AlbumRef;
 using media_library::Artist;
+using media_library::ArtistInfo;
 using media_library::ArtistRef;
 using media_library::CallContext;
 using media_library::EntityType;
@@ -427,6 +429,73 @@ crow::response handle_artist(const crow::request &req) {
 
   crow::json::wvalue payload;
   payload["artist"] = std::move(node);
+  return ok(std::move(payload));
+}
+
+// ---------------------------------------------------------------------------
+// 信息（描述）出口
+// ---------------------------------------------------------------------------
+//
+// 描述走元数据方面：与 resolve_track 同一套顺序（链接 override →
+// 配置 library_priority.metadata → 内建顺序），由 Router 逐库回退。
+// 取不到描述（本地库没有 InfoProvider、或远端失败）不是协议错误，按
+// Subsonic 惯例回空对象；只有 id 本身不合法才回 failed 信封。
+
+crow::response handle_album_info2(const crow::request &req) {
+  const std::shared_ptr<media_library::MediaRouter> router =
+      media_library::media_router_ptr();
+  const std::optional<std::string> raw = id_param(req);
+  if (!raw.has_value()) {
+    return failure_response(Code::MissingParameter, "id is required");
+  }
+  const std::optional<SourceRef> ref = parse_id(*raw, EntityType::Album);
+  if (!ref.has_value()) {
+    return failure_response(Code::NotFound, "album not found: " + *raw);
+  }
+  if (router == nullptr) {
+    return failure_response(Code::Ok, "media runtime is not initialized");
+  }
+
+  AlbumInfo info;
+  media_library::Result<media_library::Sourced<AlbumInfo>> resolved =
+      router->resolve_album_info(album_ref_of(*ref), CallContext{});
+  if (resolved.ok()) {
+    info = std::move(resolved.value().value);
+  }
+
+  crow::json::wvalue payload;
+  payload["albumInfo2"] = album_info_dto(info);
+  return ok(std::move(payload));
+}
+
+crow::response handle_artist_info2(const crow::request &req) {
+  const std::shared_ptr<media_library::MediaRouter> router =
+      media_library::media_router_ptr();
+  const std::optional<std::string> raw = id_param(req);
+  if (!raw.has_value()) {
+    return failure_response(Code::MissingParameter, "id is required");
+  }
+  const std::optional<SourceRef> parsed = media_library::parse_ref(*raw);
+  if (!parsed.has_value() ||
+      (parsed->entity_type != EntityType::Artist &&
+       parsed->entity_type != EntityType::AlbumArtist)) {
+    return failure_response(Code::NotFound, "artist not found: " + *raw);
+  }
+  if (router == nullptr) {
+    return failure_response(Code::Ok, "media runtime is not initialized");
+  }
+
+  // 不做 Artist/AlbumArtist 转换：描述查询按原始引用类型选候选，
+  // 网易云两种引用都能取到同一位艺术家的简介。
+  ArtistInfo info;
+  media_library::Result<media_library::Sourced<ArtistInfo>> resolved =
+      router->resolve_artist_info(*parsed, CallContext{});
+  if (resolved.ok()) {
+    info = std::move(resolved.value().value);
+  }
+
+  crow::json::wvalue payload;
+  payload["artistInfo2"] = artist_info_dto(info);
   return ok(std::move(payload));
 }
 
@@ -902,6 +971,8 @@ void register_routes(App &app) {
   route(app, "getSong", handle_song);
   route(app, "getAlbum", handle_album);
   route(app, "getArtist", handle_artist);
+  route(app, "getAlbumInfo2", handle_album_info2);
+  route(app, "getArtistInfo2", handle_artist_info2);
   route(app, "stream", handle_stream);
   route(app, "download", handle_stream);
   route(app, "getCoverArt", handle_cover_art);

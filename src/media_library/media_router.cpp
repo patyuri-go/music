@@ -248,6 +248,31 @@ MediaRouterImpl::resolve_artwork(const SourceRef &owner,
       sourced_resolved(std::move(resolved.value), resolved, Aspect::Artwork));
 }
 
+Result<Sourced<AlbumInfo>>
+MediaRouterImpl::resolve_album_info(const AlbumRef &ref,
+                                    const CallContext &ctx) {
+  Result<AspectResult<AlbumInfo>> result = router_->resolve_album_info(ref, ctx);
+  if (!result.ok()) {
+    return Result<Sourced<AlbumInfo>>::failure(result.error());
+  }
+  AspectResult<AlbumInfo> resolved = std::move(result).value();
+  return Result<Sourced<AlbumInfo>>::success(
+      sourced_resolved(std::move(resolved.value), resolved, Aspect::Metadata));
+}
+
+Result<Sourced<ArtistInfo>>
+MediaRouterImpl::resolve_artist_info(const SourceRef &ref,
+                                     const CallContext &ctx) {
+  Result<AspectResult<ArtistInfo>> result =
+      router_->resolve_artist_info(ref, ctx);
+  if (!result.ok()) {
+    return Result<Sourced<ArtistInfo>>::failure(result.error());
+  }
+  AspectResult<ArtistInfo> resolved = std::move(result).value();
+  return Result<Sourced<ArtistInfo>>::success(
+      sourced_resolved(std::move(resolved.value), resolved, Aspect::Metadata));
+}
+
 // ---------------------------------------------------------------------------
 // 5.4.3 聚合
 // ---------------------------------------------------------------------------

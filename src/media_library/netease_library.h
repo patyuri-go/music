@@ -27,6 +27,7 @@ namespace media_library {
 class NeteaseLibrary : public Library,
                        public CatalogReader,
                        public Searcher,
+                       public InfoProvider,
                        public StreamResolver,
                        public LyricsProvider,
                        public ArtworkProvider,
@@ -52,6 +53,13 @@ public:
                           const CallContext &ctx) override;
   Result<Artist> get_artist(const ArtistRef &ref,
                             const CallContext &ctx) override;
+
+  // InfoProvider
+  Result<AlbumInfo> get_album_info(const AlbumRef &ref,
+                                   const CallContext &ctx) override;
+  Result<ArtistInfo> get_artist_info(const SourceRef &ref,
+                                     const CallContext &ctx) override;
+
   Result<Page<Track>> list_album_tracks(const AlbumRef &ref,
                                         const PageRequest &page,
                                         const CallContext &ctx) override;

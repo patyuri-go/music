@@ -207,6 +207,23 @@ crow::json::wvalue artist_dto(const media_library::Artist &artist,
   return node;
 }
 
+crow::json::wvalue artist_info_dto(const media_library::ArtistInfo &info) {
+  crow::json::wvalue node;
+  if (!info.description.empty()) {
+    node["biography"] = info.description;
+  }
+  node["similarArtist"] = crow::json::wvalue::list{};
+  return node;
+}
+
+crow::json::wvalue album_info_dto(const media_library::AlbumInfo &info) {
+  crow::json::wvalue node;
+  if (!info.description.empty()) {
+    node["notes"] = info.description;
+  }
+  return node;
+}
+
 crow::json::wvalue playlist_dto(const media_library::Playlist &playlist,
                                 bool include_entries) {
   crow::json::wvalue node;

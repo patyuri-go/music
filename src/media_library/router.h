@@ -141,6 +141,10 @@ public:
   resolve_playback(const TrackRef &ref, const CallContext &ctx);
   Result<AspectResult<ArtworkRef>> resolve_artwork(const SourceRef &owner,
                                                    const CallContext &ctx);
+  Result<AspectResult<AlbumInfo>> resolve_album_info(const AlbumRef &ref,
+                                                     const CallContext &ctx);
+  Result<AspectResult<ArtistInfo>> resolve_artist_info(const SourceRef &ref,
+                                                       const CallContext &ctx);
 
   // ---- 5.3.4 多源聚合 ---------------------------------------------------
   // 支持 PageRequest::offset（每次从聚合流头部重放并跳过）与 next_cursor

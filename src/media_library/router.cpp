@@ -730,6 +730,36 @@ Result<AspectResult<ArtworkRef>> Router::resolve_artwork(const SourceRef &owner,
       });
 }
 
+Result<AspectResult<AlbumInfo>>
+Router::resolve_album_info(const AlbumRef &ref, const CallContext &ctx) {
+  return run_aspect<AlbumInfo>(
+      ref, Aspect::Metadata, ctx,
+      [](Library &library, const SourceRef &candidate,
+         const CallContext &call_ctx) -> Result<AlbumInfo> {
+        auto provider = library.capability<InfoProvider>();
+        if (!provider.has_value()) {
+          return Result<AlbumInfo>::failure(
+              Error::make(ErrorCode::Unsupported, "no info provider"));
+        }
+        return provider->get().get_album_info(candidate, call_ctx);
+      });
+}
+
+Result<AspectResult<ArtistInfo>>
+Router::resolve_artist_info(const SourceRef &ref, const CallContext &ctx) {
+  return run_aspect<ArtistInfo>(
+      ref, Aspect::Metadata, ctx,
+      [](Library &library, const SourceRef &candidate,
+         const CallContext &call_ctx) -> Result<ArtistInfo> {
+        auto provider = library.capability<InfoProvider>();
+        if (!provider.has_value()) {
+          return Result<ArtistInfo>::failure(
+              Error::make(ErrorCode::Unsupported, "no info provider"));
+        }
+        return provider->get().get_artist_info(candidate, call_ctx);
+      });
+}
+
 // ---------------------------------------------------------------------------
 // 5.3.4 多源聚合
 //

@@ -94,6 +94,11 @@ public:
   resolve_stream(const TrackRef &ref, const CallContext &ctx) = 0;
   virtual Result<Sourced<ArtworkRef>> resolve_artwork(const SourceRef &owner,
                                                       const CallContext &ctx) = 0;
+  // 信息（描述）也属 metadata 方面：顺序与 resolve_track 同一套。
+  virtual Result<Sourced<AlbumInfo>> resolve_album_info(const AlbumRef &ref,
+                                                        const CallContext &ctx) = 0;
+  virtual Result<Sourced<ArtistInfo>>
+  resolve_artist_info(const SourceRef &ref, const CallContext &ctx) = 0;
 
   // —— 聚合：查询条件，跨来源合并（5.3.4）
   // 不带关键词、只用筛选条件的“浏览”是它的参数形态，不另设方法。
@@ -138,6 +143,11 @@ public:
   resolve_stream(const TrackRef &ref, const CallContext &ctx) override;
   Result<Sourced<ArtworkRef>> resolve_artwork(const SourceRef &owner,
                                               const CallContext &ctx) override;
+  Result<Sourced<AlbumInfo>> resolve_album_info(const AlbumRef &ref,
+                                                const CallContext &ctx) override;
+  Result<Sourced<ArtistInfo>>
+  resolve_artist_info(const SourceRef &ref,
+                      const CallContext &ctx) override;
 
   Result<RoutedPage<SearchHit>> search(const SearchQuery &query,
                                        const CallContext &ctx) override;

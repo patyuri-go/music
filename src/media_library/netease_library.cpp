@@ -250,6 +250,7 @@ void NeteaseLibrary::initialize() {
   // 注册顺序与 LocalLibrary 一致：目录 → 搜索 → 播放 → 歌词 → 封面。
   register_capability<CatalogReader>(self);
   register_capability<Searcher>(self);
+  register_capability<InfoProvider>(self);
   register_capability<StreamResolver>(self);
   register_capability<LyricsProvider>(self);
   register_capability<ArtworkProvider>(self);
@@ -556,6 +557,82 @@ Result<Artist> NeteaseLibrary::get_artist(const ArtistRef &ref,
         Error::make(ErrorCode::NotFound, "netease artist not found"));
   }
   return R::success(artist_from_brief(artist.value()));
+}
+
+Result<AlbumInfo> NeteaseLibrary::get_album_info(const AlbumRef &ref,
+                                                 const CallContext &ctx) {
+  using R = Result<AlbumInfo>;
+  if (ref.entity_type != EntityType::Album || ref.library_id != library_id_) {
+    return R::failure(
+        Error::make(ErrorCode::InvalidRequest, "invalid album reference"));
+  }
+  const auto id = api_enhanced::parse_platform_id(ref.entity_id);
+  if (!id.ok()) {
+    return R::failure(id.error());
+  }
+
+  std::shared_ptr<api_enhanced::NeteaseClient> client;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    client = client_;
+  }
+  if (client == nullptr) {
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
+  }
+
+  auto album = client->album(id.value(), ctx);
+  if (!album.ok()) {
+    return R::failure(album.error());
+  }
+  if (album.value().brief.id <= 0) {
+    return R::failure(
+        Error::make(ErrorCode::NotFound, "netease album not found"));
+  }
+
+  AlbumInfo info;
+  info.ref = ref;
+  info.description = album.value().brief.description;
+  return R::success(std::move(info));
+}
+
+Result<ArtistInfo> NeteaseLibrary::get_artist_info(const SourceRef &ref,
+                                                   const CallContext &ctx) {
+  using R = Result<ArtistInfo>;
+  if ((ref.entity_type != EntityType::Artist &&
+       ref.entity_type != EntityType::AlbumArtist) ||
+      ref.library_id != library_id_) {
+    return R::failure(
+        Error::make(ErrorCode::InvalidRequest, "invalid artist reference"));
+  }
+  const auto id = api_enhanced::parse_platform_id(ref.entity_id);
+  if (!id.ok()) {
+    return R::failure(id.error());
+  }
+
+  std::shared_ptr<api_enhanced::NeteaseClient> client;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    client = client_;
+  }
+  if (client == nullptr) {
+    return R::failure(Error::make(ErrorCode::ProviderUnavailable,
+                                  "netease client is closed"));
+  }
+
+  auto artist = client->artist(id.value(), ctx);
+  if (!artist.ok()) {
+    return R::failure(artist.error());
+  }
+  if (artist.value().id <= 0) {
+    return R::failure(
+        Error::make(ErrorCode::NotFound, "netease artist not found"));
+  }
+
+  ArtistInfo info;
+  info.ref = ref;
+  info.description = artist.value().brief_desc;
+  return R::success(std::move(info));
 }
 
 Result<Page<Track>> NeteaseLibrary::list_album_tracks(const AlbumRef &ref,
