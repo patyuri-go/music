@@ -1,10 +1,20 @@
 #include "media_library/entity_link.h"
 
+#include "db.h"
+
+#include <SQLiteCpp/Database.h>
+#include <SQLiteCpp/Statement.h>
+#include <SQLiteCpp/Transaction.h>
+#include <sqlite3.h>
+
 #include <algorithm>
+#include <cstdint>
+#include <exception>
 #include <mutex>
 #include <shared_mutex>
-#include <unordered_map>
+#include <string>
 #include <unordered_set>
+#include <utility>
 
 namespace media_library {
 
@@ -71,8 +81,6 @@ bool aspect_accepts(Aspect aspect, EntityType type) noexcept {
 
 namespace {
 
-std::string ref_key(const SourceRef &ref) { return to_string(ref); }
-
 class AspectPriorityImpl final : public AspectPriority {
 public:
   std::vector<std::string> order(Aspect aspect) const override {
@@ -116,259 +124,710 @@ private:
   std::uint64_t revision_ = 0;
 };
 
-class EntityLinkResolverImpl final : public EntityLinkResolver {
-public:
-  EntityLinkResolverImpl(std::shared_ptr<AspectPriority> defaults,
-                         std::shared_ptr<BuiltinOrderSource> builtin)
-      : defaults_(std::move(defaults)), builtin_(std::move(builtin)) {}
+struct LocatedLink {
+  std::int64_t link_id = 0;
+  EntityType entity_type = EntityType::Track;
+};
 
-  Result<EntityLinkId>
-  link_of(const SourceRef &ref, const CallContext &) const override {
-    {
-      std::shared_lock lock(mutex_);
-      const auto it = link_of_ref_.find(ref_key(ref));
-      if (it != link_of_ref_.end()) {
-        return Result<EntityLinkId>::success(EntityLinkId{it->second});
+bool valid_ref(const SourceRef &ref) {
+  return !ref.library_id.empty() && !ref.entity_id.empty();
+}
+
+std::string aspect_text(Aspect aspect) {
+  return std::string(aspect_name(aspect));
+}
+
+std::string entity_type_text(EntityType type) {
+  return std::string(entity_type_name(type));
+}
+
+Error sqlite_error(const SQLite::Exception &error, const char *context) {
+  if (error.getErrorCode() == SQLITE_CONSTRAINT) {
+    return Error::make(ErrorCode::Conflict,
+                       std::string(context) + ": " + error.what());
+  }
+  return Error::make(ErrorCode::Internal,
+                     std::string(context) + ": " + error.what());
+}
+
+Error internal_error(const std::exception &error, const char *context) {
+  return Error::make(ErrorCode::Internal,
+                     std::string(context) + ": " + error.what());
+}
+
+std::optional<LocatedLink> locate_link(SQLite::Database &database,
+                                       const SourceRef &ref) {
+  SQLite::Statement statement(
+      database,
+      "SELECT l.link_id, l.entity_type "
+      "FROM entity_link_member m "
+      "JOIN entity_link l ON l.link_id = m.link_id "
+      "WHERE m.library_id = ? AND m.entity_type = ? AND m.entity_id = ?");
+  statement.bind(1, ref.library_id);
+  statement.bind(2, entity_type_text(ref.entity_type));
+  statement.bind(3, ref.entity_id);
+  if (!statement.executeStep()) {
+    return std::nullopt;
+  }
+  const std::optional<EntityType> type =
+      parse_entity_type(statement.getColumn(1).getString());
+  if (!type.has_value()) {
+    return std::nullopt;
+  }
+  LocatedLink located;
+  located.link_id = statement.getColumn(0).getInt64();
+  located.entity_type = *type;
+  return located;
+}
+
+std::vector<std::string> member_libraries(SQLite::Database &database,
+                                          std::int64_t link_id) {
+  SQLite::Statement statement(
+      database,
+      "SELECT library_id FROM entity_link_member "
+      "WHERE link_id = ? ORDER BY member_id");
+  statement.bind(1, link_id);
+  std::vector<std::string> libraries;
+  while (statement.executeStep()) {
+    libraries.push_back(statement.getColumn(0).getString());
+  }
+  return libraries;
+}
+
+LinkOverrides load_overrides(SQLite::Database &database,
+                             std::int64_t link_id) {
+  SQLite::Statement statement(
+      database,
+      "SELECT aspect, library_id FROM entity_link_override "
+      "WHERE link_id = ? ORDER BY aspect, position");
+  statement.bind(1, link_id);
+  LinkOverrides overrides;
+  while (statement.executeStep()) {
+    const std::optional<Aspect> aspect =
+        parse_aspect(statement.getColumn(0).getString());
+    if (!aspect.has_value()) {
+      continue;
+    }
+    overrides.order[*aspect].push_back(statement.getColumn(1).getString());
+  }
+  return overrides;
+}
+
+std::optional<Error>
+validate_overrides(const LinkOverrides &overrides,
+                   const std::unordered_set<std::string> &member_libraries) {
+  for (const auto &entry : overrides.order) {
+    std::unordered_set<std::string> seen;
+    for (const std::string &library_id : entry.second) {
+      if (library_id.empty()) {
+        return Error::make(ErrorCode::InvalidRequest,
+                           "override contains empty library_id");
+      }
+      if (!seen.insert(library_id).second) {
+        return Error::make(ErrorCode::InvalidRequest,
+                           "override contains duplicate library_id");
+      }
+      if (member_libraries.count(library_id) == 0) {
+        return Error::make(ErrorCode::InvalidRequest,
+                           "override references non-member library");
       }
     }
-    Error error = Error::make(ErrorCode::NotFound, "ref is not linked");
-    error.library_id = ref.library_id;
-    return Result<EntityLinkId>::failure(std::move(error));
+  }
+  return std::nullopt;
+}
+
+void insert_overrides(SQLite::Database &database, std::int64_t link_id,
+                      const LinkOverrides &overrides) {
+  for (const auto &entry : overrides.order) {
+    SQLite::Statement statement(
+        database,
+        "INSERT INTO entity_link_override"
+        "(link_id, aspect, library_id, position) VALUES(?, ?, ?, ?)");
+    int position = 0;
+    for (const std::string &library_id : entry.second) {
+      statement.bind(1, link_id);
+      statement.bind(2, aspect_text(entry.first));
+      statement.bind(3, library_id);
+      statement.bind(4, position);
+      statement.exec();
+      statement.reset();
+      ++position;
+    }
+  }
+}
+
+void touch_link(SQLite::Database &database, std::int64_t link_id) {
+  SQLite::Statement statement(
+      database,
+      "UPDATE entity_link SET updated_at = datetime('now','localtime') "
+      "WHERE link_id = ?");
+  statement.bind(1, link_id);
+  statement.exec();
+}
+
+class EntityLinkResolverImpl final : public EntityLinkResolver {
+public:
+  EntityLinkResolverImpl(std::string db_path,
+                         std::shared_ptr<AspectPriority> defaults,
+                         std::shared_ptr<BuiltinOrderSource> builtin)
+      : db_path_(std::move(db_path)), defaults_(std::move(defaults)),
+        builtin_(std::move(builtin)) {}
+
+  Result<EntityLinkView> find_link(const SourceRef &ref,
+                                   const CallContext &) const override {
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      SQLite::Transaction transaction(database,
+                                      SQLite::TransactionBehavior::DEFERRED);
+      const std::optional<LocatedLink> located = locate_link(database, ref);
+      if (!located.has_value()) {
+        return Result<EntityLinkView>::failure(
+            Error::make(ErrorCode::NotFound, "entity link not found"));
+      }
+
+      EntityLinkView view;
+      view.entity_type = located->entity_type;
+
+      SQLite::Statement head(
+          database,
+          "SELECT created_at, updated_at FROM entity_link WHERE link_id = ?");
+      head.bind(1, located->link_id);
+      if (!head.executeStep()) {
+        return Result<EntityLinkView>::failure(
+            Error::make(ErrorCode::NotFound, "entity link not found"));
+      }
+      view.created_at = head.getColumn(0).getString();
+      if (!head.getColumn(1).isNull()) {
+        view.updated_at = head.getColumn(1).getString();
+      }
+
+      SQLite::Statement members(
+          database,
+          "SELECT library_id, entity_type, entity_id, confidence, verified "
+          "FROM entity_link_member WHERE link_id = ? ORDER BY member_id");
+      members.bind(1, located->link_id);
+      while (members.executeStep()) {
+        const std::optional<EntityType> type =
+            parse_entity_type(members.getColumn(1).getString());
+        if (!type.has_value()) {
+          return Result<EntityLinkView>::failure(Error::make(
+              ErrorCode::Internal, "invalid entity_type in entity_link_member"));
+        }
+        LinkedRef item;
+        item.ref.library_id = members.getColumn(0).getString();
+        item.ref.entity_type = *type;
+        item.ref.entity_id = members.getColumn(2).getString();
+        item.confidence = members.getColumn(3).getString();
+        item.verified = members.getColumn(4).getInt() != 0;
+        view.refs.push_back(std::move(item));
+      }
+
+      view.overrides = load_overrides(database, located->link_id);
+      transaction.commit();
+      return Result<EntityLinkView>::success(std::move(view));
+    } catch (const SQLite::Exception &error) {
+      return Result<EntityLinkView>::failure(
+          sqlite_error(error, "find_link failed"));
+    } catch (const std::exception &error) {
+      return Result<EntityLinkView>::failure(
+          internal_error(error, "find_link failed"));
+    }
   }
 
   Result<std::vector<LinkedRef>>
-  refs_of(const EntityLinkId &link, const CallContext &) const override {
-    std::shared_lock lock(mutex_);
-    const auto it = links_.find(link.value);
-    if (it == links_.end()) {
-      Error error = Error::make(ErrorCode::NotFound, "link does not exist");
-      return Result<std::vector<LinkedRef>>::failure(std::move(error));
-    }
-    return Result<std::vector<LinkedRef>>::success(it->second.refs);
-  }
-
-  Status link(const std::vector<SourceRef> &refs,
-              const LinkOverrides &overrides,
-              const CallContext &) override {
-    if (refs.empty()) {
-      return Status::failure(Error::make(
-          ErrorCode::InvalidRequest, "cannot create a link without refs"));
-    }
-
-    // 同 link 语义必须一致；artist / album_artist 不能混。
-    const EntityType type = refs.front().entity_type;
-    std::unordered_set<std::string> seen;
-    for (const SourceRef &ref : refs) {
-      if (ref.library_id.empty() || ref.entity_id.empty()) {
-        return Status::failure(Error::make(
-            ErrorCode::InvalidRequest, "ref has empty library_id or entity_id"));
+  refs_of(const SourceRef &ref, const CallContext &) const override {
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      const std::optional<LocatedLink> located = locate_link(database, ref);
+      if (!located.has_value()) {
+        return Result<std::vector<LinkedRef>>::failure(
+            Error::make(ErrorCode::NotFound, "entity link not found"));
       }
-      if (ref.entity_type != type) {
-        return Status::failure(Error::make(
-            ErrorCode::InvalidRequest,
-            "all refs in one link must share the same entity_type"));
-      }
-      if (!seen.insert(ref_key(ref)).second) {
-        return Status::failure(
-            Error::make(ErrorCode::InvalidRequest, "duplicate ref in link"));
-      }
-    }
 
-    // 覆盖只能重排同一链接内已有的库。
-    std::unordered_set<std::string> libraries;
-    for (const SourceRef &ref : refs) {
-      libraries.insert(ref.library_id);
-    }
-    for (const auto &pair : overrides.order) {
-      for (const std::string &id : pair.second) {
-        if (libraries.count(id) == 0) {
-          return Status::failure(Error::make(
-              ErrorCode::InvalidRequest,
-              "override names a library that is not part of this link: " + id));
+      SQLite::Statement statement(
+          database,
+          "SELECT library_id, entity_type, entity_id, confidence, verified "
+          "FROM entity_link_member WHERE link_id = ? ORDER BY member_id");
+      statement.bind(1, located->link_id);
+      std::vector<LinkedRef> refs;
+      while (statement.executeStep()) {
+        const std::optional<EntityType> type =
+            parse_entity_type(statement.getColumn(1).getString());
+        if (!type.has_value()) {
+          return Result<std::vector<LinkedRef>>::failure(Error::make(
+              ErrorCode::Internal, "invalid entity_type in entity_link_member"));
         }
+        LinkedRef item;
+        item.ref.library_id = statement.getColumn(0).getString();
+        item.ref.entity_type = *type;
+        item.ref.entity_id = statement.getColumn(2).getString();
+        item.confidence = statement.getColumn(3).getString();
+        item.verified = statement.getColumn(4).getInt() != 0;
+        refs.push_back(std::move(item));
       }
+      return Result<std::vector<LinkedRef>>::success(std::move(refs));
+    } catch (const SQLite::Exception &error) {
+      return Result<std::vector<LinkedRef>>::failure(
+          sqlite_error(error, "refs_of failed"));
+    } catch (const std::exception &error) {
+      return Result<std::vector<LinkedRef>>::failure(
+          internal_error(error, "refs_of failed"));
     }
-
-    std::unique_lock lock(mutex_);
-    for (const SourceRef &ref : refs) {
-      const auto it = link_of_ref_.find(ref_key(ref));
-      if (it != link_of_ref_.end()) {
-        return Status::failure(Error::make(
-            ErrorCode::Conflict, "ref already belongs to another link"));
-      }
-    }
-
-    Link link_record;
-    link_record.id = "link-" + std::to_string(++next_id_);
-    for (const SourceRef &ref : refs) {
-      LinkedRef linked;
-      linked.ref = ref;
-      linked.confidence = "manual";
-      linked.verified = true;
-      link_record.refs.push_back(std::move(linked));
-      link_of_ref_[ref_key(ref)] = link_record.id;
-    }
-    link_record.overrides = overrides;
-    links_.emplace(link_record.id, std::move(link_record));
-    return Status::success();
-  }
-
-  Status unlink(const SourceRef &ref, const CallContext &) override {
-    std::unique_lock lock(mutex_);
-    const auto it = link_of_ref_.find(ref_key(ref));
-    if (it == link_of_ref_.end()) {
-      return Status::failure(
-          Error::make(ErrorCode::NotFound, "ref is not linked"));
-    }
-    const std::string link_id = it->second;
-    link_of_ref_.erase(it);
-
-    const auto link_it = links_.find(link_id);
-    if (link_it == links_.end()) {
-      return Status::success();
-    }
-    auto &refs = link_it->second.refs;
-    refs.erase(std::remove_if(refs.begin(), refs.end(),
-                              [&ref](const LinkedRef &item) {
-                                return item.ref == ref;
-                              }),
-               refs.end());
-    // 链接级覆盖的生命周期跟随 link：成员空了就整体丢弃，
-    // 覆盖也随之失效（5.3.3「覆盖生命周期跟随 link」）。
-    if (refs.size() < 2) {
-      if (!refs.empty()) {
-        link_of_ref_.erase(ref_key(refs.front().ref));
-      }
-      links_.erase(link_it);
-    }
-    return Status::success();
   }
 
   Result<LinkOverrides>
-  overrides_of(const EntityLinkId &link, const CallContext &) const override {
-    std::shared_lock lock(mutex_);
-    const auto it = links_.find(link.value);
-    if (it == links_.end()) {
-      Error error = Error::make(ErrorCode::NotFound, "link does not exist");
-      return Result<LinkOverrides>::failure(std::move(error));
+  overrides_of(const SourceRef &ref, const CallContext &) const override {
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      const std::optional<LocatedLink> located = locate_link(database, ref);
+      if (!located.has_value()) {
+        return Result<LinkOverrides>::failure(
+            Error::make(ErrorCode::NotFound, "entity link not found"));
+      }
+      return Result<LinkOverrides>::success(
+          load_overrides(database, located->link_id));
+    } catch (const SQLite::Exception &error) {
+      return Result<LinkOverrides>::failure(
+          sqlite_error(error, "overrides_of failed"));
+    } catch (const std::exception &error) {
+      return Result<LinkOverrides>::failure(
+          internal_error(error, "overrides_of failed"));
     }
-    return Result<LinkOverrides>::success(it->second.overrides);
   }
 
-  Status set_overrides(const EntityLinkId &link, const LinkOverrides &overrides,
-                       const CallContext &) override {
-    std::unique_lock lock(mutex_);
-    const auto it = links_.find(link.value);
-    if (it == links_.end()) {
-      return Status::failure(
-          Error::make(ErrorCode::NotFound, "link does not exist"));
+  Result<std::vector<EntityLinkSummary>>
+  list_links(std::optional<EntityType> type, int limit, int offset,
+             const CallContext &) const override {
+    if (limit < 1 || limit > 200 || offset < 0) {
+      return Result<std::vector<EntityLinkSummary>>::failure(Error::make(
+          ErrorCode::InvalidRequest, "invalid list_links limit or offset"));
     }
-    std::unordered_set<std::string> libraries;
-    for (const LinkedRef &item : it->second.refs) {
-      libraries.insert(item.ref.library_id);
-    }
-    for (const auto &pair : overrides.order) {
-      for (const std::string &id : pair.second) {
-        if (libraries.count(id) == 0) {
-          return Status::failure(Error::make(
-              ErrorCode::InvalidRequest,
-              "override names a library that is not part of this link: " + id));
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      const char *base_sql =
+          "SELECT l.link_id, l.entity_type, l.created_at, l.updated_at, "
+          "(SELECT COUNT(*) FROM entity_link_member c "
+          " WHERE c.link_id = l.link_id) AS member_count, "
+          "m.library_id, m.entity_type, m.entity_id "
+          "FROM entity_link l "
+          "JOIN entity_link_member m ON m.member_id = ("
+          "  SELECT MIN(x.member_id) FROM entity_link_member x "
+          "  WHERE x.link_id = l.link_id) ";
+      const std::string sql =
+          type.has_value()
+              ? std::string(base_sql) +
+                    "WHERE l.entity_type = ? ORDER BY l.link_id DESC "
+                    "LIMIT ? OFFSET ?"
+              : std::string(base_sql) +
+                    "ORDER BY l.link_id DESC LIMIT ? OFFSET ?";
+
+      SQLite::Statement statement(database, sql);
+      int index = 1;
+      if (type.has_value()) {
+        statement.bind(index++, entity_type_text(*type));
+      }
+      statement.bind(index++, limit);
+      statement.bind(index++, offset);
+
+      std::vector<EntityLinkSummary> summaries;
+      while (statement.executeStep()) {
+        const std::optional<EntityType> link_type =
+            parse_entity_type(statement.getColumn(1).getString());
+        const std::optional<EntityType> anchor_type =
+            parse_entity_type(statement.getColumn(6).getString());
+        if (!link_type.has_value() || !anchor_type.has_value()) {
+          return Result<std::vector<EntityLinkSummary>>::failure(
+              Error::make(ErrorCode::Internal, "invalid entity_type in link"));
         }
+        EntityLinkSummary summary;
+        summary.anchor.library_id = statement.getColumn(5).getString();
+        summary.anchor.entity_type = *anchor_type;
+        summary.anchor.entity_id = statement.getColumn(7).getString();
+        summary.entity_type = *link_type;
+        summary.member_count = statement.getColumn(4).getInt();
+        summary.created_at = statement.getColumn(2).getString();
+        if (!statement.getColumn(3).isNull()) {
+          summary.updated_at = statement.getColumn(3).getString();
+        }
+        summaries.push_back(std::move(summary));
+      }
+      return Result<std::vector<EntityLinkSummary>>::success(
+          std::move(summaries));
+    } catch (const SQLite::Exception &error) {
+      return Result<std::vector<EntityLinkSummary>>::failure(
+          sqlite_error(error, "list_links failed"));
+    } catch (const std::exception &error) {
+      return Result<std::vector<EntityLinkSummary>>::failure(
+          internal_error(error, "list_links failed"));
+    }
+  }
+
+  Status create_link(const std::vector<LinkedRef> &refs,
+                     const LinkOverrides &overrides,
+                     const CallContext &) override {
+    if (refs.size() < 2) {
+      return Status::failure(Error::make(
+          ErrorCode::InvalidRequest, "create_link requires at least 2 refs"));
+    }
+
+    const EntityType entity_type = refs.front().ref.entity_type;
+    std::unordered_set<std::string> seen_refs;
+    std::unordered_set<std::string> seen_libraries;
+    for (const LinkedRef &item : refs) {
+      if (!valid_ref(item.ref)) {
+        return Status::failure(Error::make(
+            ErrorCode::InvalidRequest, "ref contains empty library_id or entity_id"));
+      }
+      if (item.ref.entity_type != entity_type) {
+        return Status::failure(Error::make(
+            ErrorCode::InvalidRequest, "create_link refs have mixed entity_type"));
+      }
+      if (!seen_refs.insert(to_string(item.ref)).second) {
+        return Status::failure(Error::make(
+            ErrorCode::InvalidRequest, "create_link contains duplicate ref"));
+      }
+      if (!seen_libraries.insert(item.ref.library_id).second) {
+        return Status::failure(Error::make(
+            ErrorCode::InvalidRequest,
+            "create_link contains more than one ref from the same library"));
       }
     }
-    it->second.overrides = overrides;
-    return Status::success();
-  }
 
-  Status clear_overrides(const EntityLinkId &link, Aspect aspect,
-                         const CallContext &) override {
-    std::unique_lock lock(mutex_);
-    const auto it = links_.find(link.value);
-    if (it == links_.end()) {
-      return Status::failure(
-          Error::make(ErrorCode::NotFound, "link does not exist"));
+    if (const std::optional<Error> error =
+            validate_overrides(overrides, seen_libraries);
+        error.has_value()) {
+      return Status::failure(*error);
     }
-    it->second.overrides.order.erase(aspect);
-    return Status::success();
+
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      SQLite::Transaction transaction(database,
+                                      SQLite::TransactionBehavior::IMMEDIATE);
+
+      SQLite::Statement insert_link(
+          database, "INSERT INTO entity_link(entity_type) VALUES(?)");
+      insert_link.bind(1, entity_type_text(entity_type));
+      insert_link.exec();
+      const std::int64_t link_id = database.getLastInsertRowid();
+
+      SQLite::Statement insert_member(
+          database,
+          "INSERT INTO entity_link_member"
+          "(link_id, library_id, entity_type, entity_id, confidence, verified) "
+          "VALUES(?, ?, ?, ?, ?, ?)");
+      for (const LinkedRef &item : refs) {
+        insert_member.bind(1, link_id);
+        insert_member.bind(2, item.ref.library_id);
+        insert_member.bind(3, entity_type_text(item.ref.entity_type));
+        insert_member.bind(4, item.ref.entity_id);
+        insert_member.bind(5, item.confidence.empty() ? "manual"
+                                                      : item.confidence);
+        insert_member.bind(6, item.verified ? 1 : 0);
+        insert_member.exec();
+        insert_member.reset();
+      }
+
+      insert_overrides(database, link_id, overrides);
+      transaction.commit();
+      return Status::success();
+    } catch (const SQLite::Exception &error) {
+      return Status::failure(sqlite_error(error, "create_link failed"));
+    } catch (const std::exception &error) {
+      return Status::failure(internal_error(error, "create_link failed"));
+    }
   }
 
-  std::vector<std::string> effective_order(const EntityLinkId &link,
+  Status add_ref(const SourceRef &anchor, const LinkedRef &item,
+                 const CallContext &) override {
+    if (!valid_ref(item.ref)) {
+      return Status::failure(Error::make(
+          ErrorCode::InvalidRequest, "ref contains empty library_id or entity_id"));
+    }
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      SQLite::Transaction transaction(database,
+                                      SQLite::TransactionBehavior::IMMEDIATE);
+      const std::optional<LocatedLink> located = locate_link(database, anchor);
+      if (!located.has_value()) {
+        return Status::failure(
+            Error::make(ErrorCode::NotFound, "entity link not found"));
+      }
+      if (item.ref.entity_type != located->entity_type) {
+        return Status::failure(Error::make(
+            ErrorCode::InvalidRequest, "ref entity_type does not match link"));
+      }
+
+      SQLite::Statement existing(
+          database,
+          "SELECT link_id FROM entity_link_member "
+          "WHERE library_id = ? AND entity_type = ? AND entity_id = ?");
+      existing.bind(1, item.ref.library_id);
+      existing.bind(2, entity_type_text(item.ref.entity_type));
+      existing.bind(3, item.ref.entity_id);
+      if (existing.executeStep()) {
+        if (existing.getColumn(0).getInt64() == located->link_id) {
+          transaction.commit();
+          return Status::success();
+        }
+        return Status::failure(
+            Error::make(ErrorCode::Conflict, "ref belongs to another link"));
+      }
+
+      SQLite::Statement same_library(
+          database,
+          "SELECT 1 FROM entity_link_member WHERE link_id = ? AND library_id = ?");
+      same_library.bind(1, located->link_id);
+      same_library.bind(2, item.ref.library_id);
+      if (same_library.executeStep()) {
+        return Status::failure(Error::make(
+            ErrorCode::Conflict, "link already has a member from this library"));
+      }
+
+      SQLite::Statement insert_member(
+          database,
+          "INSERT INTO entity_link_member"
+          "(link_id, library_id, entity_type, entity_id, confidence, verified) "
+          "VALUES(?, ?, ?, ?, ?, ?)");
+      insert_member.bind(1, located->link_id);
+      insert_member.bind(2, item.ref.library_id);
+      insert_member.bind(3, entity_type_text(item.ref.entity_type));
+      insert_member.bind(4, item.ref.entity_id);
+      insert_member.bind(5, item.confidence.empty() ? "manual"
+                                                    : item.confidence);
+      insert_member.bind(6, item.verified ? 1 : 0);
+      insert_member.exec();
+
+      touch_link(database, located->link_id);
+      transaction.commit();
+      return Status::success();
+    } catch (const SQLite::Exception &error) {
+      return Status::failure(sqlite_error(error, "add_ref failed"));
+    } catch (const std::exception &error) {
+      return Status::failure(internal_error(error, "add_ref failed"));
+    }
+  }
+
+  Status remove_ref(const SourceRef &ref, const CallContext &) override {
+    if (!valid_ref(ref)) {
+      return Status::failure(Error::make(
+          ErrorCode::InvalidRequest, "ref contains empty library_id or entity_id"));
+    }
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      SQLite::Transaction transaction(database,
+                                      SQLite::TransactionBehavior::IMMEDIATE);
+      const std::optional<LocatedLink> located = locate_link(database, ref);
+      if (!located.has_value()) {
+        return Status::failure(
+            Error::make(ErrorCode::NotFound, "entity link not found"));
+      }
+
+      SQLite::Statement remove(
+          database,
+          "DELETE FROM entity_link_member "
+          "WHERE library_id = ? AND entity_type = ? AND entity_id = ?");
+      remove.bind(1, ref.library_id);
+      remove.bind(2, entity_type_text(ref.entity_type));
+      remove.bind(3, ref.entity_id);
+      remove.exec();
+      if (database.getChanges() == 0) {
+        return Status::failure(
+            Error::make(ErrorCode::NotFound, "entity link member not found"));
+      }
+
+      SQLite::Statement count(
+          database,
+          "SELECT COUNT(*) FROM entity_link_member WHERE link_id = ?");
+      count.bind(1, located->link_id);
+      if (!count.executeStep()) {
+        return Status::failure(
+            Error::make(ErrorCode::Internal, "failed to count link members"));
+      }
+      const int remaining = count.getColumn(0).getInt();
+
+      if (remaining < 2) {
+        SQLite::Statement remove_link(
+            database, "DELETE FROM entity_link WHERE link_id = ?");
+        remove_link.bind(1, located->link_id);
+        remove_link.exec();
+      } else {
+        touch_link(database, located->link_id);
+      }
+
+      transaction.commit();
+      return Status::success();
+    } catch (const SQLite::Exception &error) {
+      return Status::failure(sqlite_error(error, "remove_ref failed"));
+    } catch (const std::exception &error) {
+      return Status::failure(internal_error(error, "remove_ref failed"));
+    }
+  }
+
+  Status delete_link(const SourceRef &anchor, const CallContext &) override {
+    if (!valid_ref(anchor)) {
+      return Status::failure(Error::make(
+          ErrorCode::InvalidRequest, "ref contains empty library_id or entity_id"));
+    }
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      SQLite::Transaction transaction(database,
+                                      SQLite::TransactionBehavior::IMMEDIATE);
+      const std::optional<LocatedLink> located = locate_link(database, anchor);
+      if (!located.has_value()) {
+        return Status::failure(
+            Error::make(ErrorCode::NotFound, "entity link not found"));
+      }
+      SQLite::Statement remove_link(
+          database, "DELETE FROM entity_link WHERE link_id = ?");
+      remove_link.bind(1, located->link_id);
+      remove_link.exec();
+      transaction.commit();
+      return Status::success();
+    } catch (const SQLite::Exception &error) {
+      return Status::failure(sqlite_error(error, "delete_link failed"));
+    } catch (const std::exception &error) {
+      return Status::failure(internal_error(error, "delete_link failed"));
+    }
+  }
+
+  Status set_overrides(const SourceRef &anchor,
+                       const LinkOverrides &overrides,
+                       const CallContext &) override {
+    if (!valid_ref(anchor)) {
+      return Status::failure(Error::make(
+          ErrorCode::InvalidRequest, "ref contains empty library_id or entity_id"));
+    }
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      SQLite::Transaction transaction(database,
+                                      SQLite::TransactionBehavior::IMMEDIATE);
+      const std::optional<LocatedLink> located = locate_link(database, anchor);
+      if (!located.has_value()) {
+        return Status::failure(
+            Error::make(ErrorCode::NotFound, "entity link not found"));
+      }
+
+      const std::vector<std::string> libraries =
+          member_libraries(database, located->link_id);
+      const std::unordered_set<std::string> member_set(libraries.begin(),
+                                                       libraries.end());
+      if (const std::optional<Error> error =
+              validate_overrides(overrides, member_set);
+          error.has_value()) {
+        return Status::failure(*error);
+      }
+
+      SQLite::Statement clear(
+          database, "DELETE FROM entity_link_override WHERE link_id = ?");
+      clear.bind(1, located->link_id);
+      clear.exec();
+
+      insert_overrides(database, located->link_id, overrides);
+      touch_link(database, located->link_id);
+      transaction.commit();
+      return Status::success();
+    } catch (const SQLite::Exception &error) {
+      return Status::failure(sqlite_error(error, "set_overrides failed"));
+    } catch (const std::exception &error) {
+      return Status::failure(internal_error(error, "set_overrides failed"));
+    }
+  }
+
+  Status clear_overrides(const SourceRef &anchor, Aspect aspect,
+                         const CallContext &) override {
+    if (!valid_ref(anchor)) {
+      return Status::failure(Error::make(
+          ErrorCode::InvalidRequest, "ref contains empty library_id or entity_id"));
+    }
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      SQLite::Transaction transaction(database,
+                                      SQLite::TransactionBehavior::IMMEDIATE);
+      const std::optional<LocatedLink> located = locate_link(database, anchor);
+      if (!located.has_value()) {
+        return Status::failure(
+            Error::make(ErrorCode::NotFound, "entity link not found"));
+      }
+
+      SQLite::Statement clear(
+          database,
+          "DELETE FROM entity_link_override WHERE link_id = ? AND aspect = ?");
+      clear.bind(1, located->link_id);
+      clear.bind(2, aspect_text(aspect));
+      clear.exec();
+      touch_link(database, located->link_id);
+      transaction.commit();
+      return Status::success();
+    } catch (const SQLite::Exception &error) {
+      return Status::failure(sqlite_error(error, "clear_overrides failed"));
+    } catch (const std::exception &error) {
+      return Status::failure(internal_error(error, "clear_overrides failed"));
+    }
+  }
+
+  std::vector<std::string> effective_order(const SourceRef &anchor,
                                            Aspect aspect) const override {
-    std::shared_lock lock(mutex_);
-    const auto it = links_.find(link.value);
-    if (it == links_.end()) {
+    try {
+      SQLite::Database &database = db::conn(db_path_);
+      const std::optional<LocatedLink> located = locate_link(database, anchor);
+      if (!located.has_value()) {
+        return {};
+      }
+
+      const std::vector<std::string> available =
+          member_libraries(database, located->link_id);
+      if (available.empty()) {
+        return {};
+      }
+
+      std::vector<std::string> preferred;
+      SQLite::Statement statement(
+          database,
+          "SELECT library_id FROM entity_link_override "
+          "WHERE link_id = ? AND aspect = ? ORDER BY position");
+      statement.bind(1, located->link_id);
+      statement.bind(2, aspect_text(aspect));
+      while (statement.executeStep()) {
+        preferred.push_back(statement.getColumn(0).getString());
+      }
+
+      if (preferred.empty() && defaults_ != nullptr) {
+        preferred = defaults_->order(aspect);
+      }
+      if (preferred.empty() && builtin_ != nullptr) {
+        preferred = builtin_->order();
+      }
+
+      const std::unordered_set<std::string> available_set(available.begin(),
+                                                          available.end());
+      std::unordered_set<std::string> seen;
+      std::vector<std::string> result;
+      result.reserve(available.size());
+      for (const std::string &library_id : preferred) {
+        if (available_set.count(library_id) == 0) {
+          continue;
+        }
+        if (seen.insert(library_id).second) {
+          result.push_back(library_id);
+        }
+      }
+      for (const std::string &library_id : available) {
+        if (seen.insert(library_id).second) {
+          result.push_back(library_id);
+        }
+      }
+      return result;
+    } catch (const SQLite::Exception &) {
+      return {};
+    } catch (const std::exception &) {
       return {};
     }
-
-    // 该链接实际存在的库，按库 ID 收集。
-    std::vector<std::string> available;
-    for (const LinkedRef &item : it->second.refs) {
-      if (std::find(available.begin(), available.end(),
-                    item.ref.library_id) == available.end()) {
-        available.push_back(item.ref.library_id);
-      }
-    }
-
-    // 三级回落：链接覆盖 -> 全局默认 -> 内建顺序。
-    // 每级都拷贝成值，避免把指针指向容器内部元素。
-    std::vector<std::string> preferred;
-    bool has_preferred = false;
-
-    const auto override_it = it->second.overrides.order.find(aspect);
-    if (override_it != it->second.overrides.order.end()) {
-      preferred = override_it->second;
-      has_preferred = !preferred.empty();
-    }
-
-    if (!has_preferred && defaults_ != nullptr) {
-      preferred = defaults_->order(aspect);
-      has_preferred = !preferred.empty();
-    }
-
-    if (!has_preferred && builtin_ != nullptr) {
-      preferred = builtin_->order();
-      has_preferred = !preferred.empty();
-    }
-
-    // 按 preferred 排序，只保留该链接实际存在的库（不能引入 link 外来源）。
-    std::vector<std::string> result;
-    std::unordered_set<std::string> emitted;
-    if (has_preferred) {
-      for (const std::string &id : preferred) {
-        if (emitted.count(id) != 0) {
-          continue;
-        }
-        if (std::find(available.begin(), available.end(), id) ==
-            available.end()) {
-          continue;
-        }
-        emitted.insert(id);
-        result.push_back(id);
-      }
-    }
-    // 未列出的库追加末尾，仍然可候选（5.3.3）。
-    for (const std::string &id : available) {
-      if (emitted.count(id) == 0) {
-        emitted.insert(id);
-        result.push_back(id);
-      }
-    }
-    return result;
   }
 
 private:
-  struct Link {
-    std::string id;
-    std::vector<LinkedRef> refs;
-    LinkOverrides overrides;
-  };
-
-  mutable std::shared_mutex mutex_;
-  std::unordered_map<std::string, Link> links_;
-  std::unordered_map<std::string, std::string> link_of_ref_;
+  std::string db_path_;
   std::shared_ptr<AspectPriority> defaults_;
   std::shared_ptr<BuiltinOrderSource> builtin_;
-  int next_id_ = 0;
 };
 
 } // namespace
@@ -377,11 +836,11 @@ std::shared_ptr<AspectPriority> make_memory_aspect_priority() {
   return std::make_shared<AspectPriorityImpl>();
 }
 
-std::shared_ptr<EntityLinkResolver>
-make_memory_entity_link_resolver(std::shared_ptr<AspectPriority> defaults,
-                                 std::shared_ptr<BuiltinOrderSource> builtin) {
-  return std::make_shared<EntityLinkResolverImpl>(std::move(defaults),
-                                                  std::move(builtin));
+std::shared_ptr<EntityLinkResolver> make_sqlite_entity_link_resolver(
+    std::string db_path, std::shared_ptr<AspectPriority> defaults,
+    std::shared_ptr<BuiltinOrderSource> builtin) {
+  return std::make_shared<EntityLinkResolverImpl>(
+      std::move(db_path), std::move(defaults), std::move(builtin));
 }
 
 } // namespace media_library

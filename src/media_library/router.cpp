@@ -517,14 +517,8 @@ Router::candidates_for(const SourceRef &ref, Aspect aspect,
   }
 
   // 查不到映射 -> 退化为单源，就用调用方给的那个引用（不是错误）。
-  const Result<EntityLinkId> link = links_->link_of(ref, ctx);
+  const Result<EntityLinkView> link = links_->find_link(ref, ctx);
   if (!link.ok()) {
-    result.push_back(ref);
-    return result;
-  }
-
-  const Result<std::vector<LinkedRef>> refs = links_->refs_of(link.value(), ctx);
-  if (!refs.ok()) {
     result.push_back(ref);
     return result;
   }
@@ -532,7 +526,7 @@ Router::candidates_for(const SourceRef &ref, Aspect aspect,
   // 只保留同实体类型的引用：artist 与 album_artist 即使指向同一个底层
   // 艺术家也是不同 entity_type，不能落到同一个候选池。
   std::vector<SourceRef> pool;
-  for (const LinkedRef &item : refs.value()) {
+  for (const LinkedRef &item : link.value().refs) {
     if (item.ref.entity_type != ref.entity_type) {
       continue;
     }
@@ -557,7 +551,7 @@ Router::candidates_for(const SourceRef &ref, Aspect aspect,
 
   // 三级回落只在 resolver 的 effective_order 里算一次。
   const std::vector<std::string> order =
-      links_->effective_order(link.value(), aspect);
+      links_->effective_order(ref, aspect);
   for (const std::string &candidate_id : order) {
     if (usable_ids.count(candidate_id) == 0) {
       continue;
@@ -596,11 +590,11 @@ std::vector<std::string> Router::order_of(const SourceRef &ref,
     return {ref.library_id};
   }
   const CallContext ctx;
-  const Result<EntityLinkId> link = links_->link_of(ref, ctx);
+  const Result<EntityLinkView> link = links_->find_link(ref, ctx);
   if (!link.ok()) {
     return {ref.library_id};
   }
-  return links_->effective_order(link.value(), aspect);
+  return links_->effective_order(ref, aspect);
 }
 
 // 多源执行：按候选顺序逐个尝试；失败时只有 5.3.3 列出的错误才换下一个。

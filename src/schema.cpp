@@ -158,6 +158,40 @@ std::vector<std::string> createStatements() {
       "track_id INTEGER NOT NULL REFERENCES track(id) ON DELETE CASCADE,"
       "played_at TEXT DEFAULT (datetime('now','localtime')),"
       "seconds_played INTEGER)",
+      "CREATE TABLE IF NOT EXISTS entity_link("
+      "link_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+      "entity_type TEXT NOT NULL "
+      "CHECK(entity_type IN ('track','album','artist','album_artist','playlist')),"
+      "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),"
+      "updated_at TEXT,"
+      "UNIQUE(link_id, entity_type))",
+      "CREATE TABLE IF NOT EXISTS entity_link_member("
+      "member_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+      "link_id INTEGER NOT NULL,"
+      "library_id TEXT NOT NULL CHECK(length(library_id) > 0),"
+      "entity_type TEXT NOT NULL "
+      "CHECK(entity_type IN ('track','album','artist','album_artist','playlist')),"
+      "entity_id TEXT NOT NULL CHECK(length(entity_id) > 0),"
+      "confidence TEXT NOT NULL DEFAULT 'manual',"
+      "verified INTEGER NOT NULL DEFAULT 1 CHECK(verified IN (0,1)),"
+      "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),"
+      "updated_at TEXT,"
+      "UNIQUE(library_id, entity_type, entity_id),"
+      "UNIQUE(link_id, library_id),"
+      "FOREIGN KEY(link_id, entity_type) "
+      "REFERENCES entity_link(link_id, entity_type) ON DELETE CASCADE)",
+      "CREATE TABLE IF NOT EXISTS entity_link_override("
+      "link_id INTEGER NOT NULL,"
+      "aspect TEXT NOT NULL "
+      "CHECK(aspect IN ('metadata','lyrics','stream','artwork')),"
+      "library_id TEXT NOT NULL,"
+      "position INTEGER NOT NULL CHECK(position >= 0),"
+      "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),"
+      "updated_at TEXT,"
+      "PRIMARY KEY(link_id, aspect, library_id),"
+      "UNIQUE(link_id, aspect, position),"
+      "FOREIGN KEY(link_id, library_id) "
+      "REFERENCES entity_link_member(link_id, library_id) ON DELETE CASCADE)",
       "CREATE INDEX IF NOT EXISTS idx_track_album ON track(album_id, disc_no, track_no)",
       "CREATE INDEX IF NOT EXISTS idx_track_added ON track(added_at)",
       "CREATE INDEX IF NOT EXISTS idx_track_root ON track(root_id)",
@@ -166,6 +200,7 @@ std::vector<std::string> createStatements() {
       "CREATE INDEX IF NOT EXISTS idx_album_artist_album ON album_artist(album_id)",
       "CREATE INDEX IF NOT EXISTS idx_album_artist_artist ON album_artist(artist_id)",
       "CREATE INDEX IF NOT EXISTS idx_play_event_time ON play_event(played_at)",
+      "CREATE INDEX IF NOT EXISTS idx_entity_link_type ON entity_link(entity_type)",
   };
 }
 
@@ -246,7 +281,7 @@ void migrate(SQLite::Database &database) {
   }
 
   if (!hasVersion) {
-    database.exec("INSERT INTO schema_version(version) VALUES (9)");
+    database.exec("INSERT INTO schema_version(version) VALUES (10)");
     return;
   }
 
@@ -476,6 +511,12 @@ void migrate(SQLite::Database &database) {
     database.exec("DROP TABLE IF EXISTS entity_mapping");
     database.exec("UPDATE schema_version SET version = 9");
     version = 9;
+  }
+
+  if (version == 9) {
+    // 三张链接表已由 createStatements() 创建；这里只推进版本。
+    database.exec("UPDATE schema_version SET version = 10");
+    version = 10;
   }
 
   throw std::runtime_error("缺少从 schema 版本 " + std::to_string(version) +

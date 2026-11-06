@@ -910,7 +910,8 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   try {
     media_library::initialize_media_runtime(std::move(setups),
-                                            priority_orders);
+                                            priority_orders,
+                                            cfg.db_path.string());
   } catch (const std::exception &e) {
     std::cerr << "[fatal] 媒体库路由初始化失败: " << e.what() << std::endl;
     return 1;

@@ -53,15 +53,8 @@ struct PriorityOrder {
 // （本地优先 + 注册 priority）。未注册的 id 只警告不报错：被关闭的库留在
 // 配置里是正常情况。
 void initialize_media_runtime(std::vector<LibrarySetup> libraries,
-                              const std::vector<PriorityOrder> &orders);
-
-// 兼容旧调用：等价于只配置聚合（search）优先级。
-void initialize_media_runtime(std::vector<LibrarySetup> libraries,
-                              std::vector<std::string> aggregate_order = {});
-
-// 兼容旧调用（等价于只注册一个库）。
-void initialize_media_runtime(std::shared_ptr<Library> library,
-                              const MediaRuntimeOptions &options);
+                              const std::vector<PriorityOrder> &orders,
+                              std::string db_path);
 
 bool media_runtime_initialized() noexcept;
 

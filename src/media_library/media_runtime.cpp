@@ -39,7 +39,8 @@ Runtime &state() {
 } // namespace
 
 void initialize_media_runtime_impl(std::vector<LibrarySetup> libraries,
-                                   const std::vector<PriorityOrder> &orders) {
+                                   const std::vector<PriorityOrder> &orders,
+                                   const std::string &db_path) {
   if (libraries.empty()) {
     throw std::invalid_argument(
         "initialize_media_runtime: no library to register");
@@ -83,8 +84,9 @@ void initialize_media_runtime_impl(std::vector<LibrarySetup> libraries,
   // 方面优先级：留空即三层回落的内建顺序（本地优先，其次注册项 priority）。
   next.aspect_priority = make_memory_aspect_priority();
   // 内建兜底顺序从注册表现读，避免两处各存一份库清单。
-  next.links = make_memory_entity_link_resolver(
-      next.aspect_priority, make_registry_builtin_order(next.registry));
+  next.links = make_sqlite_entity_link_resolver(
+      db_path, next.aspect_priority,
+      make_registry_builtin_order(next.registry));
   next.aggregate_priority = make_memory_aggregate_priority();
   // 配置里的 library_priority 是优先级唯一出口：每个 aspect 一条顺序。
   // 未注册的 id 只警告不报错：被关闭的库（如 netease.enabled=false）留在
@@ -135,24 +137,9 @@ void initialize_media_runtime_impl(std::vector<LibrarySetup> libraries,
 }
 
 void initialize_media_runtime(std::vector<LibrarySetup> libraries,
-                              const std::vector<PriorityOrder> &orders) {
-  initialize_media_runtime_impl(std::move(libraries), orders);
-}
-
-void initialize_media_runtime(std::vector<LibrarySetup> libraries,
-                              std::vector<std::string> aggregate_order) {
-  std::vector<PriorityOrder> orders;
-  if (!aggregate_order.empty()) {
-    orders.push_back(PriorityOrder{"search", std::move(aggregate_order)});
-  }
-  initialize_media_runtime(std::move(libraries), orders);
-}
-
-void initialize_media_runtime(std::shared_ptr<Library> library,
-                              const MediaRuntimeOptions &options) {
-  std::vector<LibrarySetup> libraries;
-  libraries.push_back(LibrarySetup{std::move(library), options});
-  initialize_media_runtime(std::move(libraries));
+                              const std::vector<PriorityOrder> &orders,
+                              std::string db_path) {
+  initialize_media_runtime_impl(std::move(libraries), orders, db_path);
 }
 
 bool media_runtime_initialized() noexcept {

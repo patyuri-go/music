@@ -11,8 +11,8 @@ class Database;
 
 namespace schema {
 
-/// 当前 schema 版本（v4：scan_root 增加 user/pass 凭据）。
-inline constexpr int kVersion = 9;
+/// 当前 schema 版本（v10：新增跨库实体链接三张表）。
+inline constexpr int kVersion = 10;
 
 /// 自检时生成 IN 列表语句的最大长度（P1 暂未使用，保留）。
 inline constexpr std::size_t kMaxInList = 8;
