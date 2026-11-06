@@ -12,12 +12,12 @@ namespace jellyfin {
 // ---------------------------------------------------------------------------
 // 目录实体（曲目 / 专辑 / 艺术家）的对外 id
 //
-// 直接用 SourceRef 的规范字符串（`library_id:type:entity_id`）。entity_id 由
-// EntityStore 分配后永不变更、不回收，因此天然是稳定 id；且不依赖任何库的
-// 内部主键，远端 provider 也能给出可用的 id。
+// 直接用 SourceRef 的规范字符串（`library_id:type:entity_id`）。本地库的
+// entity_id 是数据库主键的十进制文本，远端库用平台自己的 id；门面不需要
+// 知道 id 的生成方式。
 //
-// 注意：`library_id` 与 `entity_id` 都会做百分号编码，而 `entity_id` 本身是
-// 十六进制，实际不会出现 '%'。客户端不得解析这个字符串，只能原样回传。
+// 注意：`library_id` 与 `entity_id` 都会做百分号编码。客户端不得解析这个
+// 字符串，只能原样回传。
 // ---------------------------------------------------------------------------
 std::string itemId(const media_library::SourceRef &ref);
 

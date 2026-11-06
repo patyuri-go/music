@@ -11,7 +11,7 @@ namespace media_library {
 // 进程内唯一的本地库对象。
 //
 // 5666 主服务和 9000 Jellyfin 兼容层必须共用同一个实例，避免各自加载
-// 一套元数据、各自维护一套 entity_mapping 缓存。
+// 一套元数据、各自维护一套库实例。
 //
 // 初始化只在 main() 启动阶段调用一次；初始化后保持只读，可被多个线程并发读取。
 void initialize_library(std::string library_id, std::string display_name,

@@ -15,9 +15,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <sstream>
+#include <system_error>
 #include <unordered_map>
 #include <optional>
 #include <unordered_set>
@@ -74,8 +76,7 @@ bool contains_name(const std::vector<AlbumArtistLink> &links,
 LocalLibrary::LocalLibrary(std::string library_id, std::string display_name,
                            std::string db_path)
     : library_id_(std::move(library_id)), display_name_(std::move(display_name)),
-      db_path_(std::move(db_path)),
-      entities_(library_id_, db_path_) {}
+      db_path_(std::move(db_path)) {}
 
 void LocalLibrary::initialize() {
   auto self = shared_from_this();
@@ -87,8 +88,6 @@ void LocalLibrary::initialize() {
   register_capability<LyricsProvider>(self);
   register_capability<ArtworkProvider>(self);
   register_capability<ArtworkBytes>(self);
-
-  entities_.backfill();
 }
 
 LibraryIdentity LocalLibrary::identity() const {
@@ -122,7 +121,7 @@ CapabilitySet LocalLibrary::capabilities() const {
 void LocalLibrary::close() noexcept {}
 
 SourceRef LocalLibrary::ref_for(EntityType type, int internal_id) {
-  return entities_.ref_for(type, internal_id);
+  return SourceRef{library_id_, type, std::to_string(internal_id)};
 }
 
 std::optional<SourceRef> LocalLibrary::ref_for_compat(EntityType type,
@@ -130,11 +129,31 @@ std::optional<SourceRef> LocalLibrary::ref_for_compat(EntityType type,
   if (internal_id <= 0) {
     return std::nullopt;
   }
-  return entities_.ref_for(type, internal_id);
+  return ref_for(type, internal_id);
 }
 
 std::optional<int> LocalLibrary::internal_id_of(const SourceRef &ref) const {
-  return entities_.internal_id_of(ref);
+  if (ref.library_id != library_id_ || ref.entity_id.empty()) {
+    return std::nullopt;
+  }
+  // 对外 id 就是本地库主键的十进制文本：只接受规范形式，避免同一实体
+  // 出现 "1" / "01" 两种引用。
+  if (ref.entity_id.size() > 1 && ref.entity_id.front() == '0') {
+    return std::nullopt;
+  }
+  for (const char c : ref.entity_id) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) {
+      return std::nullopt;
+    }
+  }
+  int value = 0;
+  const char *begin = ref.entity_id.data();
+  const char *end = begin + ref.entity_id.size();
+  const auto parsed = std::from_chars(begin, end, value);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || value <= 0) {
+    return std::nullopt;
+  }
+  return value;
 }
 
 std::vector<std::string> LocalLibrary::genres_of(int track_id) const {
@@ -161,7 +180,7 @@ std::optional<repo::Album> LocalLibrary::album_of(const repo::Track &row) const 
 
 Track LocalLibrary::build_track(const repo::Track &row) {
   Track track;
-  track.ref = entities_.ref_for(EntityType::Track, row.id);
+  track.ref = ref_for(EntityType::Track, row.id);
   track.title = row.title;
   track.duration_ms = row.duration_ms;
   track.track_no = row.track_no;
@@ -181,27 +200,27 @@ Track LocalLibrary::build_track(const repo::Track &row) {
   for (const int artist_id : row.artist_ids) {
     if (const auto artist = artists.byId(artist_id)) {
       track.artists.push_back(
-          ArtistLink{entities_.ref_for(EntityType::Artist, artist_id),
+          ArtistLink{ref_for(EntityType::Artist, artist_id),
                      artist->name});
     }
   }
 
   if (const auto album = album_of(row)) {
-    track.album = AlbumLink{entities_.ref_for(EntityType::Album, album->id),
+    track.album = AlbumLink{ref_for(EntityType::Album, album->id),
                             album->name};
     track.year = album->year;
     repo::AlbumRepo albums(db_path_);
     for (const int artist_id : albums.artistIdsByAlbumId(album->id)) {
       if (const auto artist = artists.byId(artist_id)) {
         track.album_artists.push_back(AlbumArtistLink{
-            entities_.ref_for(EntityType::AlbumArtist, artist_id),
+            ref_for(EntityType::AlbumArtist, artist_id),
             artist->name});
       }
     }
     const std::string cover = cover_path_of(track.ref);
     if (!cover.empty()) {
       track.artwork = ArtworkRef{
-          entities_.ref_for(EntityType::Album, album->id), "primary",
+          ref_for(EntityType::Album, album->id), "primary",
           std::nullopt, std::to_string(std::hash<std::string>{}(cover))};
     }
   }
@@ -219,7 +238,7 @@ Track LocalLibrary::build_track(const repo::Track &row) {
 
 Album LocalLibrary::build_album(const repo::Album &row) {
   Album album;
-  album.ref = entities_.ref_for(EntityType::Album, row.id);
+  album.ref = ref_for(EntityType::Album, row.id);
   album.title = row.name;
   album.year = row.year;
 
@@ -227,7 +246,7 @@ Album LocalLibrary::build_album(const repo::Album &row) {
   for (const int artist_id : row.artist_ids) {
     if (const auto artist = artists.byId(artist_id)) {
       album.artists.push_back(AlbumArtistLink{
-          entities_.ref_for(EntityType::AlbumArtist, artist_id),
+          ref_for(EntityType::AlbumArtist, artist_id),
           artist->name});
     }
   }
@@ -242,7 +261,7 @@ Album LocalLibrary::build_album(const repo::Album &row) {
 
 Artist LocalLibrary::build_artist(const repo::Artist &row) {
   Artist artist;
-  artist.ref = entities_.ref_for(EntityType::Artist, row.id);
+  artist.ref = ref_for(EntityType::Artist, row.id);
   artist.name = row.name;
   artist.sort_name = row.sort_name;
   const std::string cover = cover_path_of(artist.ref);
@@ -261,7 +280,7 @@ Result<Track> LocalLibrary::get_track(const TrackRef &ref,
     return Result<Track>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid track reference"));
   }
-  const auto internal_id = entities_.internal_id_of(ref);
+  const auto internal_id = internal_id_of(ref);
   if (!internal_id) {
     return Result<Track>::failure(
         Error::make(ErrorCode::NotFound, "track not found"));
@@ -282,7 +301,7 @@ Result<Album> LocalLibrary::get_album(const AlbumRef &ref,
     return Result<Album>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid album reference"));
   }
-  const auto internal_id = entities_.internal_id_of(ref);
+  const auto internal_id = internal_id_of(ref);
   if (!internal_id) {
     return Result<Album>::failure(
         Error::make(ErrorCode::NotFound, "album not found"));
@@ -303,7 +322,7 @@ Result<Artist> LocalLibrary::get_artist(const ArtistRef &ref,
     return Result<Artist>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid artist reference"));
   }
-  const auto internal_id = entities_.internal_id_of(ref);
+  const auto internal_id = internal_id_of(ref);
   if (!internal_id) {
     return Result<Artist>::failure(
         Error::make(ErrorCode::NotFound, "artist not found"));
@@ -325,7 +344,7 @@ Result<Page<Track>> LocalLibrary::list_album_tracks(const AlbumRef &ref,
     return Result<Page<Track>>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid album reference"));
   }
-  const auto internal_id = entities_.internal_id_of(ref);
+  const auto internal_id = internal_id_of(ref);
   if (!internal_id) {
     return Result<Page<Track>>::failure(
         Error::make(ErrorCode::NotFound, "album not found"));
@@ -352,7 +371,7 @@ Result<Page<Album>> LocalLibrary::list_artist_albums(const ArtistRef &ref,
     return Result<Page<Album>>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid artist reference"));
   }
-  const auto internal_id = entities_.internal_id_of(ref);
+  const auto internal_id = internal_id_of(ref);
   if (!internal_id) {
     return Result<Page<Album>>::failure(
         Error::make(ErrorCode::NotFound, "artist not found"));
@@ -478,7 +497,7 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
     return Result<PlaybackSource>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid track reference"));
   }
-  const auto internal_id = entities_.internal_id_of(ref);
+  const auto internal_id = internal_id_of(ref);
   if (!internal_id) {
     return Result<PlaybackSource>::failure(
         Error::make(ErrorCode::NotFound, "track not found"));
@@ -513,7 +532,7 @@ Result<Lyrics> LocalLibrary::get_lyrics(const TrackRef &ref,
     return Result<Lyrics>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid track reference"));
   }
-  const auto internal_id = entities_.internal_id_of(ref);
+  const auto internal_id = internal_id_of(ref);
   if (!internal_id) {
     return Result<Lyrics>::failure(
         Error::make(ErrorCode::NotFound, "track not found"));
@@ -542,7 +561,7 @@ Result<Lyrics> LocalLibrary::get_lyrics(const TrackRef &ref,
 
 std::string LocalLibrary::cover_path_of(const SourceRef &owner) const {
   SQLite::Database &database = db::conn(db_path_);
-  const auto internal_id = entities_.internal_id_of(owner);
+  const auto internal_id = internal_id_of(owner);
   if (!internal_id) {
     return {};
   }
@@ -717,7 +736,7 @@ CatalogSnapshot LocalLibrary::snapshot() {
       }
 
       Album album;
-      album.ref = entities_.ref_for(EntityType::Album, row.id);
+      album.ref = ref_for(EntityType::Album, row.id);
       album.title = row.name;
       album.year = row.year > 0 ? std::optional<int>(row.year) : std::nullopt;
       for (const int artist_id : row.artist_ids) {
@@ -726,11 +745,11 @@ CatalogSnapshot LocalLibrary::snapshot() {
           continue;
         }
         album.artists.push_back(AlbumArtistLink{
-            entities_.ref_for(EntityType::AlbumArtist, artist_id), name->second});
+            ref_for(EntityType::AlbumArtist, artist_id), name->second});
       }
       if (!row.cover_path.empty()) {
         album.artwork = ArtworkRef{
-            entities_.ref_for(EntityType::Album, row.id), "primary", std::nullopt,
+            ref_for(EntityType::Album, row.id), "primary", std::nullopt,
             std::to_string(std::hash<std::string>{}(row.cover_path))};
         album_cover_tag[row.id] = album.artwork->cache_tag;
       }
@@ -751,7 +770,7 @@ CatalogSnapshot LocalLibrary::snapshot() {
     while (query.executeStep()) {
       Artist artist;
       artist.ref =
-          entities_.ref_for(EntityType::Artist, query.getColumn(0).getInt());
+          ref_for(EntityType::Artist, query.getColumn(0).getInt());
       artist.name = query.getColumn(1).getText();
       artist.sort_name =
           query.getColumn(2).isNull() ? std::string() : query.getColumn(2).getText();
@@ -800,7 +819,7 @@ CatalogSnapshot LocalLibrary::snapshot() {
       }
 
       Track track;
-      track.ref = entities_.ref_for(EntityType::Track, row.id);
+      track.ref = ref_for(EntityType::Track, row.id);
       track.title = row.title;
       track.duration_ms = row.duration_ms > 0
                               ? std::optional<long long>(row.duration_ms)
@@ -830,7 +849,7 @@ CatalogSnapshot LocalLibrary::snapshot() {
           continue;
         }
         track.artists.push_back(ArtistLink{
-            entities_.ref_for(EntityType::Artist, artist_id), name->second});
+            ref_for(EntityType::Artist, artist_id), name->second});
       }
 
       if (row.album_id > 0) {
@@ -848,13 +867,13 @@ CatalogSnapshot LocalLibrary::snapshot() {
               continue;
             }
             track.album_artists.push_back(AlbumArtistLink{
-                entities_.ref_for(EntityType::AlbumArtist, artist_id),
+                ref_for(EntityType::AlbumArtist, artist_id),
                 name->second});
           }
         }
         if (const auto cover = album_cover_tag.find(row.album_id);
             cover != album_cover_tag.end()) {
-          track.artwork = ArtworkRef{entities_.ref_for(EntityType::Album,
+          track.artwork = ArtworkRef{ref_for(EntityType::Album,
                                                        row.album_id),
                                      "primary", std::nullopt, cover->second};
         }

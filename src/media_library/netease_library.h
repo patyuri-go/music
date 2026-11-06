@@ -18,7 +18,7 @@ namespace media_library {
 
 // 网易云媒体库对象。
 //
-// 与本地库的关键差异：没有 EntityStore。entity_id 就是平台 ID 的十进制
+// 与本地库的关键差异：没有库内映射。entity_id 就是平台 ID 的十进制
 // 文本（见 api/api-enhanced/ids.h），因此 internal_id_of 语义上不成立。
 //
 // 阶段分工：N1 落地身份/能力/健康；N2 打开只读目录、搜索与播放直链解析

@@ -166,19 +166,6 @@ std::vector<std::string> createStatements() {
       "CREATE INDEX IF NOT EXISTS idx_album_artist_album ON album_artist(album_id)",
       "CREATE INDEX IF NOT EXISTS idx_album_artist_artist ON album_artist(artist_id)",
       "CREATE INDEX IF NOT EXISTS idx_play_event_time ON play_event(played_at)",
-      "CREATE TABLE IF NOT EXISTS entity_mapping("
-      "library_id TEXT NOT NULL,"
-      "entity_type TEXT NOT NULL,"
-      "entity_id TEXT NOT NULL,"
-      "internal_id INTEGER NOT NULL,"
-      "state TEXT NOT NULL DEFAULT 'active',"
-      "confidence REAL,"
-      "created_at TEXT DEFAULT (datetime('now','localtime')),"
-      "updated_at TEXT,"
-      "PRIMARY KEY(library_id, entity_type, internal_id),"
-      "UNIQUE(library_id, entity_type, entity_id))",
-      "CREATE INDEX IF NOT EXISTS idx_entity_mapping_state ON "
-      "entity_mapping(library_id, entity_type, state)",
   };
 }
 
@@ -259,7 +246,7 @@ void migrate(SQLite::Database &database) {
   }
 
   if (!hasVersion) {
-    database.exec("INSERT INTO schema_version(version) VALUES (8)");
+    database.exec("INSERT INTO schema_version(version) VALUES (9)");
     return;
   }
 
@@ -481,7 +468,14 @@ void migrate(SQLite::Database &database) {
     // CREATE TABLE 已在 migrate 开始时执行；这里只推进版本。
     database.exec("UPDATE schema_version SET version = 8");
     version = 8;
-    return;
+  }
+
+  if (version == 8) {
+    // 库内映射表下线：对外 id 直接用本地库主键，远端用平台 id。
+    database.exec("DROP INDEX IF EXISTS idx_entity_mapping_state");
+    database.exec("DROP TABLE IF EXISTS entity_mapping");
+    database.exec("UPDATE schema_version SET version = 9");
+    version = 9;
   }
 
   throw std::runtime_error("缺少从 schema 版本 " + std::to_string(version) +

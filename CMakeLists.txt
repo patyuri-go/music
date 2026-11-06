@@ -20,7 +20,6 @@ add_executable(musicd
   ./src/http_util.cpp
   ./src/musicd.cpp
   ./src/media_library/source_ref.cpp
-  ./src/media_library/entity_store.cpp
   ./src/media_library/local_library.cpp
   ./src/media_library/library_runtime.cpp
   ./src/media_library/registry.cpp

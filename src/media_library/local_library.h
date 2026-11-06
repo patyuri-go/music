@@ -2,7 +2,6 @@
 #define MEDIA_LIBRARY_LOCAL_LIBRARY_H
 
 #include "media_library/domain.h"
-#include "media_library/entity_store.h"
 #include "media_library/library.h"
 #include "media_library/snapshot.h"
 
@@ -30,7 +29,7 @@ public:
   LocalLibrary(std::string library_id, std::string display_name,
                std::string db_path);
 
-  // 必须在 make_shared 之后调用：注册能力接口并补齐实体映射。
+  // 必须在 make_shared 之后调用：注册能力接口。
   void initialize();
 
   LibraryIdentity identity() const override;
@@ -116,7 +115,6 @@ private:
   std::string library_id_;
   std::string display_name_;
   std::string db_path_;
-  EntityStore entities_;
 };
 
 } // namespace media_library
