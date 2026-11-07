@@ -11,24 +11,58 @@
     <header id="header">
       <h1>Music Library</h1>
       <div id="header-actions">
-        <a id="editor-link" href="/web/html/root.html">File Editor</a>
+        <label class="opt">
+          <input type="checkbox" id="auto-fetch">
+          Auto fetch
+        </label>
+        <label class="opt">
+          Page size
+          <input type="number" id="page-size" value="10" min="1" max="200" step="1">
+        </label>
+        <button id="next-page">Next page</button>
         <button id="refresh-btn">Refresh</button>
       </div>
     </header>
 
     <div id="main">
+      <!-- 左侧两棵独立的全量树：各有自己的来源库选择器和搜索框。 -->
       <div id="sidebar">
-        <div id="tree-header">Album Artists</div>
-        <div id="tree-search">
-          <input type="text" id="search-box" placeholder="Search artists, albums, songs\u2026" autocomplete="off">
-        </div>
-        <ul id="tree"></ul>
-        <div id="tree-status"></div>
+        <section class="pane" data-pane="a">
+          <div class="pane-source">
+            <select id="source-a" title="Source library"></select>
+          </div>
+          <div class="pane-search">
+            <input type="text" id="search-a" placeholder="Search artists, albums, songs…" autocomplete="off">
+            <select id="type-a" title="Search type">
+              <option value="album">Album</option>
+              <option value="artist">Artist</option>
+              <option value="track">Track</option>
+            </select>
+          </div>
+          <ul class="pane-tree" id="tree-a"></ul>
+          <div class="pane-status" id="status-a"></div>
+        </section>
+
+        <section class="pane" data-pane="b">
+          <div class="pane-source">
+            <select id="source-b" title="Source library"></select>
+          </div>
+          <div class="pane-search">
+            <input type="text" id="search-b" placeholder="Search artists, albums, songs…" autocomplete="off">
+            <select id="type-b" title="Search type">
+              <option value="album">Album</option>
+              <option value="artist">Artist</option>
+              <option value="track">Track</option>
+            </select>
+          </div>
+          <ul class="pane-tree" id="tree-b"></ul>
+          <div class="pane-status" id="status-b"></div>
+        </section>
       </div>
 
       <div id="content">
         <div id="no-selection" class="placeholder">
-          Select an album artist, album or track
+          Select an artist, album or track (search first)
         </div>
         <div id="detail" class="hidden"></div>
       </div>

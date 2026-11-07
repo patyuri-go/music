@@ -27,6 +27,21 @@
 namespace media_library {
 namespace {
 
+// 搜索游标就是聚合流里的十进制偏移，与网易云库同一约定；空/非法一律当 0。
+int search_offset(const std::optional<std::string> &cursor) {
+  if (!cursor.has_value() || cursor->empty()) {
+    return 0;
+  }
+  int parsed = 0;
+  const char *begin = cursor->data();
+  const char *end = begin + cursor->size();
+  const auto result = std::from_chars(begin, end, parsed);
+  if (result.ec != std::errc() || result.ptr != end || parsed < 0) {
+    return 0;
+  }
+  return parsed;
+}
+
 std::string lower(std::string text) {
   std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
@@ -411,11 +426,20 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
   }
 
   const int limit = query.page.limit > 0 ? query.page.limit : 50;
+  // 三类命中按「专辑 -> 艺术家 -> 曲目」的固定顺序拼成一条结果流，所以
+  // 每类各取到 offset + limit + 1 条就够切片；窗口设上限，避免深偏移把
+  // 一次请求放大成整表扫描。
+  constexpr int kMaxWindow = 2000;
+  const int offset = search_offset(query.page.cursor);
+  if (offset >= kMaxWindow) {
+    return Result<Page<SearchHit>>::success(std::move(page));
+  }
+  const int want = std::min(offset + limit + 1, kMaxWindow);
   std::vector<SearchHit> hits;
 
   if (want_albums) {
     repo::AlbumRepo albums(db_path_);
-    for (const auto &row : albums.search(query.text, limit)) {
+    for (const auto &row : albums.search(query.text, want)) {
       const Album album = build_album(row);
       SearchHit hit;
       hit.kind = EntityType::Album;
@@ -432,7 +456,7 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
 
   if (want_artists) {
     repo::ArtistRepo artists(db_path_);
-    for (const auto &row : artists.search(query.text, limit)) {
+    for (const auto &row : artists.search(query.text, want)) {
       const Artist artist = build_artist(row);
       SearchHit hit;
       hit.kind = EntityType::Artist;
@@ -445,7 +469,7 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
 
   if (want_tracks) {
     repo::TrackRepo tracks(db_path_);
-    for (const auto &row : tracks.search(query.text, limit)) {
+    for (const auto &row : tracks.search(query.text, want)) {
       const Track track = build_track(row);
       if (!query.artists.empty()) {
         const bool match =
@@ -485,8 +509,17 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
     }
   }
 
-  page.items = std::move(hits);
-  page.has_more = false;
+  const int total = static_cast<int>(hits.size());
+  const int start = std::min(offset, total);
+  const int take = std::min(limit, total - start);
+  page.items.reserve(static_cast<std::size_t>(take));
+  for (int i = 0; i < take; ++i) {
+    page.items.push_back(std::move(hits[static_cast<std::size_t>(start + i)]));
+  }
+  page.has_more = total > start + take;
+  if (page.has_more) {
+    page.next_cursor = std::to_string(start + take);
+  }
   return Result<Page<SearchHit>>::success(std::move(page));
 }
 

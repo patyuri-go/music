@@ -323,6 +323,16 @@ crow::json::wvalue hit_json(const SearchHit &hit) {
                         : crow::json::wvalue(nullptr);
   out["artists"] = artist_links_json(hit.artists);
   out["album_artists"] = album_artist_links_json(hit.album_artists);
+  // 所属专辑：曲目命中靠它挂进「专辑艺术家 → 专辑 → 曲目」树；专辑命中
+  // 自身就是专辑节点，这里为 null，由调用方用 ref 顶替。
+  if (hit.album.has_value()) {
+    crow::json::wvalue album;
+    album["title"] = hit.album->title;
+    album["album"] = ref_json(hit.album->ref);
+    out["album"] = std::move(album);
+  } else {
+    out["album"] = nullptr;
+  }
   out["artwork"] = hit.artwork.has_value() ? artwork_json(*hit.artwork)
                                            : crow::json::wvalue(nullptr);
   out["duration_ms"] = hit.duration_ms.has_value()
