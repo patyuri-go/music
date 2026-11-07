@@ -443,3 +443,162 @@ body {
   overflow: auto;
   resize: vertical;
 }
+
+/* ------------------------------------------------ 左树多选与匹配面板 ---- */
+
+/* 多选命中与单选高亮区分：绿色系。 */
+.node-row.multi-selected {
+  background: #244a33;
+}
+
+.node-row.multi-selected:hover {
+  background: #2d5a3d;
+}
+
+/* 匹配面板：从右下角升起，占屏幕右半边，不遮住左侧 50vw 的树。 */
+#link-panel {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  width: 50vw;
+  max-height: 70vh;
+  background: #1c1c1c;
+  border-left: 1px solid #333;
+  border-top: 1px solid #333;
+  box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px 14px;
+  z-index: 50;
+  transform: translateY(105%);
+  transition: transform 0.22s ease;
+  pointer-events: none;
+}
+
+#link-panel.open {
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.link-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  color: #b0b0b0;
+}
+
+.link-panel-head strong {
+  color: #e0e0e0;
+  font-weight: 500;
+}
+
+#link-clear {
+  background: #333;
+  border: none;
+  color: #e0e0e0;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+#link-clear:hover {
+  background: #444;
+}
+
+.link-panel-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.link-field,
+.link-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #b0b0b0;
+  white-space: nowrap;
+}
+
+.link-field select {
+  background: #262626;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  color: #e0e0e0;
+  padding: 5px 8px;
+  font-size: 13px;
+  max-width: 220px;
+}
+
+.link-field select:focus {
+  outline: none;
+  border-color: #4a7a5a;
+}
+
+.link-check input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: #2f6f3f;
+}
+
+#link-start {
+  background: #2f6f3f;
+  border: none;
+  color: #f0f0f0;
+  padding: 6px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#link-start:hover:not(:disabled) {
+  background: #3a8550;
+}
+
+#link-start:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.link-log {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  background: #141414;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #c0c0c0;
+}
+
+.link-log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.link-log-line.ok {
+  color: #7fc98a;
+}
+
+.link-log-line.error {
+  color: #e08585;
+}
+
+.link-log-line.muted {
+  color: #8a8a8a;
+}
+
+.link-log-line.summary {
+  color: #e0c987;
+  font-weight: 500;
+}

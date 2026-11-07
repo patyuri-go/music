@@ -28,6 +28,22 @@ crow::response artist_albums(const crow::request &req, const std::string &ref);
 crow::response playlists(const crow::request &req);
 crow::response playlist(const crow::request &req, const std::string &ref);
 
+// 实体链接：以 SourceRef 为句柄，内部 link_id 不出进程。
+crow::response entity_link(const crow::request &req, const std::string &ref);
+crow::response entity_link_order(const crow::request &req,
+                                 const std::string &ref);
+crow::response entity_link_create(const crow::request &req);
+crow::response entity_link_delete(const crow::request &req,
+                                  const std::string &ref);
+crow::response entity_link_remove_member(const crow::request &req,
+                                         const std::string &anchor,
+                                         const std::string &member);
+crow::response entity_link_set_overrides(const crow::request &req,
+                                         const std::string &ref);
+crow::response entity_link_clear_override(const crow::request &req,
+                                          const std::string &ref,
+                                          const std::string &aspect);
+
 // 播放会话（7.1–7.4）：字节只从会话出，locator 不出进程。
 crow::response playback_open(const crow::request &req, const std::string &ref);
 crow::response playback_session(const crow::request &req,

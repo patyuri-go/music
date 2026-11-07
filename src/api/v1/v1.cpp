@@ -945,6 +945,327 @@ crow::response playlist(const crow::request &req, const std::string &ref_text) {
 }
 
 // ---------------------------------------------------------------------------
+// 实体链接（EntityLink）：以 SourceRef 为句柄，内部 link_id 不出进程。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+crow::json::wvalue linked_ref_json(const LinkedRef &item) {
+  crow::json::wvalue out;
+  out["ref"] = to_string(item.ref);
+  out["library_id"] = item.ref.library_id;
+  out["type"] = std::string(entity_type_name(item.ref.entity_type));
+  out["id"] = item.ref.entity_id;
+  out["confidence"] = item.confidence;
+  out["verified"] = item.verified;
+  return out;
+}
+
+crow::json::wvalue overrides_json(const LinkOverrides &overrides) {
+  crow::json::wvalue out = crow::json::wvalue::empty_object();
+  for (const auto &entry : overrides.order) {
+    crow::json::wvalue::list libraries;
+    libraries.reserve(entry.second.size());
+    for (const std::string &library_id : entry.second) {
+      libraries.emplace_back(library_id);
+    }
+    out[std::string(aspect_name(entry.first))] =
+        crow::json::wvalue(std::move(libraries));
+  }
+  return out;
+}
+
+crow::json::wvalue link_view_json(const EntityLinkView &view) {
+  crow::json::wvalue out;
+  out["entity_type"] = std::string(entity_type_name(view.entity_type));
+  crow::json::wvalue::list refs;
+  refs.reserve(view.refs.size());
+  for (const LinkedRef &item : view.refs) {
+    refs.push_back(linked_ref_json(item));
+  }
+  out["refs"] = std::move(refs);
+  out["overrides"] = overrides_json(view.overrides);
+  out["created_at"] = view.created_at;
+  out["updated_at"] = view.updated_at;
+  return out;
+}
+
+constexpr Aspect kAllAspects[] = {Aspect::Metadata, Aspect::Lyrics,
+                                  Aspect::Stream, Aspect::Artwork};
+
+std::string ref_of_library(const EntityLinkView &view,
+                           const std::string &library_id) {
+  for (const LinkedRef &item : view.refs) {
+    if (item.ref.library_id == library_id) {
+      return to_string(item.ref);
+    }
+  }
+  return std::string();
+}
+
+crow::json::wvalue order_json(EntityLinkResolver &resolver,
+                              const SourceRef &anchor,
+                              const EntityLinkView &view,
+                              const std::vector<Aspect> &aspects) {
+  crow::json::wvalue out = crow::json::wvalue::empty_object();
+  for (Aspect aspect : aspects) {
+    crow::json::wvalue::list entries;
+    for (const std::string &library_id :
+         resolver.effective_order(anchor, aspect)) {
+      crow::json::wvalue entry;
+      entry["library_id"] = library_id;
+      const std::string ref = ref_of_library(view, library_id);
+      if (!ref.empty()) {
+        entry["ref"] = ref;
+      }
+      entries.push_back(std::move(entry));
+    }
+    out[std::string(aspect_name(aspect))] =
+        crow::json::wvalue(std::move(entries));
+  }
+  return out;
+}
+
+std::optional<SourceRef> ref_from_body(const crow::json::rvalue &body,
+                                       const char *field) {
+  if (!body.has(field)) {
+    return std::nullopt;
+  }
+  const crow::json::rvalue &value = body[field];
+  if (value.t() != crow::json::type::String) {
+    return std::nullopt;
+  }
+  return parse_ref(std::string(value.s()));
+}
+
+std::optional<LinkOverrides> overrides_from_body(const crow::json::rvalue &body,
+                                                 std::string &error) {
+  if (!body.has("order")) {
+    error = "body requires an order object";
+    return std::nullopt;
+  }
+  const crow::json::rvalue &order = body["order"];
+  if (order.t() != crow::json::type::Object) {
+    error = "order must be an object";
+    return std::nullopt;
+  }
+  LinkOverrides overrides;
+  for (const std::string &name : order.keys()) {
+    const std::optional<Aspect> aspect = parse_aspect(name);
+    if (!aspect.has_value()) {
+      error = "unknown aspect: " + name;
+      return std::nullopt;
+    }
+    const crow::json::rvalue &values = order[name];
+    if (values.t() != crow::json::type::List) {
+      error = "aspect " + name + " must be a list of library ids";
+      return std::nullopt;
+    }
+    std::vector<std::string> libraries;
+    libraries.reserve(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      const crow::json::rvalue &value = values[i];
+      if (value.t() != crow::json::type::String) {
+        error = "aspect " + name + " must be a list of library ids";
+        return std::nullopt;
+      }
+      libraries.emplace_back(value.s());
+    }
+    overrides.order[*aspect] = std::move(libraries);
+  }
+  return overrides;
+}
+
+} // namespace
+
+crow::response entity_link(const crow::request &req,
+                           const std::string &ref_text) {
+  const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
+  if (resolver == nullptr) {
+    return unavailable();
+  }
+  const std::optional<SourceRef> ref = parse_ref_param(ref_text);
+  if (!ref.has_value()) {
+    return bad_ref();
+  }
+  Result<EntityLinkView> view = resolver->find_link(*ref, context_of(req));
+  if (!view.ok()) {
+    return fail(view.error());
+  }
+  return http_util::jsonResponse(200, link_view_json(view.value()).dump());
+}
+
+crow::response entity_link_order(const crow::request &req,
+                                 const std::string &ref_text) {
+  const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
+  if (resolver == nullptr) {
+    return unavailable();
+  }
+  const std::optional<SourceRef> ref = parse_ref_param(ref_text);
+  if (!ref.has_value()) {
+    return bad_ref();
+  }
+  Result<EntityLinkView> view = resolver->find_link(*ref, context_of(req));
+  if (!view.ok()) {
+    return fail(view.error());
+  }
+
+  std::vector<Aspect> aspects;
+  if (const std::optional<std::string> requested = text_param(req, "aspect");
+      requested.has_value()) {
+    const std::optional<Aspect> aspect = parse_aspect(*requested);
+    if (!aspect.has_value()) {
+      return invalid("unknown aspect: " + *requested);
+    }
+    if (!aspect_accepts(*aspect, view.value().entity_type)) {
+      return invalid("aspect not supported for this entity type");
+    }
+    aspects.push_back(*aspect);
+  } else {
+    for (Aspect aspect : kAllAspects) {
+      if (aspect_accepts(aspect, view.value().entity_type)) {
+        aspects.push_back(aspect);
+      }
+    }
+  }
+
+  crow::json::wvalue body;
+  body["order"] = order_json(*resolver, *ref, view.value(), aspects);
+  return http_util::jsonResponse(200, body.dump());
+}
+
+crow::response entity_link_create(const crow::request &req) {
+  const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
+  if (resolver == nullptr) {
+    return unavailable();
+  }
+  const crow::json::rvalue body = crow::json::load(req.body);
+  if (!body || body.t() != crow::json::type::Object) {
+    return invalid("body must be a JSON object");
+  }
+  const std::optional<SourceRef> a = ref_from_body(body, "a");
+  const std::optional<SourceRef> b = ref_from_body(body, "b");
+  if (!a.has_value() || !b.has_value()) {
+    return invalid("body requires string refs a and b");
+  }
+  const CallContext ctx = context_of(req);
+  const Status status = resolver->link(*a, *b, ctx);
+  if (!status.ok()) {
+    return fail(status.error());
+  }
+  Result<EntityLinkView> view = resolver->find_link(*a, ctx);
+  if (!view.ok()) {
+    return fail(view.error());
+  }
+  return http_util::jsonResponse(200, link_view_json(view.value()).dump());
+}
+
+crow::response entity_link_delete(const crow::request &req,
+                                  const std::string &ref_text) {
+  const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
+  if (resolver == nullptr) {
+    return unavailable();
+  }
+  const std::optional<SourceRef> ref = parse_ref_param(ref_text);
+  if (!ref.has_value()) {
+    return bad_ref();
+  }
+  const Status status = resolver->delete_link(*ref, context_of(req));
+  if (!status.ok()) {
+    return fail(status.error());
+  }
+  return crow::response(204);
+}
+
+crow::response entity_link_remove_member(const crow::request &req,
+                                         const std::string &anchor_text,
+                                         const std::string &member_text) {
+  const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
+  if (resolver == nullptr) {
+    return unavailable();
+  }
+  const std::optional<SourceRef> anchor = parse_ref_param(anchor_text);
+  const std::optional<SourceRef> member = parse_ref_param(member_text);
+  if (!anchor.has_value() || !member.has_value()) {
+    return bad_ref();
+  }
+  const CallContext ctx = context_of(req);
+  Result<EntityLinkView> view = resolver->find_link(*anchor, ctx);
+  if (!view.ok()) {
+    return fail(view.error());
+  }
+  const bool present =
+      std::any_of(view.value().refs.begin(), view.value().refs.end(),
+                  [&member](const LinkedRef &item) {
+                    return item.ref == *member;
+                  });
+  if (!present) {
+    return fail(Error::make(ErrorCode::NotFound, "member not found in link"));
+  }
+  const Status status = resolver->remove_ref(*member, ctx);
+  if (!status.ok()) {
+    return fail(status.error());
+  }
+  return crow::response(204);
+}
+
+crow::response entity_link_set_overrides(const crow::request &req,
+                                         const std::string &ref_text) {
+  const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
+  if (resolver == nullptr) {
+    return unavailable();
+  }
+  const std::optional<SourceRef> ref = parse_ref_param(ref_text);
+  if (!ref.has_value()) {
+    return bad_ref();
+  }
+  const crow::json::rvalue body = crow::json::load(req.body);
+  if (!body || body.t() != crow::json::type::Object) {
+    return invalid("body must be a JSON object");
+  }
+  std::string error;
+  const std::optional<LinkOverrides> overrides =
+      overrides_from_body(body, error);
+  if (!overrides.has_value()) {
+    return invalid(error);
+  }
+  const CallContext ctx = context_of(req);
+  const Status status = resolver->set_overrides(*ref, *overrides, ctx);
+  if (!status.ok()) {
+    return fail(status.error());
+  }
+  Result<LinkOverrides> applied = resolver->overrides_of(*ref, ctx);
+  if (!applied.ok()) {
+    return fail(applied.error());
+  }
+  crow::json::wvalue out;
+  out["overrides"] = overrides_json(applied.value());
+  return http_util::jsonResponse(200, out.dump());
+}
+
+crow::response entity_link_clear_override(const crow::request &req,
+                                          const std::string &ref_text,
+                                          const std::string &aspect_text) {
+  const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
+  if (resolver == nullptr) {
+    return unavailable();
+  }
+  const std::optional<SourceRef> ref = parse_ref_param(ref_text);
+  if (!ref.has_value()) {
+    return bad_ref();
+  }
+  const std::optional<Aspect> aspect = parse_aspect(aspect_text);
+  if (!aspect.has_value()) {
+    return invalid("unknown aspect: " + aspect_text);
+  }
+  const Status status = resolver->clear_overrides(*ref, *aspect, context_of(req));
+  if (!status.ok()) {
+    return fail(status.error());
+  }
+  return crow::response(204);
+}
+
+// ---------------------------------------------------------------------------
 // 播放会话（7.1–7.4）。字节只从会话出；locator 不出进程。
 // ---------------------------------------------------------------------------
 

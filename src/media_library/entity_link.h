@@ -84,15 +84,14 @@ public:
   list_links(std::optional<EntityType> type, int limit, int offset,
              const CallContext &ctx) const = 0;
 
-  // 创建链接。refs 至少 2 个，且每个 library_id 只能出现一次。
-  // 成功只返回 Status；调用方之后用任意成员 ref 定位该链接。
-  virtual Status create_link(const std::vector<LinkedRef> &refs,
-                             const LinkOverrides &overrides,
-                             const CallContext &ctx) = 0;
-
-  // 向 anchor 所属链接追加一个成员。
-  virtual Status add_ref(const SourceRef &anchor, const LinkedRef &ref,
-                         const CallContext &ctx) = 0;
+  // 统一入口：确保 a、b 属于同一个链接，调用方不需要区分创建和追加。
+  // - 两个 ref 都未链接：新建链接，成员为 a、b。
+  // - 其中一个已链接：把另一个追加进该链接。
+  // - 两个已在同一链接：幂等成功。
+  // - 两个分属不同链接：Conflict。
+  // 两个 ref 必须 entity_type 相同、library_id 不同（一个链接每库最多一个成员）。
+  virtual Status link(const SourceRef &a, const SourceRef &b,
+                      const CallContext &ctx) = 0;
 
   // 按 ref 移除成员；剩余少于 2 个时删除整个链接。
   virtual Status remove_ref(const SourceRef &ref,

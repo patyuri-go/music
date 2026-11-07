@@ -1070,6 +1070,39 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     return api_v1::playlist(req, ref);
   });
 
+  // ---- 实体链接：读写都以 SourceRef 为句柄，内部 link_id 不出进程 ----
+  CROW_ROUTE(app, "/api/v1/entity-links")
+      .methods("POST"_method)([](const crow::request &req) {
+        return api_v1::entity_link_create(req);
+      });
+  CROW_ROUTE(app, "/api/v1/entity-links/<string>")([](const crow::request &req,
+                                                      std::string ref) {
+    return api_v1::entity_link(req, ref);
+  });
+  CROW_ROUTE(app, "/api/v1/entity-links/<string>")
+      .methods("DELETE"_method)([](const crow::request &req,
+                                   std::string ref) {
+        return api_v1::entity_link_delete(req, ref);
+      });
+  CROW_ROUTE(app, "/api/v1/entity-links/<string>/order")
+      ([](const crow::request &req, std::string ref) {
+        return api_v1::entity_link_order(req, ref);
+      });
+  CROW_ROUTE(app, "/api/v1/entity-links/<string>/members/<string>")
+      .methods("DELETE"_method)([](const crow::request &req, std::string anchor,
+                                   std::string member) {
+        return api_v1::entity_link_remove_member(req, anchor, member);
+      });
+  CROW_ROUTE(app, "/api/v1/entity-links/<string>/overrides")
+      .methods("PUT"_method)([](const crow::request &req, std::string ref) {
+        return api_v1::entity_link_set_overrides(req, ref);
+      });
+  CROW_ROUTE(app, "/api/v1/entity-links/<string>/overrides/<string>")
+      .methods("DELETE"_method)([](const crow::request &req, std::string ref,
+                                   std::string aspect) {
+        return api_v1::entity_link_clear_override(req, ref, aspect);
+      });
+
   // ---- 播放会话：open / 查询 / 刷新 / 关闭 / 字节流 ----
   CROW_ROUTE(app, "/api/v1/playback/<string>")
       .methods("POST"_method)([](const crow::request &req, std::string ref) {

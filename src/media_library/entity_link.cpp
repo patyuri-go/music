@@ -265,6 +265,41 @@ void touch_link(SQLite::Database &database, std::int64_t link_id) {
   statement.exec();
 }
 
+std::int64_t insert_link_row(SQLite::Database &database,
+                             EntityType entity_type) {
+  SQLite::Statement statement(database,
+                              "INSERT INTO entity_link(entity_type) VALUES(?)");
+  statement.bind(1, entity_type_text(entity_type));
+  statement.exec();
+  return database.getLastInsertRowid();
+}
+
+void insert_member(SQLite::Database &database, std::int64_t link_id,
+                   const LinkedRef &item) {
+  SQLite::Statement statement(
+      database,
+      "INSERT INTO entity_link_member"
+      "(link_id, library_id, entity_type, entity_id, confidence, verified) "
+      "VALUES(?, ?, ?, ?, ?, ?)");
+  statement.bind(1, link_id);
+  statement.bind(2, item.ref.library_id);
+  statement.bind(3, entity_type_text(item.ref.entity_type));
+  statement.bind(4, item.ref.entity_id);
+  statement.bind(5, item.confidence.empty() ? "manual" : item.confidence);
+  statement.bind(6, item.verified ? 1 : 0);
+  statement.exec();
+}
+
+bool link_has_library(SQLite::Database &database, std::int64_t link_id,
+                      const std::string &library_id) {
+  SQLite::Statement statement(
+      database,
+      "SELECT 1 FROM entity_link_member WHERE link_id = ? AND library_id = ?");
+  statement.bind(1, link_id);
+  statement.bind(2, library_id);
+  return statement.executeStep();
+}
+
 class EntityLinkResolverImpl final : public EntityLinkResolver {
 public:
   EntityLinkResolverImpl(std::string db_path,
@@ -462,148 +497,64 @@ public:
     }
   }
 
-  Status create_link(const std::vector<LinkedRef> &refs,
-                     const LinkOverrides &overrides,
-                     const CallContext &) override {
-    if (refs.size() < 2) {
-      return Status::failure(Error::make(
-          ErrorCode::InvalidRequest, "create_link requires at least 2 refs"));
-    }
-
-    const EntityType entity_type = refs.front().ref.entity_type;
-    std::unordered_set<std::string> seen_refs;
-    std::unordered_set<std::string> seen_libraries;
-    for (const LinkedRef &item : refs) {
-      if (!valid_ref(item.ref)) {
-        return Status::failure(Error::make(
-            ErrorCode::InvalidRequest, "ref contains empty library_id or entity_id"));
-      }
-      if (item.ref.entity_type != entity_type) {
-        return Status::failure(Error::make(
-            ErrorCode::InvalidRequest, "create_link refs have mixed entity_type"));
-      }
-      if (!seen_refs.insert(to_string(item.ref)).second) {
-        return Status::failure(Error::make(
-            ErrorCode::InvalidRequest, "create_link contains duplicate ref"));
-      }
-      if (!seen_libraries.insert(item.ref.library_id).second) {
-        return Status::failure(Error::make(
-            ErrorCode::InvalidRequest,
-            "create_link contains more than one ref from the same library"));
-      }
-    }
-
-    if (const std::optional<Error> error =
-            validate_overrides(overrides, seen_libraries);
-        error.has_value()) {
-      return Status::failure(*error);
-    }
-
-    try {
-      SQLite::Database &database = db::conn(db_path_);
-      SQLite::Transaction transaction(database,
-                                      SQLite::TransactionBehavior::IMMEDIATE);
-
-      SQLite::Statement insert_link(
-          database, "INSERT INTO entity_link(entity_type) VALUES(?)");
-      insert_link.bind(1, entity_type_text(entity_type));
-      insert_link.exec();
-      const std::int64_t link_id = database.getLastInsertRowid();
-
-      SQLite::Statement insert_member(
-          database,
-          "INSERT INTO entity_link_member"
-          "(link_id, library_id, entity_type, entity_id, confidence, verified) "
-          "VALUES(?, ?, ?, ?, ?, ?)");
-      for (const LinkedRef &item : refs) {
-        insert_member.bind(1, link_id);
-        insert_member.bind(2, item.ref.library_id);
-        insert_member.bind(3, entity_type_text(item.ref.entity_type));
-        insert_member.bind(4, item.ref.entity_id);
-        insert_member.bind(5, item.confidence.empty() ? "manual"
-                                                      : item.confidence);
-        insert_member.bind(6, item.verified ? 1 : 0);
-        insert_member.exec();
-        insert_member.reset();
-      }
-
-      insert_overrides(database, link_id, overrides);
-      transaction.commit();
-      return Status::success();
-    } catch (const SQLite::Exception &error) {
-      return Status::failure(sqlite_error(error, "create_link failed"));
-    } catch (const std::exception &error) {
-      return Status::failure(internal_error(error, "create_link failed"));
-    }
-  }
-
-  Status add_ref(const SourceRef &anchor, const LinkedRef &item,
-                 const CallContext &) override {
-    if (!valid_ref(item.ref)) {
+  Status link(const SourceRef &a, const SourceRef &b,
+              const CallContext &) override {
+    if (!valid_ref(a) || !valid_ref(b)) {
       return Status::failure(Error::make(
           ErrorCode::InvalidRequest, "ref contains empty library_id or entity_id"));
     }
+    if (a == b) {
+      return Status::failure(Error::make(
+          ErrorCode::InvalidRequest, "link requires two different refs"));
+    }
+    if (a.entity_type != b.entity_type) {
+      return Status::failure(Error::make(
+          ErrorCode::InvalidRequest, "link refs have mixed entity_type"));
+    }
+    if (a.library_id == b.library_id) {
+      return Status::failure(Error::make(
+          ErrorCode::InvalidRequest,
+          "link requires refs from different libraries"));
+    }
     try {
       SQLite::Database &database = db::conn(db_path_);
       SQLite::Transaction transaction(database,
                                       SQLite::TransactionBehavior::IMMEDIATE);
-      const std::optional<LocatedLink> located = locate_link(database, anchor);
-      if (!located.has_value()) {
-        return Status::failure(
-            Error::make(ErrorCode::NotFound, "entity link not found"));
-      }
-      if (item.ref.entity_type != located->entity_type) {
-        return Status::failure(Error::make(
-            ErrorCode::InvalidRequest, "ref entity_type does not match link"));
-      }
 
-      SQLite::Statement existing(
-          database,
-          "SELECT link_id FROM entity_link_member "
-          "WHERE library_id = ? AND entity_type = ? AND entity_id = ?");
-      existing.bind(1, item.ref.library_id);
-      existing.bind(2, entity_type_text(item.ref.entity_type));
-      existing.bind(3, item.ref.entity_id);
-      if (existing.executeStep()) {
-        if (existing.getColumn(0).getInt64() == located->link_id) {
-          transaction.commit();
-          return Status::success();
+      const std::optional<LocatedLink> link_a = locate_link(database, a);
+      const std::optional<LocatedLink> link_b = locate_link(database, b);
+
+      if (link_a.has_value() && link_b.has_value()) {
+        if (link_a->link_id != link_b->link_id) {
+          return Status::failure(Error::make(
+              ErrorCode::Conflict, "refs belong to different links"));
         }
-        return Status::failure(
-            Error::make(ErrorCode::Conflict, "ref belongs to another link"));
+        transaction.commit();
+        return Status::success();
       }
 
-      SQLite::Statement same_library(
-          database,
-          "SELECT 1 FROM entity_link_member WHERE link_id = ? AND library_id = ?");
-      same_library.bind(1, located->link_id);
-      same_library.bind(2, item.ref.library_id);
-      if (same_library.executeStep()) {
+      if (!link_a.has_value() && !link_b.has_value()) {
+        const std::int64_t link_id = insert_link_row(database, a.entity_type);
+        insert_member(database, link_id, LinkedRef{a, "", false});
+        insert_member(database, link_id, LinkedRef{b, "", false});
+        transaction.commit();
+        return Status::success();
+      }
+
+      const LocatedLink &located = link_a.has_value() ? *link_a : *link_b;
+      const SourceRef &incoming = link_a.has_value() ? b : a;
+      if (link_has_library(database, located.link_id, incoming.library_id)) {
         return Status::failure(Error::make(
             ErrorCode::Conflict, "link already has a member from this library"));
       }
-
-      SQLite::Statement insert_member(
-          database,
-          "INSERT INTO entity_link_member"
-          "(link_id, library_id, entity_type, entity_id, confidence, verified) "
-          "VALUES(?, ?, ?, ?, ?, ?)");
-      insert_member.bind(1, located->link_id);
-      insert_member.bind(2, item.ref.library_id);
-      insert_member.bind(3, entity_type_text(item.ref.entity_type));
-      insert_member.bind(4, item.ref.entity_id);
-      insert_member.bind(5, item.confidence.empty() ? "manual"
-                                                    : item.confidence);
-      insert_member.bind(6, item.verified ? 1 : 0);
-      insert_member.exec();
-
-      touch_link(database, located->link_id);
+      insert_member(database, located.link_id, LinkedRef{incoming, "", false});
+      touch_link(database, located.link_id);
       transaction.commit();
       return Status::success();
     } catch (const SQLite::Exception &error) {
-      return Status::failure(sqlite_error(error, "add_ref failed"));
+      return Status::failure(sqlite_error(error, "link failed"));
     } catch (const std::exception &error) {
-      return Status::failure(internal_error(error, "add_ref failed"));
+      return Status::failure(internal_error(error, "link failed"));
     }
   }
 

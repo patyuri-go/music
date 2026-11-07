@@ -100,7 +100,8 @@ function makeNode(type, id, label, count) {
     e.stopPropagation();
     toggleNode(li);
   };
-  row.onclick = () => {
+  row.onclick = (e) => {
+    if (window.LinkSelect && window.LinkSelect.onRowClick(li, e)) return;
     selectNode(li);
     if (type !== 'track') toggleNode(li);
   };

@@ -69,6 +69,28 @@
     </div>
   </div>
 
+  <!-- 左树多选后从右下方弹出；固定占屏幕右半边，不遮挡左侧树。 -->
+  <div id="link-panel" aria-hidden="true">
+    <div class="link-panel-head">
+      <strong id="link-selected-count">已选 0 项</strong>
+      <button id="link-clear" type="button" title="Clear selection">×</button>
+    </div>
+    <div class="link-panel-controls">
+      <label class="link-field">
+        目标媒体库
+        <select id="link-target"></select>
+      </label>
+      <label class="link-check">
+        <input type="checkbox" id="link-auto-fetch">
+        Auto fetch
+      </label>
+      <button id="link-start" type="button">开始匹配</button>
+    </div>
+    <div id="link-log" class="link-log"></div>
+  </div>
+
   <script src="/web/js/library.js"></script>
+  <script src="/web/js/link-select.js"></script>
+  <script src="/web/js/link-match.js"></script>
 </body>
 </html>
