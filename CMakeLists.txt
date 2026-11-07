@@ -33,7 +33,9 @@ add_executable(musicd
   ./src/media_library/artwork.cpp
   ./src/media_library/netease_library.cpp
   ./src/media_library/lyric_parser.cpp
+  ./src/tools/lyrics_ttml.cpp
   ./src/media_library/playlist_directory.cpp
+  ./src/tools/amll_ttml.cpp
   ./src/stream_http.cpp
   ./src/api/subsonic/subsonic.cpp
   ./src/api/subsonic/access_log.cpp
@@ -60,7 +62,7 @@ set_target_properties(musicd PROPERTIES
 
 target_compile_options(musicd PRIVATE -g)
 
-target_link_libraries(musicd PRIVATE Crow SQLiteCpp tag OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(musicd PRIVATE Crow SQLiteCpp tag pugixml OpenSSL::SSL OpenSSL::Crypto)
 
 # TagLib 的 CMake 目标只导出 INSTALL_INTERFACE 路径，不传播 build-tree include。
 # 需手动补充三层：
@@ -126,5 +128,18 @@ target_include_directories(artists_test PRIVATE
 target_compile_definitions(artists_test PRIVATE ASIO_STANDALONE)
 target_link_libraries(artists_test PRIVATE tag)
 set_target_properties(artists_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
+)
+
+# AMLL TTML 正反解析测试：只依赖 pugixml，不需要 TagLib / Crow。
+add_executable(amll_ttml_test
+  ./test/amll_ttml_test.cpp
+  ./src/tools/amll_ttml.cpp
+)
+target_include_directories(amll_ttml_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(amll_ttml_test PRIVATE pugixml)
+set_target_properties(amll_ttml_test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )

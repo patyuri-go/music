@@ -13,6 +13,7 @@
 #include "api/subsonic/subsonic.h"
 #include "media_library/error.h"
 #include "media_library/library_runtime.h"
+#include "tools/lyrics_ttml.h"
 #include "media_library/media_runtime.h"
 #include "media_library/netease_library.h"
 #include "stream_http.h"
@@ -1840,7 +1841,21 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     const auto lyrics = media_library::media_router().resolve_lyrics(*ref, {});
     if (lyrics.ok()) {
       const auto &value = lyrics.value().value;
-      out["text"] = value.plain_text.value_or(std::string());
+      media_library::LyricsTtmlMeta meta;
+      const auto track =
+          media_library::media_router().resolve_track(*ref, {});
+      if (track.ok()) {
+        const media_library::Track &info = track.value().value;
+        meta.music_name = info.title;
+        if (info.album.has_value()) {
+          meta.album = info.album->title;
+        }
+        for (const media_library::ArtistLink &artist : info.artists) {
+          meta.artists.push_back(artist.name);
+        }
+        meta.duration_ms = info.duration_ms;
+      }
+      out["text"] = media_library::lyrics_to_ttml(value, meta);
       out["synced"] = value.mode != media_library::LyricsMode::Unsynced;
     }
     return jsonResponse(200, out.dump());
