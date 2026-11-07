@@ -527,7 +527,8 @@ body {
   white-space: nowrap;
 }
 
-.link-field select {
+.link-field select,
+.link-field input[type="number"] {
   background: #262626;
   border: 1px solid #3a3a3a;
   border-radius: 4px;
@@ -537,7 +538,13 @@ body {
   max-width: 220px;
 }
 
-.link-field select:focus {
+.link-field input[type="number"] {
+  width: 64px;
+  max-width: 64px;
+}
+
+.link-field select:focus,
+.link-field input[type="number"]:focus {
   outline: none;
   border-color: #4a7a5a;
 }
@@ -563,6 +570,49 @@ body {
 }
 
 #link-start:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 左树 1 个曲目 + 右树 1 个曲目时出现的直接链接按钮。 */
+#link-direct {
+  background: #35506f;
+  border: none;
+  color: #f0f0f0;
+  padding: 6px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#link-direct:hover:not(:disabled) {
+  background: #40628a;
+}
+
+#link-direct:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+#link-direct[hidden] {
+  display: none;
+}
+
+#link-delete {
+  background: #6b2f2f;
+  border: none;
+  color: #f0f0f0;
+  padding: 6px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#link-delete:hover:not(:disabled) {
+  background: #8a3c3c;
+}
+
+#link-delete:disabled {
   opacity: 0.55;
   cursor: default;
 }

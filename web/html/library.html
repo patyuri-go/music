@@ -80,11 +80,19 @@
         目标媒体库
         <select id="link-target"></select>
       </label>
+      <label class="link-field">
+        搜索条数
+        <input id="link-limit" type="number" min="1" max="200" step="1" value="10">
+      </label>
       <label class="link-check">
         <input type="checkbox" id="link-auto-fetch">
         Auto fetch
       </label>
       <button id="link-start" type="button">开始匹配</button>
+      <button id="link-direct" type="button" hidden
+              title="左树 1 个曲目 + 右树 1 个曲目时直接建立链接">直接链接</button>
+      <button id="link-delete" type="button"
+              title="递归删除所选项目下所有曲目已有的链接">批量删除链接</button>
     </div>
     <div id="link-log" class="link-log"></div>
   </div>

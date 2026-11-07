@@ -1,7 +1,7 @@
 // 递归 + 匹配 + 调链接接口。匹配规则：
 // 目标库曲目前 10 条里，标题、专辑归一化后全等，且至少一个艺术家名相同。
 (function () {
-  const SEARCH_LIMIT = 10;
+  const DEFAULT_SEARCH_LIMIT = 10;
 
   function norm(value) {
     return String(value == null ? '' : value)
@@ -20,9 +20,28 @@
     return hit.ref && hit.ref.ref ? hit.ref.ref : '';
   }
 
+  // 数组元素可能是接口返回的 {name, ...}，也可能是已提取好的名字字符串
+  // （start() 里构造的 source 就是后者），两种都要能取出名字。
+  function nameOf(entry) {
+    if (typeof entry === 'string') return entry.trim();
+    return (entry && entry.name) || '';
+  }
+
   function artistNames(entry) {
     const list = entry && Array.isArray(entry.artists) ? entry.artists : [];
-    return list.map(a => (a && a.name) || '').filter(Boolean);
+    return list.map(nameOf).filter(Boolean);
+  }
+
+  function albumArtistNames(entry) {
+    const list =
+      entry && Array.isArray(entry.album_artists) ? entry.album_artists : [];
+    return list.map(nameOf).filter(Boolean);
+  }
+
+  // 搜索串和比对优先用专辑艺术家；平台/曲目没有时回退到曲目艺术家。
+  function matchArtistNames(entry) {
+    const albumArtists = albumArtistNames(entry);
+    return albumArtists.length > 0 ? albumArtists : artistNames(entry);
   }
 
   function nodeOf(ref) {
@@ -107,27 +126,28 @@
     return refs;
   }
 
-  async function searchTracks(libraryId, query) {
+  async function searchTracks(libraryId, query, limit) {
     const url = `/api/v1/search?q=${encodeURIComponent(query)}` +
-      `&types=track&limit=${SEARCH_LIMIT}` +
+      `&types=track&limit=${limit}` +
       `&library_id=${encodeURIComponent(libraryId)}`;
     const page = v1Page(await api(url));
     return page.hits
       .filter(hit => (hit.kind || 'track') === 'track')
-      .slice(0, SEARCH_LIMIT);
+      .slice(0, limit);
   }
 
   function fieldsMatch(source, hit) {
     const candidateAlbum = hit.album ? hit.album.title : '';
     if (norm(source.title) !== norm(hit.title)) return false;
     if (norm(source.album) !== norm(candidateAlbum)) return false;
-    const candidateArtists = artistNames(hit);
-    if (candidateArtists.length === 0 || source.artists.length === 0) {
+    const candidateArtists = matchArtistNames(hit);
+    const sourceArtists = matchArtistNames(source);
+    if (candidateArtists.length === 0 || sourceArtists.length === 0) {
       return false;
     }
     // 多艺术家只要有一个能对上就算相同。
     return candidateArtists.some(candidate =>
-      source.artists.some(artist => norm(artist) === norm(candidate)));
+      sourceArtists.some(artist => norm(artist) === norm(candidate)));
   }
 
   async function linkPair(sourceRef, targetRef) {
@@ -138,15 +158,15 @@
     });
   }
 
-  async function matchTrack(source, targetLibrary) {
+  async function matchTrack(source, targetLibrary, limit) {
     const composite =
-      `${source.title} - ${source.artists.join('; ')} - ${source.album}`;
-    let hits = await searchTracks(targetLibrary, composite);
+      `${source.title} - ${matchArtistNames(source).join('; ')} - ${source.album}`;
+    let hits = await searchTracks(targetLibrary, composite, limit);
     let query = composite;
     if (hits.length === 0) {
       // 本地库只按标题 LIKE，拼接串必然搜不到，退回标题再试一次。
       query = source.title;
-      hits = await searchTracks(targetLibrary, query);
+      hits = await searchTracks(targetLibrary, query, limit);
     }
     for (const hit of hits) {
       if (refOfHit(hit) === source.ref) continue;
@@ -167,11 +187,14 @@
       return;
     }
     const autoFetch = LinkSelect.autoFetch();
+    const limit = LinkSelect.searchLimit
+      ? LinkSelect.searchLimit()
+      : DEFAULT_SEARCH_LIMIT;
     LinkSelect.clearLog();
     LinkSelect.setBusy(true);
     LinkSelect.log(
       `开始：${nodes.length} 个选中项，目标库 ${LinkSelect.targetLabel() || targetLibrary}，` +
-      `Auto fetch ${autoFetch ? '开' : '关'}`);
+      `Auto fetch ${autoFetch ? '开' : '关'}，搜索条数 ${limit}`);
 
     let linked = 0;
     let unmatched = 0;
@@ -203,19 +226,21 @@
           ref,
           title: track.title || '',
           artists: artistNames(track),
+          album_artists: albumArtistNames(track),
           album: track.album_name || '',
         };
-        const label = `${source.title} - ${source.artists.join('; ')} - ${source.album}`;
+        const label =
+          `${source.title} - ${matchArtistNames(source).join('; ')} - ${source.album}`;
         LinkSelect.log(prefix + label);
 
         try {
-          const targetRef = await matchTrack(source, targetLibrary);
+          const targetRef = await matchTrack(source, targetLibrary, limit);
           if (targetRef) {
             linked++;
             LinkSelect.log(`    → 已链接 ${targetRef}`, 'ok');
           } else {
             unmatched++;
-            LinkSelect.log('    → 前 10 条无匹配', 'muted');
+            LinkSelect.log(`    → 前 ${limit} 条无匹配`, 'muted');
           }
         } catch (e) {
           failed++;
@@ -233,8 +258,112 @@
       'summary');
   }
 
+  // 左树恰好 1 个曲目、右树恰好 1 个曲目时，允许跳过搜索直接链接。
+  function directPair() {
+    const left = LinkSelect.selected();
+    if (left.length !== 1 || left[0].type !== 'track') return null;
+    const right = LinkSelect.rightTrack ? LinkSelect.rightTrack() : null;
+    if (!right || right.type !== 'track') return null;
+    return { left: left[0], right };
+  }
+
+  function syncDirect() {
+    const button = document.getElementById('link-direct');
+    if (!button) return;
+    const pair = directPair();
+    button.hidden = !pair;
+    if (pair) {
+      button.title =
+        `直接链接「${pair.left.label}」↔「${pair.right.label}」`;
+    }
+  }
+
+  async function directLink() {
+    const pair = directPair();
+    if (!pair) return;
+    const button = document.getElementById('link-direct');
+    if (button) button.disabled = true;
+    try {
+      await linkPair(pair.left.ref, pair.right.ref);
+      LinkSelect.log(
+        `已链接「${pair.left.label}」↔「${pair.right.label}」`, 'ok');
+    } catch (e) {
+      LinkSelect.log(`直接链接失败：${e.message}`, 'error');
+    } finally {
+      if (button) button.disabled = false;
+      syncDirect();
+    }
+  }
+
+  // 删除接口成功返回 204、失败返回 JSON，和 api() 的 res.json() 不兼容，
+  // 这里单独处理：ok -> 已删除；404 -> 本来就没有链接。
+  async function deleteLink(ref) {
+    const res = await fetch(
+      `${API_BASE}/api/v1/entity-links/${ref}`, { method: 'DELETE' });
+    if (res.ok) return 'deleted';
+    const text = await res.text();
+    if (res.status === 404) return 'missing';
+    throw new Error(`HTTP ${res.status}: ${text}`);
+  }
+
+  // 对左树多选项递归出的所有曲目，删除它们所在的整条链接。
+  async function bulkDelete() {
+    const nodes = LinkSelect.selected();
+    if (nodes.length === 0) return;
+    const autoFetch = LinkSelect.autoFetch();
+    const question =
+      `删除 ${nodes.length} 个选中项递归得到的所有曲目链接？` +
+      `\n整条链接（含其他库的成员）都会被删除，且不可撤销。`;
+    if (!confirm(question)) return;
+
+    const button = document.getElementById('link-delete');
+    if (button) button.disabled = true;
+    LinkSelect.clearLog();
+    LinkSelect.log(
+      `开始删除：${nodes.length} 个选中项，Auto fetch ${autoFetch ? '开' : '关'}`);
+
+    let deleted = 0;
+    let missing = 0;
+    let failed = 0;
+    try {
+      const refs = await collectTrackRefs(nodes, autoFetch);
+      LinkSelect.log(`递归得到 ${refs.length} 个曲目`, 'muted');
+
+      for (let i = 0; i < refs.length; i++) {
+        const ref = refs[i];
+        const prefix = `[${i + 1}/${refs.length}] `;
+        try {
+          const result = await deleteLink(ref);
+          if (result === 'deleted') {
+            deleted++;
+            LinkSelect.log(prefix + `${ref} → 已删除链接`, 'ok');
+          } else {
+            missing++;
+            LinkSelect.log(prefix + `${ref} → 未关联，跳过`, 'muted');
+          }
+        } catch (e) {
+          failed++;
+          LinkSelect.log(prefix + `${ref} → 删除失败：${e.message}`, 'error');
+        }
+      }
+    } catch (e) {
+      LinkSelect.log('删除中断：' + e.message, 'error');
+    } finally {
+      if (button) button.disabled = false;
+    }
+
+    LinkSelect.log(
+      `完成：删除 ${deleted}，未关联 ${missing}，失败 ${failed}`, 'summary');
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     const button = document.getElementById('link-start');
     if (button) button.onclick = start;
+    const direct = document.getElementById('link-direct');
+    if (direct) direct.onclick = directLink;
+    const batchDelete = document.getElementById('link-delete');
+    if (batchDelete) batchDelete.onclick = bulkDelete;
+    document.addEventListener('linkselect:change', syncDirect);
+    syncDirect();
   });
 })();

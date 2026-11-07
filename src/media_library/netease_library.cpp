@@ -117,27 +117,6 @@ std::vector<std::string> split_notes(const std::vector<std::string> &items) {
   return out;
 }
 
-// 曲目标题补全：`歌名 (译名) [备注]…`。
-// tns（译名）在前用半角圆括号，alia（备注）在后每条各一对半角方括号；
-// 两个来源都没有时返回原名，不加任何空括号。只用于曲目，album/artist
-// 标题保持平台原名。
-std::string title_with_alias(const std::string &name,
-                             const std::vector<std::string> &translated,
-                             const std::vector<std::string> &alias) {
-  std::string out = name;
-  const std::vector<std::string> names = split_notes(translated);
-  for (const std::string &item : names) {
-    out += "(" + item + ")";
-  }
-  for (const std::string &item : split_notes(alias)) {
-    if (std::find(names.begin(), names.end(), item) != names.end()) {
-      continue;
-    }
-    out += "[" + item + "]";
-  }
-  return out;
-}
-
 // tags 可能是空串、逗号分隔串或数组；只有非空项才进 genres。
 std::vector<std::string> genres_of(const std::vector<std::string> &tags) {
   std::vector<std::string> genres;
@@ -356,7 +335,9 @@ Track NeteaseLibrary::track_from_song(
     return track;
   }
   track.ref = ref.value();
-  track.title = title_with_alias(song.name, song.translated_names, song.alias);
+  track.title = song.name;
+  track.translations = split_notes(song.translated_names);
+  track.notes = split_notes(song.alias);
   track.duration_ms = song.duration_ms > 0
                           ? std::optional<std::int64_t>(song.duration_ms)
                           : std::nullopt;

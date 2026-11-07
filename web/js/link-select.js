@@ -7,6 +7,26 @@
     return document.getElementById('tree-a');
   }
 
+  function rightTree() {
+    return document.getElementById('tree-b');
+  }
+
+  // 右树只支持普通单选：当前 `.selected` 的那一行就是右树的选择。
+  function rightTrack() {
+    const root = rightTree();
+    if (!root) return null;
+    const row = root.querySelector(
+      'li.tree-node[data-type="track"] > .node-row.selected');
+    if (!row) return null;
+    const li = row.parentElement;
+    return { ref: li.dataset.id, type: li.dataset.type, label: nodeLabel(li) };
+  }
+
+  // 选择状态变化（多选、右树单选、树重绘）统一广播，避免各模块互相调用。
+  function notify() {
+    document.dispatchEvent(new CustomEvent('linkselect:change'));
+  }
+
   function panel() {
     return document.getElementById('link-panel');
   }
@@ -51,6 +71,7 @@
     applyHighlights();
     syncPanel();
     clearLog();
+    notify();
   }
 
   function toggle(li) {
@@ -67,6 +88,7 @@
     }
     applyHighlights();
     syncPanel();
+    notify();
   }
 
   // 返回 true 表示这次点击已被多选逻辑吃掉，不再触发普通单选。
@@ -138,9 +160,24 @@
     loadTargets();
     const root = tree();
     if (root) {
-      new MutationObserver(applyHighlights).observe(root, {
+      new MutationObserver(() => {
+        applyHighlights();
+        notify();
+      }).observe(root, {
         childList: true,
         subtree: true,
+        attributes: true,
+        attributeFilter: ['class'],
+      });
+    }
+    const right = rightTree();
+    if (right) {
+      // 右树的普通单选只会改 class，不会重建节点，所以必须观察属性。
+      new MutationObserver(notify).observe(right, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class'],
       });
     }
     syncPanel();
@@ -149,6 +186,7 @@
   window.LinkSelect = {
     onRowClick,
     selected: () => [...selected.values()],
+    rightTrack,
     clear,
     log,
     clearLog,
@@ -167,6 +205,12 @@
     autoFetch: () => {
       const box = document.getElementById('link-auto-fetch');
       return !!(box && box.checked);
+    },
+    searchLimit: () => {
+      const input = document.getElementById('link-limit');
+      const value = input ? parseInt(input.value, 10) : NaN;
+      if (!Number.isFinite(value)) return 10;
+      return Math.min(200, Math.max(1, value));
     },
   };
 })();

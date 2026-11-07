@@ -56,6 +56,10 @@ struct AudioInfo {
 struct Track {
   TrackRef ref;
   std::string title;
+  // 平台提供的译名与备注，各自独立成列表，不再拼进 title。
+  // title 始终是平台原名，展示时由调用方决定如何组合。
+  std::vector<std::string> translations;
+  std::vector<std::string> notes;
   std::vector<ArtistLink> artists;
   std::vector<AlbumArtistLink> album_artists;
   std::optional<AlbumLink> album;
