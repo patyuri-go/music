@@ -21,8 +21,8 @@ namespace media_library {
 //   - 增强 LRC   <mm:ss.xxx> 内联时间（按词切分）
 //   - YRC        [行起始,行时长](词起始,词时长,0)词…（逐字同步，网易云）
 //   - 多行时间标签 [t1][t2]正文（同一句重复出现在多个时间点）
-//   - 双语       原文与译文各自一条轨，按行时间对齐后挂到 line.aux
-//   - 注音       romalrc / ruby 轨，同样按行时间对齐后挂到 line.aux
+//   - 双语       原文与译文各自一条轨，按行时间对齐后挂到 line.items
+//   - 注音       romalrc / ruby 轨，同样按行时间对齐后挂到 line.items
 // ---------------------------------------------------------------------------
 
 // 一条按时间排好序的文本轨（LRC / 译文 / 注音都是这个形状）。
@@ -46,7 +46,7 @@ std::vector<LyricLine> parse_enhanced_lrc_track(const std::string &text);
 // 用来阻止客户端沿用上一句；对齐不上的行丢弃（不猜时间）。
 void attach_aux_track(std::vector<LyricLine> &lines,
                       const std::vector<LyricTrackLine> &track,
-                      LyricAuxKind kind);
+                      LyricItemKind kind);
 
 // 从已解析的行重建纯文本（无时间轴时的降级表示）。
 std::string plain_text_of(const std::vector<LyricLine> &lines);

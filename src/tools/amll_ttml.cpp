@@ -165,7 +165,21 @@ private:
           lang.has_value() && !lang->empty()) {
         item.lang = *lang;
       }
-      item.text = trim(direct_text(span));
+      // 逐字翻译/标音会在 x-translation / x-roman 里再嵌带时间的 span；
+      // 有元素子项时按混合内容递归解析，纯文本才放 text。
+      bool has_element = false;
+      for (pugi::xml_node child = span.first_child(); child;
+           child = child.next_sibling()) {
+        if (child.type() == pugi::node_element) {
+          has_element = true;
+          break;
+        }
+      }
+      if (has_element) {
+        item.children = parse_content(span, true);
+      } else {
+        item.text = trim(direct_text(span));
+      }
       items.push_back(std::move(item));
       return;
     }
@@ -523,7 +537,11 @@ void append_item(std::string &out, const Item &item) {
     append_time_attr(out, "begin", item.begin_ms);
     append_time_attr(out, "end", item.end_ms);
     out += '>';
-    escape_text(out, item.text);
+    if (!item.children.empty()) {
+      append_items(out, item.children);
+    } else {
+      escape_text(out, item.text);
+    }
     out += "</span>";
     return;
   }

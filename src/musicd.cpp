@@ -1856,7 +1856,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         meta.duration_ms = info.duration_ms;
       }
       out["text"] = media_library::lyrics_to_ttml(value, meta);
-      out["synced"] = value.mode != media_library::LyricsMode::Unsynced;
+      out["synced"] = media_library::is_synced(value);
     }
     return jsonResponse(200, out.dump());
   });

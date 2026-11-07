@@ -211,17 +211,31 @@ crow::json::wvalue lyrics_json(const Lyrics &lyrics) {
   out["language"] = lyrics.language.has_value()
                         ? crow::json::wvalue(*lyrics.language)
                         : crow::json::wvalue(nullptr);
-  switch (lyrics.mode) {
-  case LyricsMode::WordSynced:
-    out["mode"] = "word_synced";
-    break;
-  case LyricsMode::LineSynced:
-    out["mode"] = "line_synced";
-    break;
-  case LyricsMode::Unsynced:
-    out["mode"] = "unsynced";
-    break;
+  crow::json::wvalue::list modes;
+  modes.reserve(lyrics.modes.size());
+  for (LyricsMode mode : lyrics.modes) {
+    switch (mode) {
+    case LyricsMode::WordSynced:
+      modes.emplace_back("word_synced");
+      break;
+    case LyricsMode::LineSynced:
+      modes.emplace_back("line_synced");
+      break;
+    case LyricsMode::Unsynced:
+      modes.emplace_back("unsynced");
+      break;
+    case LyricsMode::HasTranslation:
+      modes.emplace_back("has_translation");
+      break;
+    case LyricsMode::HasRomanization:
+      modes.emplace_back("has_romanization");
+      break;
+    case LyricsMode::HasBackground:
+      modes.emplace_back("has_background");
+      break;
+    }
   }
+  out["modes"] = std::move(modes);
   crow::json::wvalue::list lines;
   lines.reserve(lyrics.lines.size());
   for (const LyricLine &line : lyrics.lines) {
@@ -231,10 +245,11 @@ crow::json::wvalue lyrics_json(const Lyrics &lyrics) {
                             : crow::json::wvalue(nullptr);
     entry["end_ms"] = line.end_ms.has_value() ? crow::json::wvalue(*line.end_ms)
                                               : crow::json::wvalue(nullptr);
-    entry["text"] = line.text;
+    entry["text"] = line_text(line);
+    const std::vector<LyricWord> line_word_list = line_words(line);
     crow::json::wvalue::list words;
-    words.reserve(line.words.size());
-    for (const LyricWord &word : line.words) {
+    words.reserve(line_word_list.size());
+    for (const LyricWord &word : line_word_list) {
       crow::json::wvalue item;
       item["start_ms"] = word.start_ms;
       item["end_ms"] = word.end_ms.has_value()
@@ -245,15 +260,19 @@ crow::json::wvalue lyrics_json(const Lyrics &lyrics) {
     }
     entry["words"] = std::move(words);
     crow::json::wvalue::list aux;
-    aux.reserve(line.aux.size());
-    for (const LyricAux &item : line.aux) {
+    for (const LyricItem &item : line.items) {
+      if (item.kind != LyricItemKind::Translation &&
+          item.kind != LyricItemKind::Romanization) {
+        continue;
+      }
       crow::json::wvalue node;
-      node["kind"] = item.kind == LyricAuxKind::Translation ? "translation"
-                                                           : "romanization";
+      node["kind"] = item.kind == LyricItemKind::Translation ? "translation"
+                                                             : "romanization";
       node["text"] = item.text;
+      const std::vector<LyricWord> aux_word_list = item_words(item);
       crow::json::wvalue::list aux_words;
-      aux_words.reserve(item.words.size());
-      for (const LyricWord &word : item.words) {
+      aux_words.reserve(aux_word_list.size());
+      for (const LyricWord &word : aux_word_list) {
         crow::json::wvalue w;
         w["start_ms"] = word.start_ms;
         w["end_ms"] = word.end_ms.has_value() ? crow::json::wvalue(*word.end_ms)

@@ -681,20 +681,22 @@ std::size_t utf8_length(const std::string &text) {
 // 也不出半截 Cue 让客户端高亮错位。
 crow::json::wvalue::list buildCues(const media_library::LyricLine &line) {
   crow::json::wvalue::list cues;
-  if (line.words.empty()) {
+  const std::vector<media_library::LyricWord> words =
+      media_library::line_words(line);
+  if (words.empty()) {
     return cues;
   }
   std::string joined;
-  for (const media_library::LyricWord &word : line.words) {
+  for (const media_library::LyricWord &word : words) {
     joined += word.text;
   }
-  if (joined != line.text) {
+  if (joined != media_library::line_text(line)) {
     return cues;
   }
 
   std::size_t pos = 0;
-  for (std::size_t i = 0; i < line.words.size(); ++i) {
-    const media_library::LyricWord &word = line.words[i];
+  for (std::size_t i = 0; i < words.size(); ++i) {
+    const media_library::LyricWord &word = words[i];
     const std::size_t length = utf8_length(word.text);
     if (length == 0) {
       continue;
@@ -702,8 +704,8 @@ crow::json::wvalue::list buildCues(const media_library::LyricLine &line) {
     std::int64_t end_ms = word.start_ms;
     if (word.end_ms.has_value()) {
       end_ms = *word.end_ms;
-    } else if (i + 1 < line.words.size()) {
-      end_ms = line.words[i + 1].start_ms;
+    } else if (i + 1 < words.size()) {
+      end_ms = words[i + 1].start_ms;
     } else if (line.end_ms.has_value()) {
       end_ms = *line.end_ms;
     }
@@ -734,16 +736,12 @@ crow::json::wvalue buildLyricDto(const media_library::Lyrics &lyrics,
     // 用 `_BREAK_` 把原文与译文串在同一行（与 `?format=lrc` 的正文写法一致），
     // 换行会占掉一行显示空间，也不便客户端自行拆成双行。
     // `Cues` 的下标只覆盖 `_BREAK_` 之前的原文，译文不参与下标计算。
-    std::string text = line.text;
-    for (const media_library::LyricAux &aux : line.aux) {
-      if (aux.kind != media_library::LyricAuxKind::Translation) {
-        continue;
-      }
-      if (aux.text.empty()) {
-        continue;
-      }
-      text += "_BREAK_" + aux.text;
-      break;
+    std::string text = media_library::line_text(line);
+    const media_library::LyricItem *translation =
+        media_library::find_text_item(line,
+                                      media_library::LyricItemKind::Translation);
+    if (translation != nullptr) {
+      text += "_BREAK_" + translation->text;
     }
     node["Text"] = text;
     if (line.start_ms.has_value()) {
@@ -762,7 +760,7 @@ crow::json::wvalue buildLyricDto(const media_library::Lyrics &lyrics,
     meta["Album"] = album;
   }
   meta["Length"] = duration_ms * 10000LL;
-  meta["IsSynced"] = lyrics.mode != media_library::LyricsMode::Unsynced;
+  meta["IsSynced"] = media_library::is_synced(lyrics);
   r["Metadata"] = std::move(meta);
   r["Lyrics"] = crow::json::wvalue(lines);
   return r;
@@ -802,16 +800,12 @@ std::string buildLrcText(const media_library::Lyrics &lyrics,
   out += "[offset:0]\n";
 
   for (const media_library::LyricLine &line : lyrics.lines) {
-    std::string text = line.text;
-    for (const media_library::LyricAux &aux : line.aux) {
-      if (aux.kind != media_library::LyricAuxKind::Translation) {
-        continue;
-      }
-      if (aux.text.empty()) {
-        continue;
-      }
-      text += "_BREAK_" + aux.text;
-      break;
+    std::string text = media_library::line_text(line);
+    const media_library::LyricItem *translation =
+        media_library::find_text_item(line,
+                                      media_library::LyricItemKind::Translation);
+    if (translation != nullptr) {
+      text += "_BREAK_" + translation->text;
     }
     out += "[" + lrcTimestamp(line.start_ms.value_or(0)) + "]" + text + "\n";
   }

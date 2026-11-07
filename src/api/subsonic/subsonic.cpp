@@ -707,7 +707,8 @@ struct LyricTrack {
   std::string text;
   std::optional<std::int64_t> start_ms;
   std::optional<std::int64_t> end_ms;
-  const std::vector<media_library::LyricWord> *words = nullptr;
+  std::vector<media_library::LyricWord> words;
+  bool has_words = false;
 };
 
 // Subsonic 的 cue 用 **UTF-8 字节偏移** 而且是闭区间；跨行拼字时必须按字节累加，
@@ -781,11 +782,11 @@ crow::json::wvalue structured_lyrics(const std::string &lang, bool synced,
     lines.push_back(std::move(line));
 
     // cueLine 只在该轨真的有逐字时间、且整体是同步歌词时才给。
-    if (!enhanced || !synced || track.words == nullptr || track.words->empty()) {
+    if (!enhanced || !synced || !track.has_words || track.words.empty()) {
       continue;
     }
     std::string value;
-    for (const auto &word : *track.words) {
+    for (const auto &word : track.words) {
       value += word.text;
     }
     crow::json::wvalue cue_line;
@@ -797,7 +798,7 @@ crow::json::wvalue structured_lyrics(const std::string &lang, bool synced,
       cue_line["end"] = *track.end_ms;
     }
     cue_line["value"] = value;
-    cue_line["cue"] = crow::json::wvalue(cue_list_of(*track.words, track.end_ms));
+    cue_line["cue"] = crow::json::wvalue(cue_list_of(track.words, track.end_ms));
     cue_lines.push_back(std::move(cue_line));
   }
 
@@ -851,17 +852,18 @@ crow::response handle_lyrics_by_song_id(const crow::request &req) {
   const bool enhanced = enhanced_text == "true" || enhanced_text == "1" ||
                         enhanced_text == "yes";
 
-  const bool synced = lyrics.mode != media_library::LyricsMode::Unsynced;
+  const bool synced = media_library::is_synced(lyrics);
   const std::string lang = lyric_lang(lyrics);
 
   std::vector<LyricTrack> main_tracks;
   main_tracks.reserve(lyrics.lines.size());
   for (const auto &line : lyrics.lines) {
     LyricTrack track;
-    track.text = line.text;
+    track.text = media_library::line_text(line);
     track.start_ms = line.start_ms;
     track.end_ms = line.end_ms;
-    track.words = &line.words;
+    track.words = media_library::line_words(line);
+    track.has_words = !track.words.empty();
     main_tracks.push_back(std::move(track));
   }
 
@@ -871,20 +873,20 @@ crow::response handle_lyrics_by_song_id(const crow::request &req) {
 
   if (enhanced) {
     // 译文与注音各自是一条独立轨（kind 区分），行时间与正文行对齐。
-    const auto emit_aux = [&](media_library::LyricAuxKind kind,
+    const auto emit_aux = [&](media_library::LyricItemKind kind,
                               const char *name) {
       std::vector<LyricTrack> tracks;
       tracks.reserve(lyrics.lines.size());
       bool any = false;
       for (const auto &line : lyrics.lines) {
-        const media_library::LyricAux *found = nullptr;
-        for (const auto &aux : line.aux) {
-          if (aux.kind != kind) {
+        const media_library::LyricItem *found = nullptr;
+        for (const auto &item : line.items) {
+          if (item.kind != kind) {
             continue;
           }
           // 同一行可能同时有空占位和真实文本，优先真实文本。
-          if (found == nullptr || (found->text.empty() && !aux.text.empty())) {
-            found = &aux;
+          if (found == nullptr || (found->text.empty() && !item.text.empty())) {
+            found = &item;
           }
           if (!found->text.empty()) {
             break;
@@ -897,11 +899,12 @@ crow::response handle_lyrics_by_song_id(const crow::request &req) {
         }
         LyricTrack track;
         // 空串也是有效占位：媒体库层保留的间奏位置必须原样传出去，
-        // 否则客户端找不到精确时间点，会沿用上一条译文/注音。
+        // 否则客户端找不到精确时间点，会沿用上一条译文/标音。
         track.text = found->text;
         track.start_ms = line.start_ms;
         track.end_ms = line.end_ms;
-        track.words = &found->words;
+        track.words = media_library::item_words(*found);
+        track.has_words = !track.words.empty();
         any = true;
         tracks.push_back(std::move(track));
       }
@@ -910,8 +913,8 @@ crow::response handle_lyrics_by_song_id(const crow::request &req) {
             structured_lyrics(lang, synced, tracks, name, enhanced));
       }
     };
-    emit_aux(media_library::LyricAuxKind::Translation, "translation");
-    emit_aux(media_library::LyricAuxKind::Romanization, "pronunciation");
+    emit_aux(media_library::LyricItemKind::Translation, "translation");
+    emit_aux(media_library::LyricItemKind::Romanization, "pronunciation");
   }
 
   crow::json::wvalue lyrics_list;

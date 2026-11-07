@@ -112,7 +112,18 @@ struct Playlist {
   std::vector<Track> tracks;
 };
 
-enum class LyricsMode { WordSynced, LineSynced, Unsynced };
+// 歌词的时间模式与内容特征。
+//
+// `Lyrics::modes` 固定包含且只包含一个时间模式（WordSynced / LineSynced /
+// Unsynced），其余标志按内容追加。不要假设顺序，统一用 has_mode() 查询。
+enum class LyricsMode {
+  WordSynced,
+  LineSynced,
+  Unsynced,
+  HasTranslation,  // 有译文轨
+  HasRomanization, // 有标音轨（罗马音 / Ruby 注音）
+  HasBackground,   // 有背景人声
+};
 
 struct LyricWord {
   std::int64_t start_ms = 0;
@@ -120,37 +131,139 @@ struct LyricWord {
   std::string text;
 };
 
-// 辅助轨：挂在正文行上的第二语言文本。
-// 平台把「译文」与「注音」分两条轨给出，二者都按正文行的时间对齐，
-// 所以不是独立的时间轴，而是 line.aux 里的一条附属内容。
-enum class LyricAuxKind {
-  Translation,  // 译文（双语歌词的另一半）
-  Romanization, // 注音（romalrc / ruby，逐字读音）
+// Ruby（注音）：base 是原文，texts 是逐段带时间的读音。
+struct LyricRuby {
+  std::string base;
+  std::vector<LyricWord> texts;
 };
 
-struct LyricAux {
-  LyricAuxKind kind = LyricAuxKind::Translation;
-  std::string text;
-  // 逐字轨（ytlrc / 逐词注音）才有值；行级轨为空。
-  std::vector<LyricWord> words;
+// 一行歌词里的有序内容单元，对应 AMLL TTML 的不同 span。
+// 顺序本身是语义（主唱、背景人声、译文可以交错），不要重排。
+enum class LyricItemKind {
+  Text,         // 行级纯文本
+  Word,         // 逐字音节（start_ms 必填）
+  Ruby,         // 注音
+  Background,   // 背景人声，children 里可再带时间轴
+  Translation,  // 译文
+  Romanization, // 标音（罗马音）
+};
+
+struct LyricItem {
+  LyricItemKind kind = LyricItemKind::Text;
+  std::string text;                     // Text / Translation / Romanization
+  std::optional<std::int64_t> start_ms; // Word / Background
+  std::optional<std::int64_t> end_ms;
+  std::optional<std::string> lang;      // Translation / Romanization
+  LyricRuby ruby;                       // Ruby
+  // Background 的子内容；Translation / Romanization 逐字时也放在这里。
+  std::vector<LyricItem> children;
 };
 
 struct LyricLine {
   std::optional<std::int64_t> start_ms;
   std::optional<std::int64_t> end_ms;
-  std::string text;
-  std::vector<LyricWord> words;
-  // 同一行上可能同时有译文和注音，顺序按加入先后。
-  std::vector<LyricAux> aux;
+  std::vector<LyricItem> items;
 };
 
 struct Lyrics {
   TrackRef track;
   std::optional<std::string> language;
-  LyricsMode mode = LyricsMode::Unsynced;
+  // 固定一个时间模式，按需追加 Has* 内容标志。
+  std::vector<LyricsMode> modes{LyricsMode::Unsynced};
   std::vector<LyricLine> lines;
   std::optional<std::string> plain_text;
 };
+
+inline bool has_mode(const Lyrics &lyrics, LyricsMode mode) {
+  for (const LyricsMode entry : lyrics.modes) {
+    if (entry == mode) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool is_synced(const Lyrics &lyrics) {
+  return has_mode(lyrics, LyricsMode::WordSynced) ||
+         has_mode(lyrics, LyricsMode::LineSynced);
+}
+
+// 正文纯文本：拼顶层 Text / Word 与 Ruby 的 base。
+// 背景人声、译文、标音是附属内容，不计入正文。
+inline std::string line_text(const LyricLine &line) {
+  std::string out;
+  for (const LyricItem &item : line.items) {
+    switch (item.kind) {
+    case LyricItemKind::Text:
+    case LyricItemKind::Word:
+      out += item.text;
+      break;
+    case LyricItemKind::Ruby:
+      out += item.ruby.base;
+      break;
+    default:
+      break;
+    }
+  }
+  return out;
+}
+
+// 顶层逐字轨。Ruby 读音不是正文音节，不混进来。
+inline std::vector<LyricWord> line_words(const LyricLine &line) {
+  std::vector<LyricWord> out;
+  for (const LyricItem &item : line.items) {
+    if (item.kind != LyricItemKind::Word) {
+      continue;
+    }
+    LyricWord word;
+    word.start_ms = item.start_ms.value_or(0);
+    word.end_ms = item.end_ms;
+    word.text = item.text;
+    out.push_back(std::move(word));
+  }
+  return out;
+}
+
+// 一个 item 下的逐字子项（Translation/Romanization 的逐字轨，或
+// Background 的子项）。
+inline std::vector<LyricWord> item_words(const LyricItem &item) {
+  std::vector<LyricWord> out;
+  for (const LyricItem &child : item.children) {
+    if (child.kind != LyricItemKind::Word) {
+      continue;
+    }
+    LyricWord word;
+    word.start_ms = child.start_ms.value_or(0);
+    word.end_ms = child.end_ms;
+    word.text = child.text;
+    out.push_back(std::move(word));
+  }
+  return out;
+}
+
+inline const LyricItem *find_item(const LyricLine &line, LyricItemKind kind) {
+  for (const LyricItem &item : line.items) {
+    if (item.kind == kind) {
+      return &item;
+    }
+  }
+  return nullptr;
+}
+
+inline bool line_has_item(const LyricLine &line, LyricItemKind kind) {
+  return find_item(line, kind) != nullptr;
+}
+
+// 行内第一个非空文本项（译文/标音占位可能为空）。
+inline const LyricItem *find_text_item(const LyricLine &line,
+                                       LyricItemKind kind) {
+  for (const LyricItem &item : line.items) {
+    if (item.kind == kind && !item.text.empty()) {
+      return &item;
+    }
+  }
+  return nullptr;
+}
 
 enum class PlaybackKind { LocalFile, WebDav, RemoteStream, Cache };
 

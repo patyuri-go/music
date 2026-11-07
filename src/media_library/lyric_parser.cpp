@@ -174,6 +174,41 @@ std::vector<std::string> split_lines(const std::string &text) {
 }
 
 // 增强 LRC 的内联时间标签：<mm:ss.xxx>。按标签切成词。
+LyricItem make_text_item(std::string text);
+
+// 0 时长词无法生成合法的 AMLL span（规范要求 begin < end）。优先把它并进
+// 前一个逐字项：YRC 的行尾标点（如「て」后的「、」）本来就是连读的一部分，
+// 合并文本语义不变；没有可合并的前项时退化成 1ms 的最小时长。
+void normalize_zero_length_words(LyricLine &line) {
+  std::size_t i = 0;
+  while (i < line.items.size()) {
+    LyricItem &item = line.items[i];
+    if (item.kind != LyricItemKind::Word || !item.start_ms.has_value() ||
+        !item.end_ms.has_value() || *item.end_ms > *item.start_ms) {
+      ++i;
+      continue;
+    }
+    const bool at_previous_end =
+        i > 0 && line.items[i - 1].kind == LyricItemKind::Word &&
+        line.items[i - 1].end_ms.has_value() &&
+        *line.items[i - 1].end_ms == *item.start_ms;
+    const bool at_line_end =
+        line.end_ms.has_value() && *line.end_ms == *item.start_ms;
+    if (at_previous_end || at_line_end) {
+      if (i > 0 && line.items[i - 1].kind == LyricItemKind::Word) {
+        line.items[i - 1].text += item.text;
+        line.items.erase(line.items.begin() + i);
+        continue;
+      }
+    }
+    item.end_ms = *item.start_ms + 1;
+    if (!line.end_ms.has_value() || *line.end_ms < *item.end_ms) {
+      line.end_ms = item.end_ms;
+    }
+    ++i;
+  }
+}
+
 void split_inline_words(const std::string &body, LyricLine &line) {
   std::size_t pos = 0;
   while (pos < body.size()) {
@@ -181,11 +216,11 @@ void split_inline_words(const std::string &body, LyricLine &line) {
     if (open == std::string::npos) {
       // 尾部残留文本并进上一词，没有上一词则并进正文。
       if (pos < body.size()) {
-        if (!line.words.empty()) {
-          line.words.back().text += body.substr(pos);
-          line.text += body.substr(pos);
+        if (!line.items.empty() &&
+            line.items.back().kind == LyricItemKind::Word) {
+          line.items.back().text += body.substr(pos);
         } else {
-          line.text += body.substr(pos);
+          line.items.push_back(make_text_item(body.substr(pos)));
         }
       }
       break;
@@ -204,17 +239,18 @@ void split_inline_words(const std::string &body, LyricLine &line) {
     const std::string word_text =
         body.substr(close + 1, next == std::string::npos ? std::string::npos
                                                          : next - close - 1);
-    LyricWord word;
-    word.start_ms = start;
-    word.text = word_text;
-    if (!line.words.empty()) {
+    LyricItem item;
+    item.kind = LyricItemKind::Word;
+    item.start_ms = start;
+    item.text = word_text;
+    if (!line.items.empty() && line.items.back().kind == LyricItemKind::Word) {
       // 上一个词的结束时间就是下一个词的开始时间。
-      line.words.back().end_ms = start;
+      line.items.back().end_ms = start;
     }
-    line.words.push_back(std::move(word));
-    line.text += word_text;
+    line.items.push_back(std::move(item));
     pos = next == std::string::npos ? body.size() : next;
   }
+  normalize_zero_length_words(line);
 }
 
 bool is_yrc_head(const std::string &raw) {
@@ -232,6 +268,79 @@ std::int64_t normalize_start(std::int64_t start, std::int64_t offset_ms) {
   return std::max<std::int64_t>(0, start + offset_ms);
 }
 
+LyricItem make_text_item(std::string text) {
+  LyricItem item;
+  item.kind = LyricItemKind::Text;
+  item.text = std::move(text);
+  return item;
+}
+
+// 逐字/注音（Ruby）都算带词级时间轴；背景人声里的词也算。
+bool item_has_timed_words(const LyricItem &item) {
+  if (item.kind == LyricItemKind::Word || item.kind == LyricItemKind::Ruby) {
+    return true;
+  }
+  for (const LyricItem &child : item.children) {
+    if (item_has_timed_words(child)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void scan_item_flags(const LyricItem &item, bool &translation, bool &romanization,
+                     bool &background) {
+  switch (item.kind) {
+  case LyricItemKind::Translation:
+    translation = true;
+    break;
+  case LyricItemKind::Romanization:
+  case LyricItemKind::Ruby:
+    romanization = true;
+    break;
+  case LyricItemKind::Background:
+    background = true;
+    break;
+  default:
+    break;
+  }
+  for (const LyricItem &child : item.children) {
+    scan_item_flags(child, translation, romanization, background);
+  }
+}
+
+// 由实际内容推导 modes：一个时间模式 + 按需的内容标志。
+void update_modes(Lyrics &lyrics) {
+  bool any_words = false;
+  bool any_time = false;
+  bool translation = false;
+  bool romanization = false;
+  bool background = false;
+  for (const LyricLine &line : lyrics.lines) {
+    if (line.start_ms.has_value()) {
+      any_time = true;
+    }
+    for (const LyricItem &item : line.items) {
+      any_words = any_words || item_has_timed_words(item);
+      scan_item_flags(item, translation, romanization, background);
+    }
+  }
+
+  lyrics.modes.clear();
+  lyrics.modes.push_back(any_words ? LyricsMode::WordSynced
+                                   : (any_time ? LyricsMode::LineSynced
+                                               : LyricsMode::Unsynced));
+  if (translation) {
+    lyrics.modes.push_back(LyricsMode::HasTranslation);
+  }
+  if (romanization) {
+    lyrics.modes.push_back(LyricsMode::HasRomanization);
+  }
+  if (background) {
+    lyrics.modes.push_back(LyricsMode::HasBackground);
+  }
+}
+
 // 间奏占位：平台在间奏处给出的是「有时间戳、正文为空」的行，不是点。
 // 只有持续超过 3 秒的空行才补 `······`；短空行只是换行/停顿，直接删除。
 // 时长优先用行自带的 end_ms（YRC），否则用下一行的开始时间推算；
@@ -244,7 +353,7 @@ void normalize_interlude_placeholders(std::vector<LyricLine> &lines) {
   kept.reserve(lines.size());
   for (std::size_t i = 0; i < lines.size(); ++i) {
     LyricLine &line = lines[i];
-    if (!line.start_ms.has_value() || !line.text.empty()) {
+    if (!line.start_ms.has_value() || !line_text(line).empty()) {
       kept.push_back(std::move(line));
       continue;
     }
@@ -255,7 +364,8 @@ void normalize_interlude_placeholders(std::vector<LyricLine> &lines) {
       duration_ms = *lines[i + 1].start_ms - *line.start_ms;
     }
     if (duration_ms > kInterludeMinDurationMs) {
-      line.text = kInterludePlaceholder;
+      // 主行占位放最前，已挂上的译文/注音占位保持在后面。
+      line.items.insert(line.items.begin(), make_text_item(kInterludePlaceholder));
       kept.push_back(std::move(line));
     }
   }
@@ -265,7 +375,7 @@ void normalize_interlude_placeholders(std::vector<LyricLine> &lines) {
 // 行时间对齐：先找完全相同的时间，其次容差内最近的，最后（行数相同时）按序号。
 void attach_one(std::vector<LyricLine> &lines,
                 const std::vector<LyricTrackLine> &track,
-                LyricAuxKind kind) {
+                LyricItemKind kind) {
   constexpr std::int64_t kToleranceMs = 1200;
   const bool same_count = lines.size() == track.size();
   for (std::size_t i = 0; i < track.size(); ++i) {
@@ -288,12 +398,12 @@ void attach_one(std::vector<LyricLine> &lines,
       }
       best = i;
     }
-    LyricAux aux;
-    aux.kind = kind;
+    LyricItem item;
+    item.kind = kind;
     // 空文本也要保留：这是副轨在该时间点的“无内容”占位，
     // 用来阻止客户端把上一句的译文/注音回退套到这里。
-    aux.text = track[i].text;
-    lines[best].aux.push_back(std::move(aux));
+    item.text = track[i].text;
+    lines[best].items.push_back(std::move(item));
   }
 }
 
@@ -379,20 +489,26 @@ std::vector<LyricLine> parse_yrc_track(const std::string &text) {
           if (word_start < start) {
             word_start += start;
           }
-          LyricWord word;
-          word.start_ms = word_start;
-          if (word_duration > 0) {
-            word.end_ms = word_start + word_duration;
-          }
-          word.text = word_text;
-          line.words.push_back(std::move(word));
+          LyricItem item;
+          item.kind = LyricItemKind::Word;
+          item.start_ms = word_start;
+          // duration 为 0 的行尾标点也先保留成 0 时长 Word，等整行解析完
+          // 再由 normalize_zero_length_words 并入前一个词或补最小 1ms。
+          item.end_ms = word_start + std::max<std::int64_t>(word_duration, 0);
+          item.text = word_text;
+          line.items.push_back(std::move(item));
         } catch (const std::exception &) {
-          // 单个坏词不影响整行。
+          // 单个坏词不影响整行；文本仍按普通文本保留。
+          if (!word_text.empty()) {
+            line.items.push_back(make_text_item(word_text));
+          }
         }
+      } else if (!word_text.empty()) {
+        line.items.push_back(make_text_item(word_text));
       }
-      line.text += word_text;
       pos = next == std::string::npos ? raw.size() : next;
     }
+    normalize_zero_length_words(line);
     out.push_back(std::move(line));
   }
   return out;
@@ -409,7 +525,7 @@ std::vector<LyricLine> parse_enhanced_lrc_track(const std::string &text) {
     if (parse_netease_credit_line(raw, credit_ms, credit_text)) {
       LyricLine line;
       line.start_ms = credit_ms;
-      line.text = std::move(credit_text);
+      line.items.push_back(make_text_item(std::move(credit_text)));
       out.push_back(std::move(line));
       continue;
     }
@@ -435,7 +551,7 @@ std::vector<LyricLine> parse_enhanced_lrc_track(const std::string &text) {
 
 void attach_aux_track(std::vector<LyricLine> &lines,
                       const std::vector<LyricTrackLine> &track,
-                      LyricAuxKind kind) {
+                      LyricItemKind kind) {
   if (lines.empty() || track.empty()) {
     return;
   }
@@ -448,7 +564,7 @@ std::string plain_text_of(const std::vector<LyricLine> &lines) {
     if (!out.empty()) {
       out.push_back('\n');
     }
-    out += line.text;
+    out += line_text(line);
   }
   return out;
 }
@@ -480,13 +596,13 @@ Lyrics parse_plain_lyrics(const TrackRef &track, const std::string &text) {
           !lines.empty() && lines.back().start_ms.has_value() &&
           entry.start_ms.has_value() && *lines.back().start_ms == *entry.start_ms;
       // 本地双语 .lrc 的常见写法：同一时间戳连着两行（原文、译文）。
-      // 时间完全相同的第二行不是新的一句，挂成第一行的译文辅助轨。
-      if (dup_time && lines.back().aux.empty() &&
-          lines.back().text != entry.text) {
-        LyricAux aux;
-        aux.kind = LyricAuxKind::Translation;
-        aux.text = entry.text;
-        lines.back().aux.push_back(std::move(aux));
+      // 时间完全相同的第二行不是新的一句，挂成第一行的译文辅助项。
+      if (dup_time && find_item(lines.back(), LyricItemKind::Translation) == nullptr &&
+          line_text(lines.back()) != line_text(entry)) {
+        LyricItem aux;
+        aux.kind = LyricItemKind::Translation;
+        aux.text = line_text(entry);
+        lines.back().items.push_back(std::move(aux));
         continue;
       }
       lines.push_back(entry);
@@ -495,23 +611,18 @@ Lyrics parse_plain_lyrics(const TrackRef &track, const std::string &text) {
     normalize_interlude_placeholders(lines);
     // 纯文本视图与处理后的行保持一致，避免它还保留被删掉的空行。
     lyrics.plain_text = plain_text_of(lines);
-    const bool any_words = std::any_of(
-        lines.begin(), lines.end(),
-        [](const LyricLine &line) { return !line.words.empty(); });
-    lyrics.mode = lines.empty()
-                      ? LyricsMode::Unsynced
-                      : (any_words ? LyricsMode::WordSynced
-                                   : LyricsMode::LineSynced);
   } else {
     for (const std::string &raw : split_lines(text)) {
       LyricLine line;
-      line.text = raw;
+      if (!raw.empty()) {
+        line.items.push_back(make_text_item(raw));
+      }
       lines.push_back(std::move(line));
     }
-    lyrics.mode = LyricsMode::Unsynced;
   }
 
   lyrics.lines = std::move(lines);
+  update_modes(lyrics);
   return lyrics;
 }
 
@@ -522,32 +633,25 @@ Lyrics parse_platform_lyrics(const TrackRef &track, const std::string &body,
   lyrics.track = track;
 
   std::vector<LyricLine> lines = parse_yrc_track(body);
-  if (!lines.empty()) {
-    lyrics.mode = LyricsMode::WordSynced;
-  } else {
+  if (lines.empty()) {
     lines = parse_enhanced_lrc_track(body);
-    if (!lines.empty() && !lines.front().words.empty()) {
-      lyrics.mode = LyricsMode::WordSynced;
-    } else if (!lines.empty()) {
-      lyrics.mode = LyricsMode::LineSynced;
-    } else {
+    if (lines.empty()) {
       for (const LyricTrackLine &entry : parse_lrc_track(body)) {
         LyricLine line;
         line.start_ms = entry.start_ms;
-        line.text = entry.text;
+        line.items.push_back(make_text_item(entry.text));
         lines.push_back(std::move(line));
       }
-      lyrics.mode = lines.empty() ? LyricsMode::Unsynced : LyricsMode::LineSynced;
     }
   }
 
   if (!translation.empty()) {
     attach_aux_track(lines, parse_lrc_track(translation),
-                     LyricAuxKind::Translation);
+                     LyricItemKind::Translation);
   }
   if (!romanization.empty()) {
     attach_aux_track(lines, parse_lrc_track(romanization),
-                     LyricAuxKind::Romanization);
+                     LyricItemKind::Romanization);
   }
 
   // 先挂副轨再处理间奏：短空行连同它的空副轨一起删除，
@@ -556,6 +660,7 @@ Lyrics parse_platform_lyrics(const TrackRef &track, const std::string &body,
   normalize_interlude_placeholders(lines);
 
   if (lines.empty()) {
+    update_modes(lyrics);
     return lyrics;
   }
   lyrics.lines = std::move(lines);
@@ -563,6 +668,7 @@ Lyrics parse_platform_lyrics(const TrackRef &track, const std::string &body,
   if (!plain.empty()) {
     lyrics.plain_text = plain;
   }
+  update_modes(lyrics);
   return lyrics;
 }
 
