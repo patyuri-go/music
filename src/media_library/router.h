@@ -169,6 +169,13 @@ private:
                                      const CallContext &ctx,
                                      Executor &&executor);
 
+  // 取最优多源执行：遍历全部候选，用 better 选出最佳值；质量相同时保留
+  // 先出现的候选（候选顺序即优先级）。
+  template <typename T, typename Executor, typename Better>
+  Result<AspectResult<T>> run_aspect_best(const SourceRef &ref, Aspect aspect,
+                                          const CallContext &ctx,
+                                          Executor &&executor, Better &&better);
+
   std::int64_t now_ms() const;
   static bool should_fall_back(ErrorCode code) noexcept;
 

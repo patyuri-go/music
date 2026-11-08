@@ -23,6 +23,39 @@ std::int64_t current_ms() {
       .count();
 }
 
+// 歌词质量：逐字 > 逐行 > 未同步；同一档再比 和声 > 翻译 > 标音。
+bool lyrics_better(const Lyrics &lhs, const Lyrics &rhs) {
+  const auto timing_rank = [](const Lyrics &lyrics) {
+    if (has_mode(lyrics, LyricsMode::WordSynced)) {
+      return 2;
+    }
+    if (has_mode(lyrics, LyricsMode::LineSynced)) {
+      return 1;
+    }
+    return 0;
+  };
+  const int lhs_timing = timing_rank(lhs);
+  const int rhs_timing = timing_rank(rhs);
+  if (lhs_timing != rhs_timing) {
+    return lhs_timing > rhs_timing;
+  }
+
+  const bool lhs_background = has_mode(lhs, LyricsMode::HasBackground);
+  const bool rhs_background = has_mode(rhs, LyricsMode::HasBackground);
+  if (lhs_background != rhs_background) {
+    return lhs_background;
+  }
+
+  const bool lhs_translation = has_mode(lhs, LyricsMode::HasTranslation);
+  const bool rhs_translation = has_mode(rhs, LyricsMode::HasTranslation);
+  if (lhs_translation != rhs_translation) {
+    return lhs_translation;
+  }
+
+  return has_mode(lhs, LyricsMode::HasRomanization) &&
+         !has_mode(rhs, LyricsMode::HasRomanization);
+}
+
 // 5.3.10：全部来源失败时的整体错误码优先级（数字越小越优先）。
 int aggregate_error_rank(ErrorCode code) noexcept {
   switch (code) {
@@ -670,6 +703,88 @@ Router::run_aspect(const SourceRef &ref, Aspect aspect, const CallContext &ctx,
   return Result<AspectResult<T>>::failure(std::move(*last_error));
 }
 
+// 取最优多源执行：成功也不提前返回，继续比较后续候选；只有 better 严格
+// 更优时才替换，因此同质量天然保留候选顺序中的第一个（优先级更高）。
+template <typename T, typename Executor, typename Better>
+Result<AspectResult<T>>
+Router::run_aspect_best(const SourceRef &ref, Aspect aspect,
+                        const CallContext &ctx, Executor &&executor,
+                        Better &&better) {
+  const std::vector<SourceRef> candidates = candidates_for(ref, aspect, ctx);
+  if (candidates.empty()) {
+    Error error = Error::make(
+        ErrorCode::Unsupported,
+        "no library provides aspect " + std::string(aspect_name(aspect)));
+    error.library_id = ref.library_id;
+    error.capability = std::string(capability_name(capability_for(aspect)));
+    return Result<AspectResult<T>>::failure(std::move(error));
+  }
+
+  AspectResult<T> output;
+  std::optional<Error> last_error;
+  bool has_value = false;
+
+  for (const SourceRef &candidate : candidates) {
+    if (ctx.deadline_ms.has_value() && current_ms() >= *ctx.deadline_ms) {
+      last_error = Error::make(ErrorCode::Timeout, "request deadline exceeded");
+      break;
+    }
+
+    const std::int64_t started = current_ms();
+    AspectAttempt attempt;
+    attempt.library_id = candidate.library_id;
+
+    auto lease = registry_->acquire(candidate.library_id, capability_for(aspect),
+                                    now_ms(), ctx.deadline_ms);
+    if (!lease.ok()) {
+      attempt.ok = false;
+      attempt.error = lease.error().code;
+      attempt.elapsed_ms = current_ms() - started;
+      output.attempts.push_back(attempt);
+      last_error = lease.error();
+      if (!should_fall_back(lease.error().code)) {
+        break;
+      }
+      continue;
+    }
+
+    auto library = lease.value().library();
+    Result<T> result = executor(*library, candidate, ctx);
+    attempt.elapsed_ms = current_ms() - started;
+
+    if (result.ok()) {
+      lease.value().finish(std::nullopt);
+      attempt.ok = true;
+      output.attempts.push_back(attempt);
+      if (!has_value || better(result.value(), output.value)) {
+        output.value = std::move(result).value();
+        output.source = candidate;
+        output.substituted = !(candidate == ref);
+        has_value = true;
+      }
+      continue;
+    }
+
+    lease.value().finish(result.error());
+    attempt.ok = false;
+    attempt.error = result.error().code;
+    output.attempts.push_back(attempt);
+    last_error = result.error();
+    if (!should_fall_back(result.error().code)) {
+      break;
+    }
+  }
+
+  if (has_value) {
+    return Result<AspectResult<T>>::success(std::move(output));
+  }
+  if (!last_error.has_value()) {
+    last_error = Error::make(ErrorCode::Unsupported,
+                             "no candidate produced a value");
+  }
+  return Result<AspectResult<T>>::failure(std::move(*last_error));
+}
+
 Result<AspectResult<Track>> Router::resolve_track(const TrackRef &ref,
                                                   const CallContext &ctx) {
   return run_aspect<Track>(
@@ -687,7 +802,7 @@ Result<AspectResult<Track>> Router::resolve_track(const TrackRef &ref,
 
 Result<AspectResult<Lyrics>> Router::resolve_lyrics(const TrackRef &ref,
                                                     const CallContext &ctx) {
-  return run_aspect<Lyrics>(
+  return run_aspect_best<Lyrics>(
       ref, Aspect::Lyrics, ctx,
       [](Library &library, const SourceRef &candidate,
          const CallContext &call_ctx) -> Result<Lyrics> {
@@ -697,6 +812,9 @@ Result<AspectResult<Lyrics>> Router::resolve_lyrics(const TrackRef &ref,
               Error::make(ErrorCode::Unsupported, "no lyrics provider"));
         }
         return provider->get().get_lyrics(candidate, call_ctx);
+      },
+      [](const Lyrics &lhs, const Lyrics &rhs) {
+        return lyrics_better(lhs, rhs);
       });
 }
 
