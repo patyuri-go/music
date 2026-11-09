@@ -26,3 +26,12 @@ config.json
 /lyrics_test
 /artists_test
 /amll_ttml_test
+
+/third_party/*/tests/
+/third_party/*/test/
+/third_party/*/docs/
+/third_party/*/doc/
+/third_party/*/examples/
+/third_party/*/CMakeFiles/
+/third_party/*/.github/
+/third_party/*/.vscode/

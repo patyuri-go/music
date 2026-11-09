@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.23)
 project(musicd)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -62,7 +62,7 @@ set_target_properties(musicd PROPERTIES
 
 target_compile_options(musicd PRIVATE -g)
 
-target_link_libraries(musicd PRIVATE Crow SQLiteCpp tag pugixml OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(musicd PRIVATE Crow SQLiteCpp SOCI::SOCI tag pugixml OpenSSL::SSL OpenSSL::Crypto)
 
 # TagLib 的 CMake 目标只导出 INSTALL_INTERFACE 路径，不传播 build-tree include。
 # 需手动补充三层：
