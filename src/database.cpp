@@ -318,6 +318,24 @@ std::optional<Album> AlbumRepo::byId(int id) {
   return readAlbum(result.rows.front());
 }
 
+std::vector<Album> AlbumRepo::byIds(const std::vector<int> &ids) {
+  if (ids.empty()) {
+    return {};
+  }
+  db::ParamList params;
+  params.reserve(ids.size());
+  for (const int id : ids) {
+    params.push_back(static_cast<std::int64_t>(id));
+  }
+  return readAlbums(pdb_.query(
+      "SELECT a.*, " +
+          schema::sql::artistIdsSubquery(pdb_.dialect(), "album_artist",
+                                         "album_id", "a.id") +
+          " FROM album a WHERE a.id IN (" +
+          schema::sql::placeholders(ids.size()) + ") ORDER BY a.id",
+      params));
+}
+
 std::vector<Album> AlbumRepo::byArtist(int artist_id) {
   return readAlbums(pdb_.query(schema::sql::albumsByArtist(pdb_.dialect()),
                                {static_cast<std::int64_t>(artist_id)}));

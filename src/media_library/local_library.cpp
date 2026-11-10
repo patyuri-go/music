@@ -10,16 +10,15 @@
 #include "api/webdav/webdav.h"
 #include "media_library/lyric_parser.h"
 
-
 #include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <sstream>
 #include <system_error>
 #include <unordered_map>
-#include <optional>
 #include <unordered_set>
 
 namespace media_library {
@@ -78,10 +77,9 @@ bool contains_name(const std::vector<ArtistLink> &links,
 bool contains_name(const std::vector<AlbumArtistLink> &links,
                    const std::string &name) {
   const std::string needle = lower(name);
-  return std::any_of(links.begin(), links.end(),
-                     [&](const AlbumArtistLink &link) {
-                       return lower(link.name) == needle;
-                     });
+  return std::any_of(
+      links.begin(), links.end(),
+      [&](const AlbumArtistLink &link) { return lower(link.name) == needle; });
 }
 
 // 结果集按列取值。列不存在时当作 NULL，避免调用方到处做越界判断。
@@ -223,7 +221,8 @@ std::vector<std::string> LocalLibrary::genres_of(int track_id) const {
   return out;
 }
 
-std::optional<repo::Album> LocalLibrary::album_of(const repo::Track &row) const {
+std::optional<repo::Album>
+LocalLibrary::album_of(const repo::Track &row) const {
   if (row.album_id <= 0) {
     return std::nullopt;
   }
@@ -253,34 +252,30 @@ Track LocalLibrary::build_track(const repo::Track &row) {
   for (const int artist_id : row.artist_ids) {
     if (const auto artist = artists.byId(artist_id)) {
       track.artists.push_back(
-          ArtistLink{ref_for(EntityType::Artist, artist_id),
-                     artist->name});
+          ArtistLink{ref_for(EntityType::Artist, artist_id), artist->name});
     }
   }
 
   if (const auto album = album_of(row)) {
-    track.album = AlbumLink{ref_for(EntityType::Album, album->id),
-                            album->name};
+    track.album = AlbumLink{ref_for(EntityType::Album, album->id), album->name};
     track.year = album->year;
     repo::AlbumRepo albums(db());
     for (const int artist_id : albums.artistIdsByAlbumId(album->id)) {
       if (const auto artist = artists.byId(artist_id)) {
         track.album_artists.push_back(AlbumArtistLink{
-            ref_for(EntityType::AlbumArtist, artist_id),
-            artist->name});
+            ref_for(EntityType::AlbumArtist, artist_id), artist->name});
       }
     }
     const std::string cover = cover_path_of(track.ref);
     if (!cover.empty()) {
       track.artwork = ArtworkRef{
-          ref_for(EntityType::Album, album->id), "primary",
-          std::nullopt, std::to_string(std::hash<std::string>{}(cover))};
+          ref_for(EntityType::Album, album->id), "primary", std::nullopt,
+          std::to_string(std::hash<std::string>{}(cover))};
     }
   }
 
   track.lyrics_available =
-      !db()
-           .query("SELECT 1 FROM track_lyrics WHERE track_id = ? AND "
+      !db().query("SELECT 1 FROM track_lyrics WHERE track_id = ? AND "
                   "text <> ''",
                   {static_cast<std::int64_t>(row.id)})
            .empty();
@@ -298,15 +293,14 @@ Album LocalLibrary::build_album(const repo::Album &row) {
   for (const int artist_id : row.artist_ids) {
     if (const auto artist = artists.byId(artist_id)) {
       album.artists.push_back(AlbumArtistLink{
-          ref_for(EntityType::AlbumArtist, artist_id),
-          artist->name});
+          ref_for(EntityType::AlbumArtist, artist_id), artist->name});
     }
   }
 
   if (!row.cover_path.empty()) {
-    album.artwork = ArtworkRef{
-        album.ref, "primary", std::nullopt,
-        std::to_string(std::hash<std::string>{}(row.cover_path))};
+    album.artwork =
+        ArtworkRef{album.ref, "primary", std::nullopt,
+                   std::to_string(std::hash<std::string>{}(row.cover_path))};
   }
   return album;
 }
@@ -318,17 +312,247 @@ Artist LocalLibrary::build_artist(const repo::Artist &row) {
   artist.sort_name = row.sort_name;
   const std::string cover = cover_path_of(artist.ref);
   if (!cover.empty()) {
-    artist.artwork = ArtworkRef{
-        artist.ref, "primary", std::nullopt,
-        std::to_string(std::hash<std::string>{}(cover))};
+    artist.artwork =
+        ArtworkRef{artist.ref, "primary", std::nullopt,
+                   std::to_string(std::hash<std::string>{}(cover))};
   }
   return artist;
 }
 
+std::vector<Track>
+LocalLibrary::build_tracks(const std::vector<repo::Track> &rows) {
+  std::vector<Track> out;
+  if (rows.empty()) {
+    return out;
+  }
+  out.reserve(rows.size());
+
+  db::ParamList track_ids;
+  track_ids.reserve(rows.size());
+  std::vector<int> album_ids;
+  std::unordered_set<int> seen_albums;
+  for (const repo::Track &row : rows) {
+    track_ids.push_back(static_cast<std::int64_t>(row.id));
+    if (row.album_id > 0 && seen_albums.insert(row.album_id).second) {
+      album_ids.push_back(row.album_id);
+    }
+  }
+  const std::string track_in = schema::sql::placeholders(rows.size());
+
+  std::unordered_map<int, std::vector<std::string>> genres;
+  for (const db::Row &row :
+       db()
+           .query("SELECT tg.track_id, g.name FROM track_genre tg "
+                  "JOIN genre g ON g.id = tg.genre_id WHERE tg.track_id "
+                  "IN (" +
+                      track_in + ") ORDER BY tg.track_id, g.name",
+                  track_ids)
+           .rows) {
+    genres[static_cast<int>(int_at(row, 0))].push_back(text_at(row, 1));
+  }
+
+  std::unordered_map<int, std::vector<ArtistLink>> track_artists;
+  for (const db::Row &row :
+       db()
+           .query("SELECT ta.track_id, a.id, a.name FROM track_artist ta "
+                  "JOIN artist a ON a.id = ta.artist_id WHERE ta.track_id "
+                  "IN (" +
+                      track_in +
+                      ") ORDER BY ta.track_id, ta.position, ta.artist_id",
+                  track_ids)
+           .rows) {
+    track_artists[static_cast<int>(int_at(row, 0))].push_back(ArtistLink{
+        ref_for(EntityType::Artist, static_cast<int>(int_at(row, 1))),
+        text_at(row, 2)});
+  }
+
+  std::unordered_set<int> with_lyrics;
+  for (const db::Row &row :
+       db()
+           .query("SELECT track_id FROM track_lyrics WHERE track_id IN (" +
+                      track_in + ") AND text <> ''",
+                  track_ids)
+           .rows) {
+    with_lyrics.insert(static_cast<int>(int_at(row, 0)));
+  }
+
+  std::unordered_map<int, repo::Album> albums;
+  std::unordered_map<int, std::vector<AlbumArtistLink>> album_artists;
+  if (!album_ids.empty()) {
+    repo::AlbumRepo album_repo(db());
+    for (repo::Album &album : album_repo.byIds(album_ids)) {
+      albums.emplace(album.id, std::move(album));
+    }
+
+    db::ParamList album_params;
+    album_params.reserve(album_ids.size());
+    for (const int album_id : album_ids) {
+      album_params.push_back(static_cast<std::int64_t>(album_id));
+    }
+    for (const db::Row &row :
+         db()
+             .query("SELECT aa.album_id, a.id, a.name FROM album_artist aa "
+                    "JOIN artist a ON a.id = aa.artist_id WHERE aa.album_id "
+                    "IN (" +
+                        schema::sql::placeholders(album_ids.size()) +
+                        ") ORDER BY aa.album_id, aa.position, aa.artist_id",
+                    album_params)
+             .rows) {
+      album_artists[static_cast<int>(int_at(row, 0))].push_back(
+          AlbumArtistLink{
+              ref_for(EntityType::AlbumArtist,
+                      static_cast<int>(int_at(row, 1))),
+              text_at(row, 2)});
+    }
+  }
+
+  for (const repo::Track &row : rows) {
+    Track track;
+    track.ref = ref_for(EntityType::Track, row.id);
+    track.title = row.title;
+    track.duration_ms = row.duration_ms;
+    track.track_no = row.track_no;
+    track.disc_no = row.disc_no;
+    const auto genre_it = genres.find(row.id);
+    if (genre_it != genres.end()) {
+      track.genres = genre_it->second;
+    }
+    track.user_data.play_count = row.play_count;
+    track.user_data.last_played = row.last_played;
+    track.user_data.rating = row.rating;
+    track.user_data.added_at = row.added_at;
+    track.audio.bitrate_kbps = row.bitrate;
+    track.audio.sample_rate = row.sample_rate;
+    track.audio.channels = row.channels;
+    track.audio.format = row.format;
+    track.audio.size_bytes = row.size_bytes;
+
+    const auto artist_it = track_artists.find(row.id);
+    if (artist_it != track_artists.end()) {
+      track.artists = artist_it->second;
+    }
+
+    const auto album_it = albums.find(row.album_id);
+    if (album_it != albums.end()) {
+      const repo::Album &album = album_it->second;
+      track.album =
+          AlbumLink{ref_for(EntityType::Album, album.id), album.name};
+      track.year = album.year;
+      const auto album_artist_it = album_artists.find(album.id);
+      if (album_artist_it != album_artists.end()) {
+        track.album_artists = album_artist_it->second;
+      }
+      if (!album.cover_path.empty()) {
+        track.artwork = ArtworkRef{
+            ref_for(EntityType::Album, album.id), "primary", std::nullopt,
+            std::to_string(std::hash<std::string>{}(album.cover_path))};
+      }
+    }
+
+    track.lyrics_available = with_lyrics.count(row.id) != 0;
+    out.push_back(std::move(track));
+  }
+  return out;
+}
+
+std::vector<Album>
+LocalLibrary::build_albums(const std::vector<repo::Album> &rows) {
+  std::vector<Album> out;
+  if (rows.empty()) {
+    return out;
+  }
+  out.reserve(rows.size());
+
+  db::ParamList album_params;
+  album_params.reserve(rows.size());
+  for (const repo::Album &row : rows) {
+    album_params.push_back(static_cast<std::int64_t>(row.id));
+  }
+
+  std::unordered_map<int, std::vector<AlbumArtistLink>> album_artists;
+  for (const db::Row &row :
+       db()
+           .query("SELECT aa.album_id, a.id, a.name FROM album_artist aa "
+                  "JOIN artist a ON a.id = aa.artist_id WHERE aa.album_id "
+                  "IN (" +
+                      schema::sql::placeholders(rows.size()) +
+                      ") ORDER BY aa.album_id, aa.position, aa.artist_id",
+                  album_params)
+           .rows) {
+    album_artists[static_cast<int>(int_at(row, 0))].push_back(
+        AlbumArtistLink{
+            ref_for(EntityType::AlbumArtist, static_cast<int>(int_at(row, 1))),
+            text_at(row, 2)});
+  }
+
+  for (const repo::Album &row : rows) {
+    Album album;
+    album.ref = ref_for(EntityType::Album, row.id);
+    album.title = row.name;
+    album.year = row.year;
+    const auto artist_it = album_artists.find(row.id);
+    if (artist_it != album_artists.end()) {
+      album.artists = artist_it->second;
+    }
+    if (!row.cover_path.empty()) {
+      album.artwork = ArtworkRef{
+          album.ref, "primary", std::nullopt,
+          std::to_string(std::hash<std::string>{}(row.cover_path))};
+    }
+    out.push_back(std::move(album));
+  }
+  return out;
+}
+
+std::vector<Artist>
+LocalLibrary::build_artists(const std::vector<repo::Artist> &rows) {
+  std::vector<Artist> out;
+  if (rows.empty()) {
+    return out;
+  }
+  out.reserve(rows.size());
+
+  db::ParamList artist_params;
+  artist_params.reserve(rows.size());
+  for (const repo::Artist &row : rows) {
+    artist_params.push_back(static_cast<std::int64_t>(row.id));
+  }
+
+  // 与单条 cover_path_of 的语义一致：任一有封面的专辑即可；
+  // 批量路径固定取 album id 最小的一张，避免结果随扫描顺序变化。
+  std::unordered_map<int, std::string> covers;
+  for (const db::Row &row :
+       db()
+           .query("SELECT aa.artist_id, al.cover_path FROM album_artist aa "
+                  "JOIN album al ON al.id = aa.album_id WHERE aa.artist_id "
+                  "IN (" +
+                      schema::sql::placeholders(rows.size()) +
+                      ") AND al.cover_path IS NOT NULL AND al.cover_path <> '' "
+                      "ORDER BY aa.artist_id, al.id",
+                  artist_params)
+           .rows) {
+    covers.emplace(static_cast<int>(int_at(row, 0)), text_at(row, 1));
+  }
+
+  for (const repo::Artist &row : rows) {
+    Artist artist;
+    artist.ref = ref_for(EntityType::Artist, row.id);
+    artist.name = row.name;
+    artist.sort_name = row.sort_name;
+    const auto cover_it = covers.find(row.id);
+    if (cover_it != covers.end()) {
+      artist.artwork = ArtworkRef{
+          artist.ref, "primary", std::nullopt,
+          std::to_string(std::hash<std::string>{}(cover_it->second))};
+    }
+    out.push_back(std::move(artist));
+  }
+  return out;
+}
+
 Result<Track> LocalLibrary::get_track(const TrackRef &ref,
                                       const CallContext &) {
-  if (ref.entity_type != EntityType::Track ||
-      ref.library_id != library_id_) {
+  if (ref.entity_type != EntityType::Track || ref.library_id != library_id_) {
     return Result<Track>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid track reference"));
   }
@@ -348,8 +572,7 @@ Result<Track> LocalLibrary::get_track(const TrackRef &ref,
 
 Result<Album> LocalLibrary::get_album(const AlbumRef &ref,
                                       const CallContext &) {
-  if (ref.entity_type != EntityType::Album ||
-      ref.library_id != library_id_) {
+  if (ref.entity_type != EntityType::Album || ref.library_id != library_id_) {
     return Result<Album>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid album reference"));
   }
@@ -369,8 +592,7 @@ Result<Album> LocalLibrary::get_album(const AlbumRef &ref,
 
 Result<Artist> LocalLibrary::get_artist(const ArtistRef &ref,
                                         const CallContext &) {
-  if (ref.entity_type != EntityType::Artist ||
-      ref.library_id != library_id_) {
+  if (ref.entity_type != EntityType::Artist || ref.library_id != library_id_) {
     return Result<Artist>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid artist reference"));
   }
@@ -391,8 +613,7 @@ Result<Artist> LocalLibrary::get_artist(const ArtistRef &ref,
 Result<Page<Track>> LocalLibrary::list_album_tracks(const AlbumRef &ref,
                                                     const PageRequest &page,
                                                     const CallContext &) {
-  if (ref.entity_type != EntityType::Album ||
-      ref.library_id != library_id_) {
+  if (ref.entity_type != EntityType::Album || ref.library_id != library_id_) {
     return Result<Page<Track>>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid album reference"));
   }
@@ -405,21 +626,23 @@ Result<Page<Track>> LocalLibrary::list_album_tracks(const AlbumRef &ref,
   std::vector<repo::Track> rows = tracks.byAlbum(*internal_id);
   Page<Track> out;
   const int limit = page.limit > 0 ? page.limit : 50;
-  for (const auto &row : rows) {
-    out.items.push_back(build_track(row));
-    if (static_cast<int>(out.items.size()) >= limit) {
-      break;
-    }
-  }
-  out.has_more = static_cast<int>(rows.size()) > static_cast<int>(out.items.size());
+  const std::size_t total = rows.size();
+  const std::size_t take =
+      std::min<std::size_t>(total, static_cast<std::size_t>(limit));
+  rows.resize(take);
+
+  // 详情页一次取整张专辑：曲目行已由 byAlbum 取回，其余关联数据由
+  // build_tracks 按 id 集合批量查，避免每首曲目再发多条 SQL（远端
+  // PostgreSQL 下 15 首就是 100+ 次往返）。
+  out.items = build_tracks(rows);
+  out.has_more = total > out.items.size();
   return Result<Page<Track>>::success(std::move(out));
 }
 
 Result<Page<Album>> LocalLibrary::list_artist_albums(const ArtistRef &ref,
                                                      const PageRequest &page,
                                                      const CallContext &) {
-  if (ref.entity_type != EntityType::Artist ||
-      ref.library_id != library_id_) {
+  if (ref.entity_type != EntityType::Artist || ref.library_id != library_id_) {
     return Result<Page<Album>>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid artist reference"));
   }
@@ -432,13 +655,14 @@ Result<Page<Album>> LocalLibrary::list_artist_albums(const ArtistRef &ref,
   std::vector<repo::Album> rows = albums.byArtist(*internal_id);
   Page<Album> out;
   const int limit = page.limit > 0 ? page.limit : 50;
-  for (const auto &row : rows) {
-    out.items.push_back(build_album(row));
-    if (static_cast<int>(out.items.size()) >= limit) {
-      break;
-    }
-  }
-  out.has_more = static_cast<int>(rows.size()) > static_cast<int>(out.items.size());
+  const std::size_t total = rows.size();
+  const std::size_t take =
+      std::min<std::size_t>(total, static_cast<std::size_t>(limit));
+  rows.resize(take);
+
+  // 专辑行已带 artist_ids 聚合列，这里只批量补艺术家名。
+  out.items = build_albums(rows);
+  out.has_more = total > out.items.size();
   return Result<Page<Album>>::success(std::move(out));
 }
 
@@ -457,8 +681,7 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
       wants(EntityType::Artist) || wants(EntityType::AlbumArtist);
 
   Page<SearchHit> page;
-  if (query.text.empty() ||
-      (!want_tracks && !want_albums && !want_artists)) {
+  if (query.text.empty() || (!want_tracks && !want_albums && !want_artists)) {
     return Result<Page<SearchHit>>::success(std::move(page));
   }
 
@@ -476,8 +699,7 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
 
   if (want_albums) {
     repo::AlbumRepo albums(db());
-    for (const auto &row : albums.search(query.text, want)) {
-      const Album album = build_album(row);
+    for (Album &album : build_albums(albums.search(query.text, want))) {
       SearchHit hit;
       hit.kind = EntityType::Album;
       hit.ref = album.ref;
@@ -493,8 +715,7 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
 
   if (want_artists) {
     repo::ArtistRepo artists(db());
-    for (const auto &row : artists.search(query.text, want)) {
-      const Artist artist = build_artist(row);
+    for (Artist &artist : build_artists(artists.search(query.text, want))) {
       SearchHit hit;
       hit.kind = EntityType::Artist;
       hit.ref = artist.ref;
@@ -505,9 +726,10 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
   }
 
   if (want_tracks) {
-    repo::TrackRepo tracks(db());
-    for (const auto &row : tracks.search(query.text, want)) {
-      const Track track = build_track(row);
+    repo::TrackRepo track_repo(db());
+    std::vector<Track> tracks =
+        build_tracks(track_repo.search(query.text, want));
+    for (Track &track : tracks) {
       if (!query.artists.empty()) {
         const bool match =
             std::any_of(query.artists.begin(), query.artists.end(),
@@ -562,8 +784,7 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
 
 Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
                                                       const CallContext &) {
-  if (ref.entity_type != EntityType::Track ||
-      ref.library_id != library_id_) {
+  if (ref.entity_type != EntityType::Track || ref.library_id != library_id_) {
     return Result<PlaybackSource>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid track reference"));
   }
@@ -597,8 +818,7 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
 
 Result<Lyrics> LocalLibrary::get_lyrics(const TrackRef &ref,
                                         const CallContext &) {
-  if (ref.entity_type != EntityType::Track ||
-      ref.library_id != library_id_) {
+  if (ref.entity_type != EntityType::Track || ref.library_id != library_id_) {
     return Result<Lyrics>::failure(
         Error::make(ErrorCode::InvalidRequest, "invalid track reference"));
   }
@@ -610,9 +830,8 @@ Result<Lyrics> LocalLibrary::get_lyrics(const TrackRef &ref,
 
   std::string text;
   {
-    const auto result = db().query(
-        schema::sql::kTrackLyricsByTrackId,
-        {static_cast<std::int64_t>(*internal_id)});
+    const auto result = db().query(schema::sql::kTrackLyricsByTrackId,
+                                   {static_cast<std::int64_t>(*internal_id)});
     if (result.rows.empty()) {
       return Result<Lyrics>::failure(
           Error::make(ErrorCode::NotFound, "lyrics not found"));
@@ -637,7 +856,7 @@ std::string LocalLibrary::cover_path_of(const SourceRef &owner) const {
 
   if (owner.entity_type == EntityType::Album) {
     const auto result = db().query("SELECT cover_path FROM album WHERE id = ?",
-                                  {static_cast<std::int64_t>(*internal_id)});
+                                   {static_cast<std::int64_t>(*internal_id)});
     if (!result.rows.empty() && !is_null_at(result.rows.front(), 0)) {
       return text_at(result.rows.front(), 0);
     }
@@ -692,8 +911,8 @@ Result<ArtworkRef> LocalLibrary::get_artwork(const SourceRef &owner,
   return Result<ArtworkRef>::success(std::move(artwork));
 }
 
-Result<ArtworkLocation>
-LocalLibrary::artwork_location(const ArtworkRef &ref, const CallContext &) {
+Result<ArtworkLocation> LocalLibrary::artwork_location(const ArtworkRef &ref,
+                                                       const CallContext &) {
   const std::string path = cover_path_of(ref.owner);
   if (path.empty()) {
     return Result<ArtworkLocation>::failure(
@@ -722,9 +941,9 @@ CatalogSnapshot LocalLibrary::snapshot() {
 
   std::unordered_map<int, std::vector<int>> album_artist_ids;
   {
-    const auto result = db().query(
-        "SELECT album_id, artist_id FROM album_artist ORDER BY "
-        "album_id, position");
+    const auto result =
+        db().query("SELECT album_id, artist_id FROM album_artist ORDER BY "
+                   "album_id, position");
     for (const auto &row : result.rows) {
       album_artist_ids[static_cast<int>(int_at(row, 0))].push_back(
           static_cast<int>(int_at(row, 1)));
@@ -733,9 +952,9 @@ CatalogSnapshot LocalLibrary::snapshot() {
 
   std::unordered_map<int, std::vector<int>> track_artist_ids;
   {
-    const auto result = db().query(
-        "SELECT track_id, artist_id FROM track_artist ORDER BY "
-        "track_id, position");
+    const auto result =
+        db().query("SELECT track_id, artist_id FROM track_artist ORDER BY "
+                   "track_id, position");
     for (const auto &row : result.rows) {
       track_artist_ids[static_cast<int>(int_at(row, 0))].push_back(
           static_cast<int>(int_at(row, 1)));
@@ -745,9 +964,9 @@ CatalogSnapshot LocalLibrary::snapshot() {
   std::unordered_map<int, std::vector<GenreEntry>> genre_by_track;
   std::unordered_set<std::string> seen_genres;
   {
-    const auto result = db().query(
-        "SELECT tg.track_id, g.id, g.name FROM track_genre tg "
-        "JOIN genre g ON g.id = tg.genre_id ORDER BY g.name");
+    const auto result =
+        db().query("SELECT tg.track_id, g.id, g.name FROM track_genre tg "
+                   "JOIN genre g ON g.id = tg.genre_id ORDER BY g.name");
     for (const auto &row : result.rows) {
       const GenreEntry entry{static_cast<int>(int_at(row, 1)), text_at(row, 2)};
       genre_by_track[static_cast<int>(int_at(row, 0))].push_back(entry);
@@ -774,22 +993,23 @@ CatalogSnapshot LocalLibrary::snapshot() {
 
   std::unordered_set<int> lyrics_tracks;
   {
-    const auto result = db().query(
-        "SELECT track_id FROM track_lyrics WHERE text <> ''");
+    const auto result =
+        db().query("SELECT track_id FROM track_lyrics WHERE text <> ''");
     for (const auto &row : result.rows) {
       lyrics_tracks.insert(static_cast<int>(int_at(row, 0)));
     }
   }
 
   {
-    const auto result = db().query(
-        "SELECT a.id, a.name, a.year, a.cover_path FROM album a ORDER BY a.name");
+    const auto result = db().query("SELECT a.id, a.name, a.year, a.cover_path "
+                                   "FROM album a ORDER BY a.name");
     for (const auto &source : result.rows) {
       repo::Album row;
       row.id = static_cast<int>(int_at(source, 0));
       row.name = text_at(source, 1);
       row.year = static_cast<int>(int_at(source, 2));
-      row.cover_path = is_null_at(source, 3) ? std::string() : text_at(source, 3);
+      row.cover_path =
+          is_null_at(source, 3) ? std::string() : text_at(source, 3);
       const auto it = album_artist_ids.find(row.id);
       if (it != album_artist_ids.end()) {
         row.artist_ids = it->second;
@@ -823,12 +1043,13 @@ CatalogSnapshot LocalLibrary::snapshot() {
   }
 
   {
-    const auto result = db().query(
-        "SELECT id, name, sort_name FROM artist ORDER BY "
-        "COALESCE(NULLIF(sort_name, ''), name)");
+    const auto result =
+        db().query("SELECT id, name, sort_name FROM artist ORDER BY "
+                   "COALESCE(NULLIF(sort_name, ''), name)");
     for (const auto &row : result.rows) {
       Artist artist;
-      artist.ref = ref_for(EntityType::Artist, static_cast<int>(int_at(row, 0)));
+      artist.ref =
+          ref_for(EntityType::Artist, static_cast<int>(int_at(row, 0)));
       artist.name = text_at(row, 1);
       artist.sort_name = is_null_at(row, 2) ? std::string() : text_at(row, 2);
       out.artist_internal_ids.push_back(static_cast<int>(int_at(row, 0)));
@@ -845,7 +1066,8 @@ CatalogSnapshot LocalLibrary::snapshot() {
   {
     const auto result = db().query(
         "SELECT id, root_id, path, title, album_id, disc_no, track_no, "
-        "duration_ms, bitrate, sample_rate, channels, format, size_bytes, mtime, "
+        "duration_ms, bitrate, sample_rate, channels, format, size_bytes, "
+        "mtime, "
         "added_at, play_count, last_played, rating FROM track "
         "ORDER BY album_id, disc_no, track_no, id");
     for (const auto &source : result.rows) {
@@ -864,7 +1086,8 @@ CatalogSnapshot LocalLibrary::snapshot() {
       row.format = is_null_at(source, 11) ? std::string() : text_at(source, 11);
       row.size_bytes = int_at(source, 12);
       row.mtime = int_at(source, 13);
-      row.added_at = is_null_at(source, 14) ? std::string() : text_at(source, 14);
+      row.added_at =
+          is_null_at(source, 14) ? std::string() : text_at(source, 14);
       row.play_count = static_cast<int>(int_at(source, 15));
       row.last_played =
           is_null_at(source, 16) ? std::string() : text_at(source, 16);
@@ -881,8 +1104,8 @@ CatalogSnapshot LocalLibrary::snapshot() {
       track.duration_ms = row.duration_ms > 0
                               ? std::optional<long long>(row.duration_ms)
                               : std::nullopt;
-      track.track_no = row.track_no > 0 ? std::optional<int>(row.track_no)
-                                        : std::nullopt;
+      track.track_no =
+          row.track_no > 0 ? std::optional<int>(row.track_no) : std::nullopt;
       track.disc_no =
           row.disc_no > 0 ? std::optional<int>(row.disc_no) : std::nullopt;
       track.user_data.play_count = row.play_count;
@@ -891,22 +1114,23 @@ CatalogSnapshot LocalLibrary::snapshot() {
       track.user_data.added_at = row.added_at;
       track.audio.bitrate_kbps =
           row.bitrate > 0 ? std::optional<int>(row.bitrate) : std::nullopt;
-      track.audio.sample_rate =
-          row.sample_rate > 0 ? std::optional<int>(row.sample_rate) : std::nullopt;
+      track.audio.sample_rate = row.sample_rate > 0
+                                    ? std::optional<int>(row.sample_rate)
+                                    : std::nullopt;
       track.audio.channels =
           row.channels > 0 ? std::optional<int>(row.channels) : std::nullopt;
       track.audio.format = row.format;
-      track.audio.size_bytes =
-          row.size_bytes > 0 ? std::optional<long long>(row.size_bytes)
-                             : std::nullopt;
+      track.audio.size_bytes = row.size_bytes > 0
+                                   ? std::optional<long long>(row.size_bytes)
+                                   : std::nullopt;
 
       for (const int artist_id : row.artist_ids) {
         const auto name = artist_names.find(artist_id);
         if (name == artist_names.end()) {
           continue;
         }
-        track.artists.push_back(ArtistLink{
-            ref_for(EntityType::Artist, artist_id), name->second});
+        track.artists.push_back(
+            ArtistLink{ref_for(EntityType::Artist, artist_id), name->second});
       }
 
       if (row.album_id > 0) {
@@ -924,14 +1148,12 @@ CatalogSnapshot LocalLibrary::snapshot() {
               continue;
             }
             track.album_artists.push_back(AlbumArtistLink{
-                ref_for(EntityType::AlbumArtist, artist_id),
-                name->second});
+                ref_for(EntityType::AlbumArtist, artist_id), name->second});
           }
         }
         if (const auto cover = album_cover_tag.find(row.album_id);
             cover != album_cover_tag.end()) {
-          track.artwork = ArtworkRef{ref_for(EntityType::Album,
-                                                       row.album_id),
+          track.artwork = ArtworkRef{ref_for(EntityType::Album, row.album_id),
                                      "primary", std::nullopt, cover->second};
         }
       }
@@ -967,9 +1189,9 @@ std::optional<TrackTransport>
 LocalLibrary::track_transport(int internal_id) const {
   TrackTransport transport;
   {
-    const auto result = db().query(
-        "SELECT path, mtime, album_id FROM track WHERE id = ?",
-        {static_cast<std::int64_t>(internal_id)});
+    const auto result =
+        db().query("SELECT path, mtime, album_id FROM track WHERE id = ?",
+                   {static_cast<std::int64_t>(internal_id)});
     if (!result.rows.empty()) {
       const auto &row = result.rows.front();
       transport.path = is_null_at(row, 0) ? std::string() : text_at(row, 0);
@@ -980,10 +1202,10 @@ LocalLibrary::track_transport(int internal_id) const {
     }
   }
   {
-    const auto result = db().query(
-        "SELECT artist_id FROM track_artist WHERE track_id = ? "
-        "ORDER BY position",
-        {static_cast<std::int64_t>(internal_id)});
+    const auto result =
+        db().query("SELECT artist_id FROM track_artist WHERE track_id = ? "
+                   "ORDER BY position",
+                   {static_cast<std::int64_t>(internal_id)});
     for (const auto &row : result.rows) {
       transport.artist_internal_ids.push_back(static_cast<int>(int_at(row, 0)));
     }

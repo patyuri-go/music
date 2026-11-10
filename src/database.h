@@ -99,6 +99,8 @@ class AlbumRepo {
 public:
   explicit AlbumRepo(db::Session &session);
   std::optional<Album> byId(int id);
+  // 批量取专辑行（含 artist_ids 聚合列），供列表/搜索一次装配。
+  std::vector<Album> byIds(const std::vector<int> &ids);
   std::vector<Album> byArtist(int artist_id);
   // 专辑名包含匹配，供 Searcher 出 Album 命中。
   std::vector<Album> search(const std::string &query, int limit);

@@ -108,6 +108,11 @@ private:
   Track build_track(const repo::Track &row);
   Album build_album(const repo::Album &row);
   Artist build_artist(const repo::Artist &row);
+  // 批量装配：行已由一条 SQL 取回，这里只按 id 集合补关联数据。
+  // 单条路径仍走 build_track/build_album/build_artist。
+  std::vector<Track> build_tracks(const std::vector<repo::Track> &rows);
+  std::vector<Album> build_albums(const std::vector<repo::Album> &rows);
+  std::vector<Artist> build_artists(const std::vector<repo::Artist> &rows);
   std::vector<std::string> genres_of(int track_id) const;
   std::optional<repo::Album> album_of(const repo::Track &row) const;
   std::string cover_path_of(const SourceRef &owner) const;
