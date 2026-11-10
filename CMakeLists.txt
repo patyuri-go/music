@@ -10,7 +10,10 @@ add_subdirectory(./third_party/)
 add_executable(musicd
   ./src/config.cpp
   ./src/db.cpp
+  ./src/db/session.cpp
+  ./src/db/soci_session.cpp
   ./src/schema.cpp
+  ./src/schema_pg.cpp
   ./src/storage.cpp
   ./src/image_cache.cpp
   ./src/database.cpp

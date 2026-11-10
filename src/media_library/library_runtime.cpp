@@ -18,11 +18,9 @@ std::shared_ptr<LocalLibrary> &runtime_holder() {
 
 } // namespace
 
-void initialize_library(std::string library_id, std::string display_name,
-                        std::string db_path) {
+void initialize_library(std::string library_id, std::string display_name) {
   auto created = std::make_shared<LocalLibrary>(std::move(library_id),
-                                               std::move(display_name),
-                                               std::move(db_path));
+                                               std::move(display_name));
   created->initialize();
 
   std::lock_guard<std::mutex> lock(runtime_mutex());

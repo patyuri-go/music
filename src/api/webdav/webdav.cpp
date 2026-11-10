@@ -6,9 +6,6 @@
 #include "db.h"
 #include "schema.h"
 
-#include <SQLiteCpp/Database.h>
-#include <SQLiteCpp/Statement.h>
-
 #include <asio.hpp>
 #include <asio/ssl.hpp>
 
@@ -877,13 +874,21 @@ Url resolveCredentials(const std::string &url) {
   }
   // 凭据只存数据库（WebDAV 扫描根），不再从配置文件读取。
   try {
-    SQLite::Database &db = db::conn(config::get().db_path.string());
-    SQLite::Statement q(db, schema::sql::kScanRootCredentials);
+    const auto roots = db::mainSession().query(schema::sql::kScanRootCredentials);
     std::size_t best_len = 0;
-    while (q.executeStep()) {
-      const std::string root_url = q.getColumn(0).getText();
-      const std::string root_user = q.getColumn(1).getText();
-      const std::string root_pass = q.getColumn(2).getText();
+    for (const auto &row : roots.rows) {
+      const auto text_at = [&row](std::size_t index) -> std::string {
+        if (index >= row.size()) {
+          return {};
+        }
+        if (const auto *text = std::get_if<std::string>(&row[index].value)) {
+          return *text;
+        }
+        return {};
+      };
+      const std::string root_url = text_at(0);
+      const std::string root_user = text_at(1);
+      const std::string root_pass = text_at(2);
       Url c;
       if (!parseUrl(root_url, c) || c.host != u.host || c.port != u.port) {
         continue;

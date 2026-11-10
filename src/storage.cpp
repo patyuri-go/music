@@ -5,6 +5,7 @@
 
 #include "api/webdav/webdav.h"
 #include "config.h"
+#include "db.h"
 
 namespace storage {
 
@@ -79,7 +80,7 @@ std::string rootNameOf(const std::string &virtual_path) {
 }
 
 std::optional<repo::ScanRoot> findRootByName(const std::string &name) {
-  repo::ScanRootRepo repo(config::get().db_path.string());
+  repo::ScanRootRepo repo(db::mainSession());
   return repo.byName(name);
 }
 
@@ -180,7 +181,7 @@ bool isUnderAnyRoot(const fs::path &target) {
   if (ec) {
     return false;
   }
-  repo::ScanRootRepo roots(config::get().db_path.string());
+  repo::ScanRootRepo roots(db::mainSession());
   for (const auto &root : roots.list()) {
     fs::path base = fs::weakly_canonical(root.path, ec);
     if (ec) {

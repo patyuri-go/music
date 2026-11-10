@@ -126,8 +126,8 @@ public:
 
 std::shared_ptr<AspectPriority> make_memory_aspect_priority();
 
-std::shared_ptr<EntityLinkResolver> make_sqlite_entity_link_resolver(
-    std::string db_path, std::shared_ptr<AspectPriority> defaults,
+std::shared_ptr<EntityLinkResolver> make_entity_link_resolver(
+    std::shared_ptr<AspectPriority> defaults,
     std::shared_ptr<BuiltinOrderSource> builtin);
 
 } // namespace media_library

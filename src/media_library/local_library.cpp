@@ -10,8 +10,6 @@
 #include "api/webdav/webdav.h"
 #include "media_library/lyric_parser.h"
 
-#include <SQLiteCpp/Database.h>
-#include <SQLiteCpp/Statement.h>
 
 #include <algorithm>
 #include <cctype>
@@ -86,12 +84,53 @@ bool contains_name(const std::vector<AlbumArtistLink> &links,
                      });
 }
 
+// 结果集按列取值。列不存在时当作 NULL，避免调用方到处做越界判断。
+const db::Cell &cell_at(const db::Row &row, std::size_t index) {
+  static const db::Cell kNull{db::Null{}};
+  return index < row.size() ? row[index] : kNull;
+}
+
+bool is_null_at(const db::Row &row, std::size_t index) {
+  return cell_at(row, index).is_null();
+}
+
+std::int64_t int_at(const db::Row &row, std::size_t index) {
+  const db::Cell &cell = cell_at(row, index);
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return *value;
+  }
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return static_cast<std::int64_t>(*value);
+  }
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    try {
+      return std::stoll(*value);
+    } catch (const std::exception &) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+std::string text_at(const db::Row &row, std::size_t index) {
+  const db::Cell &cell = cell_at(row, index);
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    return *value;
+  }
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  return {};
+}
+
 } // namespace
 
-LocalLibrary::LocalLibrary(std::string library_id, std::string display_name,
-                           std::string db_path)
-    : library_id_(std::move(library_id)), display_name_(std::move(display_name)),
-      db_path_(std::move(db_path)) {}
+LocalLibrary::LocalLibrary(std::string library_id, std::string display_name)
+    : library_id_(std::move(library_id)),
+      display_name_(std::move(display_name)) {}
 
 void LocalLibrary::initialize() {
   auto self = shared_from_this();
@@ -172,15 +211,14 @@ std::optional<int> LocalLibrary::internal_id_of(const SourceRef &ref) const {
 }
 
 std::vector<std::string> LocalLibrary::genres_of(int track_id) const {
-  SQLite::Database &database = db::conn(db_path_);
-  SQLite::Statement query(
-      database,
+  const auto result = db().query(
       "SELECT g.name FROM track_genre tg JOIN genre g ON g.id = tg.genre_id "
-      "WHERE tg.track_id = ? ORDER BY g.name");
-  query.bind(1, track_id);
+      "WHERE tg.track_id = ? ORDER BY g.name",
+      {static_cast<std::int64_t>(track_id)});
   std::vector<std::string> out;
-  while (query.executeStep()) {
-    out.push_back(query.getColumn(0).getText());
+  out.reserve(result.rows.size());
+  for (const auto &row : result.rows) {
+    out.push_back(text_at(row, 0));
   }
   return out;
 }
@@ -189,7 +227,7 @@ std::optional<repo::Album> LocalLibrary::album_of(const repo::Track &row) const 
   if (row.album_id <= 0) {
     return std::nullopt;
   }
-  repo::AlbumRepo albums(db_path_);
+  repo::AlbumRepo albums(db());
   return albums.byId(row.album_id);
 }
 
@@ -211,7 +249,7 @@ Track LocalLibrary::build_track(const repo::Track &row) {
   track.audio.format = row.format;
   track.audio.size_bytes = row.size_bytes;
 
-  repo::ArtistRepo artists(db_path_);
+  repo::ArtistRepo artists(db());
   for (const int artist_id : row.artist_ids) {
     if (const auto artist = artists.byId(artist_id)) {
       track.artists.push_back(
@@ -224,7 +262,7 @@ Track LocalLibrary::build_track(const repo::Track &row) {
     track.album = AlbumLink{ref_for(EntityType::Album, album->id),
                             album->name};
     track.year = album->year;
-    repo::AlbumRepo albums(db_path_);
+    repo::AlbumRepo albums(db());
     for (const int artist_id : albums.artistIdsByAlbumId(album->id)) {
       if (const auto artist = artists.byId(artist_id)) {
         track.album_artists.push_back(AlbumArtistLink{
@@ -240,13 +278,12 @@ Track LocalLibrary::build_track(const repo::Track &row) {
     }
   }
 
-  {
-    SQLite::Database &database = db::conn(db_path_);
-    SQLite::Statement query(
-        database, "SELECT 1 FROM track_lyrics WHERE track_id = ? AND text <> ''");
-    query.bind(1, row.id);
-    track.lyrics_available = query.executeStep();
-  }
+  track.lyrics_available =
+      !db()
+           .query("SELECT 1 FROM track_lyrics WHERE track_id = ? AND "
+                  "text <> ''",
+                  {static_cast<std::int64_t>(row.id)})
+           .empty();
 
   return track;
 }
@@ -257,7 +294,7 @@ Album LocalLibrary::build_album(const repo::Album &row) {
   album.title = row.name;
   album.year = row.year;
 
-  repo::ArtistRepo artists(db_path_);
+  repo::ArtistRepo artists(db());
   for (const int artist_id : row.artist_ids) {
     if (const auto artist = artists.byId(artist_id)) {
       album.artists.push_back(AlbumArtistLink{
@@ -300,7 +337,7 @@ Result<Track> LocalLibrary::get_track(const TrackRef &ref,
     return Result<Track>::failure(
         Error::make(ErrorCode::NotFound, "track not found"));
   }
-  repo::TrackRepo tracks(db_path_);
+  repo::TrackRepo tracks(db());
   const auto row = tracks.byId(*internal_id);
   if (!row) {
     return Result<Track>::failure(
@@ -321,7 +358,7 @@ Result<Album> LocalLibrary::get_album(const AlbumRef &ref,
     return Result<Album>::failure(
         Error::make(ErrorCode::NotFound, "album not found"));
   }
-  repo::AlbumRepo albums(db_path_);
+  repo::AlbumRepo albums(db());
   const auto row = albums.byId(*internal_id);
   if (!row) {
     return Result<Album>::failure(
@@ -342,7 +379,7 @@ Result<Artist> LocalLibrary::get_artist(const ArtistRef &ref,
     return Result<Artist>::failure(
         Error::make(ErrorCode::NotFound, "artist not found"));
   }
-  repo::ArtistRepo artists(db_path_);
+  repo::ArtistRepo artists(db());
   const auto row = artists.byId(*internal_id);
   if (!row) {
     return Result<Artist>::failure(
@@ -364,7 +401,7 @@ Result<Page<Track>> LocalLibrary::list_album_tracks(const AlbumRef &ref,
     return Result<Page<Track>>::failure(
         Error::make(ErrorCode::NotFound, "album not found"));
   }
-  repo::TrackRepo tracks(db_path_);
+  repo::TrackRepo tracks(db());
   std::vector<repo::Track> rows = tracks.byAlbum(*internal_id);
   Page<Track> out;
   const int limit = page.limit > 0 ? page.limit : 50;
@@ -391,7 +428,7 @@ Result<Page<Album>> LocalLibrary::list_artist_albums(const ArtistRef &ref,
     return Result<Page<Album>>::failure(
         Error::make(ErrorCode::NotFound, "artist not found"));
   }
-  repo::AlbumRepo albums(db_path_);
+  repo::AlbumRepo albums(db());
   std::vector<repo::Album> rows = albums.byArtist(*internal_id);
   Page<Album> out;
   const int limit = page.limit > 0 ? page.limit : 50;
@@ -438,7 +475,7 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
   std::vector<SearchHit> hits;
 
   if (want_albums) {
-    repo::AlbumRepo albums(db_path_);
+    repo::AlbumRepo albums(db());
     for (const auto &row : albums.search(query.text, want)) {
       const Album album = build_album(row);
       SearchHit hit;
@@ -455,7 +492,7 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
   }
 
   if (want_artists) {
-    repo::ArtistRepo artists(db_path_);
+    repo::ArtistRepo artists(db());
     for (const auto &row : artists.search(query.text, want)) {
       const Artist artist = build_artist(row);
       SearchHit hit;
@@ -468,7 +505,7 @@ Result<Page<SearchHit>> LocalLibrary::search(const SearchQuery &query,
   }
 
   if (want_tracks) {
-    repo::TrackRepo tracks(db_path_);
+    repo::TrackRepo tracks(db());
     for (const auto &row : tracks.search(query.text, want)) {
       const Track track = build_track(row);
       if (!query.artists.empty()) {
@@ -535,7 +572,7 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
     return Result<PlaybackSource>::failure(
         Error::make(ErrorCode::NotFound, "track not found"));
   }
-  repo::TrackRepo tracks(db_path_);
+  repo::TrackRepo tracks(db());
   const auto row = tracks.byId(*internal_id);
   if (!row) {
     return Result<PlaybackSource>::failure(
@@ -573,14 +610,14 @@ Result<Lyrics> LocalLibrary::get_lyrics(const TrackRef &ref,
 
   std::string text;
   {
-    SQLite::Database &database = db::conn(db_path_);
-    SQLite::Statement query(database, schema::sql::kTrackLyricsByTrackId);
-    query.bind(1, *internal_id);
-    if (!query.executeStep()) {
+    const auto result = db().query(
+        schema::sql::kTrackLyricsByTrackId,
+        {static_cast<std::int64_t>(*internal_id)});
+    if (result.rows.empty()) {
       return Result<Lyrics>::failure(
           Error::make(ErrorCode::NotFound, "lyrics not found"));
     }
-    text = query.getColumn(0).getText();
+    text = text_at(result.rows.front(), 0);
   }
   if (text.empty()) {
     return Result<Lyrics>::failure(
@@ -593,44 +630,40 @@ Result<Lyrics> LocalLibrary::get_lyrics(const TrackRef &ref,
 }
 
 std::string LocalLibrary::cover_path_of(const SourceRef &owner) const {
-  SQLite::Database &database = db::conn(db_path_);
   const auto internal_id = internal_id_of(owner);
   if (!internal_id) {
     return {};
   }
 
   if (owner.entity_type == EntityType::Album) {
-    SQLite::Statement query(database,
-                            "SELECT cover_path FROM album WHERE id = ?");
-    query.bind(1, *internal_id);
-    if (query.executeStep() && !query.getColumn(0).isNull()) {
-      return query.getColumn(0).getText();
+    const auto result = db().query("SELECT cover_path FROM album WHERE id = ?",
+                                  {static_cast<std::int64_t>(*internal_id)});
+    if (!result.rows.empty() && !is_null_at(result.rows.front(), 0)) {
+      return text_at(result.rows.front(), 0);
     }
     return {};
   }
 
   if (owner.entity_type == EntityType::Track) {
-    SQLite::Statement query(
-        database,
+    const auto result = db().query(
         "SELECT al.cover_path FROM track t JOIN album al ON al.id = t.album_id "
-        "WHERE t.id = ?");
-    query.bind(1, *internal_id);
-    if (query.executeStep() && !query.getColumn(0).isNull()) {
-      return query.getColumn(0).getText();
+        "WHERE t.id = ?",
+        {static_cast<std::int64_t>(*internal_id)});
+    if (!result.rows.empty() && !is_null_at(result.rows.front(), 0)) {
+      return text_at(result.rows.front(), 0);
     }
     return {};
   }
 
   if (owner.entity_type == EntityType::Artist ||
       owner.entity_type == EntityType::AlbumArtist) {
-    SQLite::Statement query(
-        database,
+    const auto result = db().query(
         "SELECT al.cover_path FROM album al JOIN album_artist aa ON "
         "aa.album_id = al.id WHERE aa.artist_id = ? AND al.cover_path IS NOT "
-        "NULL AND al.cover_path <> '' LIMIT 1");
-    query.bind(1, *internal_id);
-    if (query.executeStep()) {
-      return query.getColumn(0).getText();
+        "NULL AND al.cover_path <> '' LIMIT 1",
+        {static_cast<std::int64_t>(*internal_id)});
+    if (!result.rows.empty()) {
+      return text_at(result.rows.front(), 0);
     }
   }
   return {};
@@ -678,49 +711,46 @@ LocalLibrary::artwork_location(const ArtworkRef &ref, const CallContext &) {
 
 CatalogSnapshot LocalLibrary::snapshot() {
   CatalogSnapshot out;
-  SQLite::Database &database = db::conn(db_path_);
 
   std::unordered_map<int, std::string> artist_names;
   {
-    SQLite::Statement query(database, "SELECT id, name FROM artist");
-    while (query.executeStep()) {
-      artist_names.emplace(query.getColumn(0).getInt(), query.getColumn(1).getText());
+    const auto result = db().query("SELECT id, name FROM artist");
+    for (const auto &row : result.rows) {
+      artist_names.emplace(static_cast<int>(int_at(row, 0)), text_at(row, 1));
     }
   }
 
   std::unordered_map<int, std::vector<int>> album_artist_ids;
   {
-    SQLite::Statement query(
-        database, "SELECT album_id, artist_id FROM album_artist ORDER BY "
-                  "album_id, position");
-    while (query.executeStep()) {
-      album_artist_ids[query.getColumn(0).getInt()].push_back(
-          query.getColumn(1).getInt());
+    const auto result = db().query(
+        "SELECT album_id, artist_id FROM album_artist ORDER BY "
+        "album_id, position");
+    for (const auto &row : result.rows) {
+      album_artist_ids[static_cast<int>(int_at(row, 0))].push_back(
+          static_cast<int>(int_at(row, 1)));
     }
   }
 
   std::unordered_map<int, std::vector<int>> track_artist_ids;
   {
-    SQLite::Statement query(
-        database, "SELECT track_id, artist_id FROM track_artist ORDER BY "
-                  "track_id, position");
-    while (query.executeStep()) {
-      track_artist_ids[query.getColumn(0).getInt()].push_back(
-          query.getColumn(1).getInt());
+    const auto result = db().query(
+        "SELECT track_id, artist_id FROM track_artist ORDER BY "
+        "track_id, position");
+    for (const auto &row : result.rows) {
+      track_artist_ids[static_cast<int>(int_at(row, 0))].push_back(
+          static_cast<int>(int_at(row, 1)));
     }
   }
 
   std::unordered_map<int, std::vector<GenreEntry>> genre_by_track;
   std::unordered_set<std::string> seen_genres;
   {
-    SQLite::Statement query(
-        database,
+    const auto result = db().query(
         "SELECT tg.track_id, g.id, g.name FROM track_genre tg "
         "JOIN genre g ON g.id = tg.genre_id ORDER BY g.name");
-    while (query.executeStep()) {
-      const GenreEntry entry{query.getColumn(1).getInt(),
-                             query.getColumn(2).getText()};
-      genre_by_track[query.getColumn(0).getInt()].push_back(entry);
+    for (const auto &row : result.rows) {
+      const GenreEntry entry{static_cast<int>(int_at(row, 1)), text_at(row, 2)};
+      genre_by_track[static_cast<int>(int_at(row, 0))].push_back(entry);
       if (seen_genres.insert(entry.name).second) {
         out.genres.push_back(entry);
       }
@@ -732,37 +762,34 @@ CatalogSnapshot LocalLibrary::snapshot() {
   std::unordered_map<int, std::size_t> album_index_by_internal;
   std::unordered_map<int, std::string> album_cover_tag;
   {
-    SQLite::Statement query(
-        database,
+    const auto result = db().query(
         "SELECT album_id, COUNT(*), COALESCE(SUM(duration_ms), 0) FROM track "
         "WHERE album_id > 0 GROUP BY album_id");
-    while (query.executeStep()) {
-      const int album_id = query.getColumn(0).getInt();
-      album_count[album_id] = query.getColumn(1).getInt();
-      album_duration[album_id] = query.getColumn(2).getInt64();
+    for (const auto &row : result.rows) {
+      const int album_id = static_cast<int>(int_at(row, 0));
+      album_count[album_id] = static_cast<int>(int_at(row, 1));
+      album_duration[album_id] = int_at(row, 2);
     }
   }
 
   std::unordered_set<int> lyrics_tracks;
   {
-    SQLite::Statement query(
-        database, "SELECT track_id FROM track_lyrics WHERE text <> ''");
-    while (query.executeStep()) {
-      lyrics_tracks.insert(query.getColumn(0).getInt());
+    const auto result = db().query(
+        "SELECT track_id FROM track_lyrics WHERE text <> ''");
+    for (const auto &row : result.rows) {
+      lyrics_tracks.insert(static_cast<int>(int_at(row, 0)));
     }
   }
 
   {
-    SQLite::Statement query(
-        database,
+    const auto result = db().query(
         "SELECT a.id, a.name, a.year, a.cover_path FROM album a ORDER BY a.name");
-    while (query.executeStep()) {
+    for (const auto &source : result.rows) {
       repo::Album row;
-      row.id = query.getColumn(0).getInt();
-      row.name = query.getColumn(1).getText();
-      row.year = query.getColumn(2).getInt();
-      row.cover_path =
-          query.getColumn(3).isNull() ? std::string() : query.getColumn(3).getText();
+      row.id = static_cast<int>(int_at(source, 0));
+      row.name = text_at(source, 1);
+      row.year = static_cast<int>(int_at(source, 2));
+      row.cover_path = is_null_at(source, 3) ? std::string() : text_at(source, 3);
       const auto it = album_artist_ids.find(row.id);
       if (it != album_artist_ids.end()) {
         row.artist_ids = it->second;
@@ -796,18 +823,15 @@ CatalogSnapshot LocalLibrary::snapshot() {
   }
 
   {
-    SQLite::Statement query(
-        database,
+    const auto result = db().query(
         "SELECT id, name, sort_name FROM artist ORDER BY "
         "COALESCE(NULLIF(sort_name, ''), name)");
-    while (query.executeStep()) {
+    for (const auto &row : result.rows) {
       Artist artist;
-      artist.ref =
-          ref_for(EntityType::Artist, query.getColumn(0).getInt());
-      artist.name = query.getColumn(1).getText();
-      artist.sort_name =
-          query.getColumn(2).isNull() ? std::string() : query.getColumn(2).getText();
-      out.artist_internal_ids.push_back(query.getColumn(0).getInt());
+      artist.ref = ref_for(EntityType::Artist, static_cast<int>(int_at(row, 0)));
+      artist.name = text_at(row, 1);
+      artist.sort_name = is_null_at(row, 2) ? std::string() : text_at(row, 2);
+      out.artist_internal_ids.push_back(static_cast<int>(int_at(row, 0)));
       out.artists.push_back(std::move(artist));
     }
   }
@@ -819,32 +843,32 @@ CatalogSnapshot LocalLibrary::snapshot() {
   }
 
   {
-    SQLite::Statement query(
-        database,
+    const auto result = db().query(
         "SELECT id, root_id, path, title, album_id, disc_no, track_no, "
         "duration_ms, bitrate, sample_rate, channels, format, size_bytes, mtime, "
         "added_at, play_count, last_played, rating FROM track "
         "ORDER BY album_id, disc_no, track_no, id");
-    while (query.executeStep()) {
+    for (const auto &source : result.rows) {
       repo::Track row;
-      row.id = query.getColumn(0).getInt();
-      row.root_id = query.getColumn(1).getInt();
-      row.path = query.getColumn(2).isNull() ? std::string() : query.getColumn(2).getText();
-      row.title = query.getColumn(3).isNull() ? std::string() : query.getColumn(3).getText();
-      row.album_id = query.getColumn(4).getInt();
-      row.disc_no = query.getColumn(5).getInt();
-      row.track_no = query.getColumn(6).getInt();
-      row.duration_ms = query.getColumn(7).getInt();
-      row.bitrate = query.getColumn(8).getInt();
-      row.sample_rate = query.getColumn(9).getInt();
-      row.channels = query.getColumn(10).getInt();
-      row.format = query.getColumn(11).isNull() ? std::string() : query.getColumn(11).getText();
-      row.size_bytes = query.getColumn(12).getInt64();
-      row.mtime = query.getColumn(13).getInt64();
-      row.added_at = query.getColumn(14).isNull() ? std::string() : query.getColumn(14).getText();
-      row.play_count = query.getColumn(15).getInt();
-      row.last_played = query.getColumn(16).isNull() ? std::string() : query.getColumn(16).getText();
-      row.rating = query.getColumn(17).getInt();
+      row.id = static_cast<int>(int_at(source, 0));
+      row.root_id = static_cast<int>(int_at(source, 1));
+      row.path = is_null_at(source, 2) ? std::string() : text_at(source, 2);
+      row.title = is_null_at(source, 3) ? std::string() : text_at(source, 3);
+      row.album_id = static_cast<int>(int_at(source, 4));
+      row.disc_no = static_cast<int>(int_at(source, 5));
+      row.track_no = static_cast<int>(int_at(source, 6));
+      row.duration_ms = static_cast<int>(int_at(source, 7));
+      row.bitrate = static_cast<int>(int_at(source, 8));
+      row.sample_rate = static_cast<int>(int_at(source, 9));
+      row.channels = static_cast<int>(int_at(source, 10));
+      row.format = is_null_at(source, 11) ? std::string() : text_at(source, 11);
+      row.size_bytes = int_at(source, 12);
+      row.mtime = int_at(source, 13);
+      row.added_at = is_null_at(source, 14) ? std::string() : text_at(source, 14);
+      row.play_count = static_cast<int>(int_at(source, 15));
+      row.last_played =
+          is_null_at(source, 16) ? std::string() : text_at(source, 16);
+      row.rating = static_cast<int>(int_at(source, 17));
 
       const auto tracks_it = track_artist_ids.find(row.id);
       if (tracks_it != track_artist_ids.end()) {
@@ -928,12 +952,11 @@ CatalogSnapshot LocalLibrary::snapshot() {
   }
 
   {
-    SQLite::Statement query(
-        database,
+    const auto result = db().query(
         "SELECT t.id FROM track t JOIN play_event pe ON t.id = pe.track_id "
         "ORDER BY pe.played_at DESC");
-    while (query.executeStep()) {
-      out.recent_play_track_ids.push_back(query.getColumn(0).getInt());
+    for (const auto &row : result.rows) {
+      out.recent_play_track_ids.push_back(static_cast<int>(int_at(row, 0)));
     }
   }
 
@@ -942,32 +965,27 @@ CatalogSnapshot LocalLibrary::snapshot() {
 
 std::optional<TrackTransport>
 LocalLibrary::track_transport(int internal_id) const {
-  SQLite::Database &database = db::conn(db_path_);
   TrackTransport transport;
-  bool found = false;
   {
-    SQLite::Statement query(
-        database,
-        "SELECT path, mtime, album_id FROM track WHERE id = ?");
-    query.bind(1, internal_id);
-    if (query.executeStep()) {
-      transport.path =
-          query.getColumn(0).isNull() ? std::string() : query.getColumn(0).getText();
-      transport.mtime = query.getColumn(1).getInt64();
-      transport.album_internal_id = query.getColumn(2).getInt();
-      found = true;
+    const auto result = db().query(
+        "SELECT path, mtime, album_id FROM track WHERE id = ?",
+        {static_cast<std::int64_t>(internal_id)});
+    if (!result.rows.empty()) {
+      const auto &row = result.rows.front();
+      transport.path = is_null_at(row, 0) ? std::string() : text_at(row, 0);
+      transport.mtime = int_at(row, 1);
+      transport.album_internal_id = static_cast<int>(int_at(row, 2));
+    } else {
+      return std::nullopt;
     }
   }
-  if (!found) {
-    return std::nullopt;
-  }
   {
-    SQLite::Statement query(
-        database,
-        "SELECT artist_id FROM track_artist WHERE track_id = ? ORDER BY position");
-    query.bind(1, internal_id);
-    while (query.executeStep()) {
-      transport.artist_internal_ids.push_back(query.getColumn(0).getInt());
+    const auto result = db().query(
+        "SELECT artist_id FROM track_artist WHERE track_id = ? "
+        "ORDER BY position",
+        {static_cast<std::int64_t>(internal_id)});
+    for (const auto &row : result.rows) {
+      transport.artist_internal_ids.push_back(static_cast<int>(int_at(row, 0)));
     }
   }
   return transport;
@@ -1114,5 +1132,7 @@ Result<Playlist> LocalLibrary::get_playlist(const PlaylistRef &ref,
   }
   return R::success(std::move(out));
 }
+
+db::Session &LocalLibrary::db() const { return db::mainSession(); }
 
 } // namespace media_library

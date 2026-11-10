@@ -1,29 +1,52 @@
 #include "database.h"
 
-#include "SQLiteCpp/Column.h"
-#include "SQLiteCpp/Database.h"
-#include "SQLiteCpp/Statement.h"
-#include "config.h"
 #include "db.h"
 #include "schema.h"
 
-#include <exception>
-#include <filesystem>
-#include <iostream>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
 
-namespace fs = std::filesystem;
-
 namespace repo {
 namespace {
 
-std::string getText(const SQLite::Statement &q, int col) {
-  if (q.getColumn(col).isNull()) {
-    return {};
+std::string asText(const db::Cell &cell) {
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    return *value;
   }
-  return q.getColumn(col).getText();
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  return {};
+}
+
+std::int64_t asInt(const db::Cell &cell) {
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return *value;
+  }
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return static_cast<std::int64_t>(*value);
+  }
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    try {
+      return std::stoll(*value);
+    } catch (...) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+const db::Cell &cellAt(const db::Row &row, std::size_t index) {
+  static const db::Cell kNull{db::Null{}};
+  if (index >= row.size()) {
+    return kNull;
+  }
+  return row[index];
 }
 
 std::vector<int> parseIntList(const std::string &csv) {
@@ -45,336 +68,303 @@ std::vector<int> parseIntList(const std::string &csv) {
   return out;
 }
 
-Track readTrack(SQLite::Statement &q) {
+Track readTrack(const db::Row &row) {
   Track t;
-  t.id = q.getColumn(0).getInt();
-  t.root_id = q.getColumn(1).getInt();
-  t.path = getText(q, 2);
-  t.title = getText(q, 3);
-  t.album_id = q.getColumn(4).getInt();
-  t.disc_no = q.getColumn(5).getInt();
-  t.track_no = q.getColumn(6).getInt();
-  t.duration_ms = q.getColumn(7).getInt();
-  t.bitrate = q.getColumn(8).getInt();
-  t.sample_rate = q.getColumn(9).getInt();
-  t.channels = q.getColumn(10).getInt();
-  t.format = getText(q, 11);
-  t.size_bytes = q.getColumn(12).getInt64();
-  t.mtime = q.getColumn(13).getInt64();
-  t.added_at = getText(q, 14);
-  t.play_count = q.getColumn(15).getInt();
-  t.last_played = getText(q, 16);
-  t.rating = q.getColumn(17).getInt();
-  t.artist_ids = parseIntList(getText(q, 18));
+  t.id = static_cast<int>(asInt(cellAt(row, 0)));
+  t.root_id = static_cast<int>(asInt(cellAt(row, 1)));
+  t.path = asText(cellAt(row, 2));
+  t.title = asText(cellAt(row, 3));
+  t.album_id = static_cast<int>(asInt(cellAt(row, 4)));
+  t.disc_no = static_cast<int>(asInt(cellAt(row, 5)));
+  t.track_no = static_cast<int>(asInt(cellAt(row, 6)));
+  t.duration_ms = static_cast<int>(asInt(cellAt(row, 7)));
+  t.bitrate = static_cast<int>(asInt(cellAt(row, 8)));
+  t.sample_rate = static_cast<int>(asInt(cellAt(row, 9)));
+  t.channels = static_cast<int>(asInt(cellAt(row, 10)));
+  t.format = asText(cellAt(row, 11));
+  t.size_bytes = static_cast<long long>(asInt(cellAt(row, 12)));
+  t.mtime = static_cast<long long>(asInt(cellAt(row, 13)));
+  t.added_at = asText(cellAt(row, 14));
+  t.play_count = static_cast<int>(asInt(cellAt(row, 15)));
+  t.last_played = asText(cellAt(row, 16));
+  t.rating = static_cast<int>(asInt(cellAt(row, 17)));
+  t.artist_ids = parseIntList(asText(cellAt(row, 18)));
   return t;
 }
 
-Album readAlbum(SQLite::Statement &q) {
+Album readAlbum(const db::Row &row) {
   Album a;
-  a.id = q.getColumn(0).getInt();
-  a.name = getText(q, 1);
-  a.year = q.getColumn(2).getInt();
-  a.cover_path = getText(q, 3);
-  a.artist_ids = parseIntList(getText(q, 5));
+  a.id = static_cast<int>(asInt(cellAt(row, 0)));
+  a.name = asText(cellAt(row, 1));
+  a.year = static_cast<int>(asInt(cellAt(row, 2)));
+  a.cover_path = asText(cellAt(row, 3));
+  a.artist_ids = parseIntList(asText(cellAt(row, 5)));
   return a;
 }
 
-Artist readArtist(SQLite::Statement &q) {
+Artist readArtist(const db::Row &row) {
   Artist a;
-  a.id = q.getColumn(0).getInt();
-  a.name = getText(q, 1);
-  a.sort_name = getText(q, 2);
+  a.id = static_cast<int>(asInt(cellAt(row, 0)));
+  a.name = asText(cellAt(row, 1));
+  a.sort_name = asText(cellAt(row, 2));
   return a;
 }
 
-ScanRoot readScanRoot(SQLite::Statement &q) {
+ScanRoot readScanRoot(const db::Row &row) {
   ScanRoot sr;
-  sr.id = q.getColumn(0).getInt();
-  sr.path = getText(q, 1);
-  sr.added_at = getText(q, 2);
-  sr.last_scan = getText(q, 3);
-  sr.user = getText(q, 4);
-  sr.pass = getText(q, 5);
-  sr.name = getText(q, 6);
-  sr.type = getText(q, 7);
+  sr.id = static_cast<int>(asInt(cellAt(row, 0)));
+  sr.path = asText(cellAt(row, 1));
+  sr.added_at = asText(cellAt(row, 2));
+  sr.last_scan = asText(cellAt(row, 3));
+  sr.user = asText(cellAt(row, 4));
+  sr.pass = asText(cellAt(row, 5));
+  sr.name = asText(cellAt(row, 6));
+  sr.type = asText(cellAt(row, 7));
   return sr;
+}
+
+std::vector<Track> readTracks(const db::ResultSet &result) {
+  std::vector<Track> out;
+  out.reserve(result.rows.size());
+  for (const auto &row : result.rows) {
+    out.push_back(readTrack(row));
+  }
+  return out;
+}
+
+std::vector<Album> readAlbums(const db::ResultSet &result) {
+  std::vector<Album> out;
+  out.reserve(result.rows.size());
+  for (const auto &row : result.rows) {
+    out.push_back(readAlbum(row));
+  }
+  return out;
 }
 
 } // namespace
 
 // ScanRootRepo
 
-ScanRootRepo::ScanRootRepo(const std::string &path)  : pdb_(db::conn(path)) {}
+ScanRootRepo::ScanRootRepo(db::Session &session) : pdb_(session) {}
 
 std::vector<ScanRoot> ScanRootRepo::list() {
-  std::vector<ScanRoot> result;
-  SQLite::Statement q(pdb_, schema::sql::kScanRoots);
-  while (q.executeStep()) {
-    result.push_back(readScanRoot(q));
+  const auto result = pdb_.query(schema::sql::kScanRoots);
+  std::vector<ScanRoot> out;
+  out.reserve(result.rows.size());
+  for (const auto &row : result.rows) {
+    out.push_back(readScanRoot(row));
   }
-  return result;
+  return out;
 }
 
 int ScanRootRepo::add(const std::string &path, const std::string &user,
                       const std::string &pass, const std::string &name,
                       const std::string &type) {
-  SQLite::Statement check(pdb_, schema::sql::kScanRootByPath);
-  check.bind(1, path);
-  if (check.executeStep()) {
-    return check.getColumn(0).getInt();
+  const auto existing = pdb_.query(schema::sql::kScanRootByPath, {path});
+  if (!existing.rows.empty()) {
+    return static_cast<int>(asInt(existing.rows.front().front()));
   }
-  SQLite::Statement insert(pdb_, schema::sql::kScanRootInsert);
-  insert.bind(1, path);
-  insert.bind(2, user);
-  insert.bind(3, pass);
-  insert.bind(4, name);
-  insert.bind(5, type);
-  insert.executeStep();
-  return static_cast<int>(pdb_.getLastInsertRowid());
+  pdb_.execute(schema::sql::kScanRootInsert, {path, user, pass, name, type});
+  return static_cast<int>(pdb_.lastInsertId());
 }
 
 void ScanRootRepo::updateName(int id, const std::string &name) {
-  SQLite::Statement q(pdb_, schema::sql::kScanRootUpdateName);
-  q.bind(1, name);
-  q.bind(2, id);
-  q.executeStep();
+  pdb_.execute(schema::sql::kScanRootUpdateName,
+               {name, static_cast<std::int64_t>(id)});
 }
 
 bool ScanRootRepo::remove(int id) {
-  SQLite::Statement q(pdb_, schema::sql::kScanRootDelete);
-  q.bind(1, id);
-  return q.executeStep() || q.getChanges() > 0;
+  return pdb_.execute(schema::sql::kScanRootDelete,
+                      {static_cast<std::int64_t>(id)}) > 0;
 }
 
 std::optional<ScanRoot> ScanRootRepo::byId(int id) {
-  SQLite::Statement q(pdb_, schema::sql::kScanRootById);
-  q.bind(1, id);
-  if (!q.executeStep()) {
+  const auto result =
+      pdb_.query(schema::sql::kScanRootById, {static_cast<std::int64_t>(id)});
+  if (result.rows.empty()) {
     return std::nullopt;
   }
-  return readScanRoot(q);
+  return readScanRoot(result.rows.front());
 }
 
 std::optional<ScanRoot> ScanRootRepo::byName(const std::string &name) {
-  SQLite::Statement q(pdb_, schema::sql::kScanRootByName);
-  q.bind(1, name);
-  if (!q.executeStep()) {
+  const auto result = pdb_.query(schema::sql::kScanRootByName, {name});
+  if (result.rows.empty()) {
     return std::nullopt;
   }
-  return readScanRoot(q);
+  return readScanRoot(result.rows.front());
 }
 
 // TrackRepo
 
-TrackRepo::TrackRepo(const std::string &path)  : pdb_(db::conn(path)) {}
+TrackRepo::TrackRepo(db::Session &session) : pdb_(session) {}
 
 std::optional<Track> TrackRepo::byId(int id) {
-  SQLite::Statement q(pdb_, schema::sql::kTrackById);
-  q.bind(1, id);
-  if (!q.executeStep()) {
+  const auto result = pdb_.query(schema::sql::trackById(pdb_.dialect()),
+                                 {static_cast<std::int64_t>(id)});
+  if (result.rows.empty()) {
     return std::nullopt;
   }
-  return readTrack(q);
+  return readTrack(result.rows.front());
 }
 
 std::vector<Track> TrackRepo::byAlbum(int album_id) {
-  std::vector<Track> result;
-  SQLite::Statement q(pdb_, schema::sql::kTracksByAlbum);
-  q.bind(1, album_id);
-  while (q.executeStep()) {
-    result.push_back(readTrack(q));
-  }
-  return result;
+  return readTracks(pdb_.query(schema::sql::tracksByAlbum(pdb_.dialect()),
+                               {static_cast<std::int64_t>(album_id)}));
 }
 
 std::vector<Track> TrackRepo::byRootId(int root_id) {
-  std::vector<Track> result;
-  SQLite::Statement q(pdb_, schema::sql::kTrackByRootId);
-  q.bind(1, root_id);
-  while (q.executeStep()) {
-    result.push_back(readTrack(q));
-  }
-  return result;
+  return readTracks(pdb_.query(schema::sql::trackByRootId(pdb_.dialect()),
+                               {static_cast<std::int64_t>(root_id)}));
 }
 
 std::vector<Track> TrackRepo::recent(int after_id, int limit) {
-  std::vector<Track> result;
-  SQLite::Statement q(pdb_, schema::sql::kTracksRecent);
-  q.bind(1, after_id);
-  q.bind(2, limit);
-  while (q.executeStep()) {
-    result.push_back(readTrack(q));
-  }
-  return result;
+  return readTracks(
+      pdb_.query(schema::sql::tracksRecent(pdb_.dialect()),
+                 {static_cast<std::int64_t>(after_id),
+                  static_cast<std::int64_t>(limit)}));
 }
 
 std::vector<Track> TrackRepo::byGenre(int genre_id, int limit) {
-  std::vector<Track> result;
-  SQLite::Statement q(pdb_, schema::sql::kTracksByGenre);
-  q.bind(1, genre_id);
-  q.bind(2, limit);
-  while (q.executeStep()) {
-    result.push_back(readTrack(q));
-  }
-  return result;
+  return readTracks(
+      pdb_.query(schema::sql::tracksByGenre(pdb_.dialect()),
+                 {static_cast<std::int64_t>(genre_id),
+                  static_cast<std::int64_t>(limit)}));
 }
 
 std::vector<Track> TrackRepo::search(const std::string &query, int limit) {
-  std::vector<Track> result;
-  SQLite::Statement q(pdb_, schema::sql::kSearchByTitle);
   const std::string pattern = "%" + query + "%";
-  q.bind(1, pattern);
-  q.bind(2, limit);
-  while (q.executeStep()) {
-    result.push_back(readTrack(q));
-  }
-  return result;
+  return readTracks(
+      pdb_.query(schema::sql::searchByTitle(pdb_.dialect()),
+                 {pattern, static_cast<std::int64_t>(limit)}));
 }
 
 std::vector<Track> TrackRepo::recentPlays(int limit) {
-  std::vector<Track> result;
-  SQLite::Statement q(pdb_, schema::sql::kRecentPlays);
-  q.bind(1, limit);
-  while (q.executeStep()) {
-    result.push_back(readTrack(q));
-  }
-  return result;
+  return readTracks(pdb_.query(schema::sql::recentPlays(pdb_.dialect()),
+                               {static_cast<std::int64_t>(limit)}));
 }
 
 bool TrackRepo::recordPlay(int track_id) {
-  SQLite::Statement event(pdb_, "INSERT INTO play_event(track_id, played_at, seconds_played) VALUES (?, datetime('now','localtime'), 0)");
-  event.bind(1, track_id);
-  event.executeStep();
-
-  SQLite::Statement stats(pdb_, schema::sql::kTrackUpdateStats);
-  stats.bind(1, track_id);
-  return stats.executeStep() || stats.getChanges() > 0;
+  const std::string insert =
+      "INSERT INTO play_event(track_id, played_at, seconds_played) "
+      "VALUES (?, " +
+      schema::sql::nowExpr(pdb_.dialect()) + ", 0)";
+  pdb_.execute(insert, {static_cast<std::int64_t>(track_id)});
+  return pdb_.execute(schema::sql::trackUpdateStats(pdb_.dialect()),
+                      {static_cast<std::int64_t>(track_id)}) > 0;
 }
 
 std::vector<int> TrackRepo::genresByTrackId(int track_id) {
-  std::vector<int> result;
-  SQLite::Statement q(pdb_, schema::sql::kTrackGenresByTrackId);
-  q.bind(1, track_id);
-  while (q.executeStep()) {
-    result.push_back(q.getColumn(0).getInt());
+  const auto result = pdb_.query(schema::sql::kTrackGenresByTrackId,
+                                 {static_cast<std::int64_t>(track_id)});
+  std::vector<int> out;
+  out.reserve(result.rows.size());
+  for (const auto &row : result.rows) {
+    out.push_back(static_cast<int>(asInt(row.front())));
   }
-  return result;
+  return out;
 }
 
 std::vector<int> TrackRepo::artistIdsByTrackId(int track_id) {
-  std::vector<int> result;
-  SQLite::Statement q(pdb_, schema::sql::kTrackArtistsByTrackId);
-  q.bind(1, track_id);
-  while (q.executeStep()) {
-    result.push_back(q.getColumn(0).getInt());
+  const auto result = pdb_.query(schema::sql::kTrackArtistsByTrackId,
+                                 {static_cast<std::int64_t>(track_id)});
+  std::vector<int> out;
+  out.reserve(result.rows.size());
+  for (const auto &row : result.rows) {
+    out.push_back(static_cast<int>(asInt(row.front())));
   }
-  return result;
+  return out;
 }
 
 std::vector<Track> TrackRepo::byArtist(int artist_id, int limit) {
-  std::vector<Track> result;
-  SQLite::Statement q(pdb_, schema::sql::kTracksByArtist);
-  q.bind(1, artist_id);
-  q.bind(2, limit);
-  while (q.executeStep()) {
-    result.push_back(readTrack(q));
-  }
-  return result;
+  return readTracks(
+      pdb_.query(schema::sql::tracksByArtist(pdb_.dialect()),
+                 {static_cast<std::int64_t>(artist_id),
+                  static_cast<std::int64_t>(limit)}));
 }
 
 bool TrackRepo::updatePartial(const Track &t) {
-  SQLite::Statement q(pdb_, schema::sql::kTrackUpdatePartial);
-  q.bind(1, t.title);
-  q.bind(2, t.album_id);
-  q.bind(3, t.disc_no);
-  q.bind(4, t.track_no);
-  q.bind(5, t.duration_ms);
-  q.bind(6, t.bitrate);
-  q.bind(7, t.sample_rate);
-  q.bind(8, t.channels);
-  q.bind(9, t.format);
-  q.bind(10, static_cast<int64_t>(t.size_bytes));
-  q.bind(11, static_cast<int64_t>(t.mtime));
-  q.bind(12, t.rating);
-  q.bind(13, t.id);
-  q.executeStep();
-  return q.getChanges() > 0;
+  return pdb_.execute(schema::sql::kTrackUpdatePartial,
+                      {t.title,
+                       static_cast<std::int64_t>(t.album_id),
+                       static_cast<std::int64_t>(t.disc_no),
+                       static_cast<std::int64_t>(t.track_no),
+                       static_cast<std::int64_t>(t.duration_ms),
+                       static_cast<std::int64_t>(t.bitrate),
+                       static_cast<std::int64_t>(t.sample_rate),
+                       static_cast<std::int64_t>(t.channels),
+                       t.format,
+                       static_cast<std::int64_t>(t.size_bytes),
+                       static_cast<std::int64_t>(t.mtime),
+                       static_cast<std::int64_t>(t.rating),
+                       static_cast<std::int64_t>(t.id)}) > 0;
 }
 
 bool TrackRepo::remove(int id) {
-  SQLite::Statement q(pdb_, schema::sql::kTrackDelete);
-  q.bind(1, id);
-  return q.executeStep() || q.getChanges() > 0;
+  return pdb_.execute(schema::sql::kTrackDelete,
+                      {static_cast<std::int64_t>(id)}) > 0;
 }
 
 // AlbumRepo
 
-AlbumRepo::AlbumRepo(const std::string &path)  : pdb_(db::conn(path)) {}
+AlbumRepo::AlbumRepo(db::Session &session) : pdb_(session) {}
 
 std::optional<Album> AlbumRepo::byId(int id) {
-  SQLite::Statement q(pdb_, schema::sql::kAlbumById);
-  q.bind(1, id);
-  if (!q.executeStep()) {
+  const auto result = pdb_.query(schema::sql::albumById(pdb_.dialect()),
+                                 {static_cast<std::int64_t>(id)});
+  if (result.rows.empty()) {
     return std::nullopt;
   }
-  return readAlbum(q);
+  return readAlbum(result.rows.front());
 }
 
 std::vector<Album> AlbumRepo::byArtist(int artist_id) {
-  std::vector<Album> result;
-  SQLite::Statement q(pdb_, schema::sql::kAlbumsByArtist);
-  q.bind(1, artist_id);
-  while (q.executeStep()) {
-    result.push_back(readAlbum(q));
-  }
-  return result;
+  return readAlbums(pdb_.query(schema::sql::albumsByArtist(pdb_.dialect()),
+                               {static_cast<std::int64_t>(artist_id)}));
 }
 
 std::vector<Album> AlbumRepo::search(const std::string &query, int limit) {
-  std::vector<Album> result;
-  SQLite::Statement q(pdb_, schema::sql::kAlbumsSearchByName);
   const std::string pattern = "%" + query + "%";
-  q.bind(1, pattern);
-  q.bind(2, limit);
-  while (q.executeStep()) {
-    result.push_back(readAlbum(q));
-  }
-  return result;
+  return readAlbums(
+      pdb_.query(schema::sql::albumsSearchByName(pdb_.dialect()),
+                 {pattern, static_cast<std::int64_t>(limit)}));
 }
 
 std::vector<int> AlbumRepo::artistIdsByAlbumId(int album_id) {
-  std::vector<int> result;
-  SQLite::Statement q(pdb_, schema::sql::kAlbumArtistsByAlbumId);
-  q.bind(1, album_id);
-  while (q.executeStep()) {
-    result.push_back(q.getColumn(0).getInt());
+  const auto result = pdb_.query(schema::sql::kAlbumArtistsByAlbumId,
+                                 {static_cast<std::int64_t>(album_id)});
+  std::vector<int> out;
+  out.reserve(result.rows.size());
+  for (const auto &row : result.rows) {
+    out.push_back(static_cast<int>(asInt(row.front())));
   }
-  return result;
+  return out;
 }
 
 // ArtistRepo
 
-ArtistRepo::ArtistRepo(const std::string &path)  : pdb_(db::conn(path)) {}
+ArtistRepo::ArtistRepo(db::Session &session) : pdb_(session) {}
 
 std::vector<Artist> ArtistRepo::search(const std::string &query, int limit) {
-  std::vector<Artist> result;
-  SQLite::Statement q(pdb_, schema::sql::kArtistsSearchByName);
   const std::string pattern = "%" + query + "%";
-  q.bind(1, pattern);
-  q.bind(2, limit);
-  while (q.executeStep()) {
-    result.push_back(readArtist(q));
+  const auto result =
+      pdb_.query(schema::sql::artistsSearchByName(pdb_.dialect()),
+                 {pattern, static_cast<std::int64_t>(limit)});
+  std::vector<Artist> out;
+  out.reserve(result.rows.size());
+  for (const auto &row : result.rows) {
+    out.push_back(readArtist(row));
   }
-  return result;
+  return out;
 }
 
 std::optional<Artist> ArtistRepo::byId(int id) {
-  SQLite::Statement q(pdb_, schema::sql::kArtistById);
-  q.bind(1, id);
-  if (!q.executeStep()) {
+  const auto result = pdb_.query(schema::sql::kArtistById,
+                                 {static_cast<std::int64_t>(id)});
+  if (result.rows.empty()) {
     return std::nullopt;
   }
-  return readArtist(q);
+  return readArtist(result.rows.front());
 }
 
 } // namespace repo

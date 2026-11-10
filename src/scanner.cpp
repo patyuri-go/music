@@ -9,14 +9,12 @@
 
 #include "api/webdav/webdav.h"
 
-#include <SQLiteCpp/Database.h>
-#include <SQLiteCpp/Statement.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <ctime>
 #include <deque>
 #include <filesystem>
@@ -166,16 +164,49 @@ void report(const Progress &p) {
   }
 }
 
-int ensureArtist(SQLite::Database &db, const std::string &name) {
-  std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-  SQLite::Statement insert(db, schema::sql::kArtistInsert);
-  insert.bind(1, name);
-  insert.executeStep();
+const db::Cell &cellAt(const db::Row &row, std::size_t index) {
+  static const db::Cell kNull{db::Null{}};
+  return index < row.size() ? row[index] : kNull;
+}
 
-  SQLite::Statement query(db, schema::sql::kArtistByName);
-  query.bind(1, name);
-  if (query.executeStep()) {
-    return query.getColumn(0).getInt();
+std::int64_t intAt(const db::Row &row, std::size_t index) {
+  const db::Cell &cell = cellAt(row, index);
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return *value;
+  }
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return static_cast<std::int64_t>(*value);
+  }
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    try {
+      return std::stoll(*value);
+    } catch (...) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+std::string textAt(const db::Row &row, std::size_t index) {
+  const db::Cell &cell = cellAt(row, index);
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    return *value;
+  }
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  return {};
+}
+
+int ensureArtist(db::Session &db, const std::string &name) {
+  std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
+  db.execute(schema::sql::artistInsert(db.dialect()), {name});
+  const auto result = db.query(schema::sql::kArtistByName, {name});
+  if (!result.rows.empty()) {
+    return static_cast<int>(intAt(result.rows.front(), 0));
   }
   return 0;
 }
@@ -221,24 +252,19 @@ std::vector<std::string> effectiveAlbumArtists(const metadata::TrackMeta &meta) 
   return effectiveArtists(meta);
 }
 
-int ensureAlbum(SQLite::Database &db, const std::string &name,
+int ensureAlbum(db::Session &db, const std::string &name,
                 const std::string &key) {
   std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-  SQLite::Statement insert(db, schema::sql::kAlbumUpsert);
-  insert.bind(1, name);
-  insert.bind(2, key);
-  insert.executeStep();
+  db.execute(schema::sql::albumUpsert(db.dialect()), {name, key});
 
-  SQLite::Statement query(db, schema::sql::kAlbumByKey);
-  query.bind(1, name);
-  query.bind(2, key);
-  if (query.executeStep()) {
-    return query.getColumn(0).getInt();
+  const auto result = db.query(schema::sql::kAlbumByKey, {name, key});
+  if (!result.rows.empty()) {
+    return static_cast<int>(intAt(result.rows.front(), 0));
   }
   return 0;
 }
 
-std::vector<int> ensureArtists(SQLite::Database &db,
+std::vector<int> ensureArtists(db::Session &db,
                                const std::vector<std::string> &names) {
   std::vector<int> ids;
   for (const auto &name : names) {
@@ -253,81 +279,68 @@ std::vector<int> ensureArtists(SQLite::Database &db,
   return ids;
 }
 
-void linkTrackArtists(SQLite::Database &db, int track_id,
+void linkTrackArtists(db::Session &db, int track_id,
                       const std::vector<int> &artist_ids) {
   std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-  SQLite::Statement clear(db, schema::sql::kTrackArtistClear);
-  clear.bind(1, track_id);
-  clear.executeStep();
+  db.execute(schema::sql::kTrackArtistClear, {static_cast<std::int64_t>(track_id)});
 
   int position = 0;
   for (const int artist_id : artist_ids) {
     if (artist_id == 0) {
       continue;
     }
-    SQLite::Statement insert(db, schema::sql::kTrackArtistInsert);
-    insert.bind(1, track_id);
-    insert.bind(2, artist_id);
-    insert.bind(3, position++);
-    insert.executeStep();
+    db.execute(schema::sql::trackArtistInsert(db.dialect()),
+               {static_cast<std::int64_t>(track_id),
+                static_cast<std::int64_t>(artist_id),
+                static_cast<std::int64_t>(position++)});
   }
 }
 
-void linkAlbumArtists(SQLite::Database &db, int album_id,
+void linkAlbumArtists(db::Session &db, int album_id,
                       const std::vector<int> &artist_ids) {
   std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-  SQLite::Statement clear(db, schema::sql::kAlbumArtistClear);
-  clear.bind(1, album_id);
-  clear.executeStep();
+  db.execute(schema::sql::kAlbumArtistClear, {static_cast<std::int64_t>(album_id)});
 
   int position = 0;
   for (const int artist_id : artist_ids) {
     if (artist_id == 0) {
       continue;
     }
-    SQLite::Statement insert(db, schema::sql::kAlbumArtistInsert);
-    insert.bind(1, album_id);
-    insert.bind(2, artist_id);
-    insert.bind(3, position++);
-    insert.executeStep();
+    db.execute(schema::sql::albumArtistInsert(db.dialect()),
+               {static_cast<std::int64_t>(album_id),
+                static_cast<std::int64_t>(artist_id),
+                static_cast<std::int64_t>(position++)});
   }
 }
 
-int ensureGenre(SQLite::Database &db, const std::string &name) {
+int ensureGenre(db::Session &db, const std::string &name) {
   std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-  SQLite::Statement insert(db, schema::sql::kGenreInsert);
-  insert.bind(1, name);
-  insert.executeStep();
+  db.execute(schema::sql::genreInsert(db.dialect()), {name});
 
-  SQLite::Statement query(db, schema::sql::kGenreByName);
-  query.bind(1, name);
-  if (query.executeStep()) {
-    return query.getColumn(0).getInt();
+  const auto result = db.query(schema::sql::kGenreByName, {name});
+  if (!result.rows.empty()) {
+    return static_cast<int>(intAt(result.rows.front(), 0));
   }
   return 0;
 }
 
-void applyAlbumYear(SQLite::Database &db, int album_id, int year) {
+void applyAlbumYear(db::Session &db, int album_id, int year) {
   if (album_id == 0 || year <= 0) {
     return;
   }
   std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-  SQLite::Statement update(db, schema::sql::kAlbumUpdateYear);
-  update.bind(1, static_cast<int>(year));
-  update.bind(2, static_cast<int>(album_id));
-  update.executeStep();
+  db.execute(schema::sql::kAlbumUpdateYear,
+             {static_cast<std::int64_t>(year), static_cast<std::int64_t>(album_id)});
 }
 
-void storeLyrics(SQLite::Database &db, int track_id, const std::string &text) {
+void storeLyrics(db::Session &db, int track_id, const std::string &text) {
   if (track_id == 0 || text.empty()) {
     return;
   }
   std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-  SQLite::Statement up(db, schema::sql::kTrackLyricsUpsert);
-  up.bind(1, static_cast<int>(track_id));
-  up.bind(2, text);
-  up.bind(3, metadata::isSyncedLyrics(text) ? 1 : 0);
-  up.executeStep();
+  db.execute(schema::sql::trackLyricsUpsert(db.dialect()),
+             {static_cast<std::int64_t>(track_id), text,
+              static_cast<std::int64_t>(metadata::isSyncedLyrics(text) ? 1 : 0)});
 }
 
 /// 歌词来源：优先文件内嵌歌词，其次同目录同名 .lrc 文件。
@@ -339,66 +352,61 @@ std::string fetchLyrics(const metadata::TrackMeta &meta,
   return metadata::readSiblingLyrics(real_path);
 }
 
-int upsertTrack(SQLite::Database &db, int root_id, const std::string &path,
+int upsertTrack(db::Session &db, int root_id, const std::string &path,
                 const metadata::TrackMeta &meta, int album_id,
                 const std::vector<int> &artist_ids) {
   std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
   applyAlbumYear(db, album_id, meta.year);
 
-  SQLite::Statement check(db, schema::sql::kTrackByPath);
-  check.bind(1, path);
-  const bool exists = check.executeStep();
+  const auto check = db.query(schema::sql::kTrackByPath, {path});
+  const bool exists = !check.rows.empty();
 
   if (exists) {
-    const int id = check.getColumn(0).getInt();
-    const long long old_mtime = check.getColumn(1).getInt64();
-    const long long old_size = check.getColumn(2).getInt64();
+    const auto &row = check.rows.front();
+    const int id = static_cast<int>(intAt(row, 0));
+    const long long old_mtime = intAt(row, 1);
+    const long long old_size = intAt(row, 2);
 
     if (old_mtime == static_cast<long long>(meta.mtime) &&
         old_size == static_cast<long long>(meta.size_bytes)) {
       return id;
     }
 
-    SQLite::Statement update(db, schema::sql::kTrackUpdate);
-    update.bind(1, meta.title);
-    update.bind(2, static_cast<int>(album_id));
-    update.bind(3, static_cast<int>(meta.disc_no));
-    update.bind(4, static_cast<int>(meta.track_no));
-    update.bind(5, static_cast<int>(meta.duration_ms));
-    update.bind(6, static_cast<int>(meta.bitrate));
-    update.bind(7, static_cast<int>(meta.sample_rate));
-    update.bind(8, static_cast<int>(meta.channels));
-    update.bind(9, meta.format);
-    update.bind(10, static_cast<int>(meta.size_bytes));
-    update.bind(11, static_cast<int>(meta.mtime));
-    update.bind(12, path);
-    update.executeStep();
+    db.execute(schema::sql::kTrackUpdate,
+               {meta.title,
+                static_cast<std::int64_t>(album_id),
+                static_cast<std::int64_t>(meta.disc_no),
+                static_cast<std::int64_t>(meta.track_no),
+                static_cast<std::int64_t>(meta.duration_ms),
+                static_cast<std::int64_t>(meta.bitrate),
+                static_cast<std::int64_t>(meta.sample_rate),
+                static_cast<std::int64_t>(meta.channels),
+                meta.format,
+                static_cast<std::int64_t>(meta.size_bytes),
+                static_cast<std::int64_t>(meta.mtime),
+                path});
     linkTrackArtists(db, id, artist_ids);
     return id;
   }
 
-  SQLite::Statement insert(db, schema::sql::kTrackInsert);
-  insert.bind(1, static_cast<int>(root_id));
-  insert.bind(2, path);
-  insert.bind(3, meta.title);
-  insert.bind(4, static_cast<int>(album_id));
-  insert.bind(5, static_cast<int>(meta.disc_no));
-  insert.bind(6, static_cast<int>(meta.track_no));
-  insert.bind(7, static_cast<int>(meta.duration_ms));
-  insert.bind(8, static_cast<int>(meta.bitrate));
-  insert.bind(9, static_cast<int>(meta.sample_rate));
-  insert.bind(10, static_cast<int>(meta.channels));
-  insert.bind(11, meta.format);
-  insert.bind(12, static_cast<int64_t>(meta.size_bytes));
-  insert.bind(13, static_cast<int64_t>(meta.mtime));
-  insert.executeStep();
+  db.execute(schema::sql::trackInsert(db.dialect()),
+             {static_cast<std::int64_t>(root_id), path, meta.title,
+              static_cast<std::int64_t>(album_id),
+              static_cast<std::int64_t>(meta.disc_no),
+              static_cast<std::int64_t>(meta.track_no),
+              static_cast<std::int64_t>(meta.duration_ms),
+              static_cast<std::int64_t>(meta.bitrate),
+              static_cast<std::int64_t>(meta.sample_rate),
+              static_cast<std::int64_t>(meta.channels), meta.format,
+              static_cast<std::int64_t>(meta.size_bytes),
+              static_cast<std::int64_t>(meta.mtime)});
 
-  const int id = static_cast<int>(db.getLastInsertRowid());
+  const int id = static_cast<int>(db.lastInsertId());
   linkTrackArtists(db, id, artist_ids);
   return id;
 }
 
-void linkGenre(SQLite::Database &db, int track_id, const std::string &genre_name) {
+void linkGenre(db::Session &db, int track_id, const std::string &genre_name) {
   if (genre_name.empty()) {
     return;
   }
@@ -407,10 +415,9 @@ void linkGenre(SQLite::Database &db, int track_id, const std::string &genre_name
   if (genre_id == 0) {
     return;
   }
-  SQLite::Statement insert(db, schema::sql::kTrackGenreInsert);
-  insert.bind(1, static_cast<int>(track_id));
-  insert.bind(2, static_cast<int>(genre_id));
-  insert.executeStep();
+  db.execute(schema::sql::trackGenreInsert(db.dialect()),
+             {static_cast<std::int64_t>(track_id),
+              static_cast<std::int64_t>(genre_id)});
 }
 
 long long parseHttpDate(const std::string &s) {
@@ -511,7 +518,7 @@ void scanWebdavTree(const webdav::Url &base, const std::vector<DirTask> &starts,
                     std::optional<std::reference_wrapper<Progress>> progress,
                     bool only_new = false) {
   webdav::Client client(base);
-  repo::ScanRootRepo root_repo(config::get().db_path.string());
+  repo::ScanRootRepo root_repo(db::mainSession());
   auto root_opt = root_repo.byId(root_id);
   const std::optional<repo::ScanRoot> &root = root_opt;
 
@@ -541,10 +548,9 @@ void scanWebdavTree(const webdav::Url &base, const std::vector<DirTask> &starts,
       const std::string vpath = root ? storage::toVirtual(*root, url) : url;
       if (c.only_new) {
         std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-        SQLite::Database &db = db::conn(config::get().db_path.string());
-        SQLite::Statement check(db, schema::sql::kTrackByPath);
-        check.bind(1, vpath);
-        if (check.executeStep()) {
+        db::Session &db = db::mainSession();
+        const auto check = db.query(schema::sql::kTrackByPath, {vpath});
+        if (!check.rows.empty()) {
           std::lock_guard<std::mutex> lock(c.mu);
           rp.files_processed++;
           return;
@@ -565,16 +571,16 @@ void scanWebdavTree(const webdav::Url &base, const std::vector<DirTask> &starts,
       int updated = 0;
       {
         std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-        SQLite::Database &db = db::conn(config::get().db_path.string());
-        SQLite::Statement check(db, schema::sql::kTrackByPath);
-        check.bind(1, vpath);
-        const bool exists = check.executeStep();
+        db::Session &db = db::mainSession();
+        const auto check = db.query(schema::sql::kTrackByPath, {vpath});
+        const bool exists = !check.rows.empty();
         if (exists) {
-          const long long old_mtime = check.getColumn(1).getInt64();
-          const long long old_size = check.getColumn(2).getInt64();
+          const auto &row = check.rows.front();
+          const long long old_mtime = intAt(row, 1);
+          const long long old_size = intAt(row, 2);
           if (old_mtime == static_cast<long long>(meta.mtime) &&
               old_size == static_cast<long long>(meta.size_bytes)) {
-            applyAlbumYear(db, check.getColumn(3).getInt(), meta.year);
+            applyAlbumYear(db, static_cast<int>(intAt(row, 3)), meta.year);
             std::lock_guard<std::mutex> lock(c.mu);
             rp.files_processed++;
             return;
@@ -595,10 +601,8 @@ void scanWebdavTree(const webdav::Url &base, const std::vector<DirTask> &starts,
         if (album_id != 0) {
           linkAlbumArtists(db, album_id, ensureArtists(db, album_artist_names));
           if (!task.cover.empty()) {
-            SQLite::Statement update(db, schema::sql::kAlbumUpdateCover);
-            update.bind(1, task.cover);
-            update.bind(2, album_id);
-            update.executeStep();
+            db.execute(schema::sql::kAlbumUpdateCover,
+                       {task.cover, static_cast<std::int64_t>(album_id)});
           }
         }
         if (exists) {
@@ -694,10 +698,9 @@ void scanWebdavTree(const webdav::Url &base, const std::vector<DirTask> &starts,
 
   if (!g_stop.load(std::memory_order_relaxed)) {
     std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-    SQLite::Database &db = db::conn(config::get().db_path.string());
-    SQLite::Statement update(db, schema::sql::kScanRootUpdateLastScan);
-    update.bind(1, root_id);
-    update.executeStep();
+    db::Session &db = db::mainSession();
+    db.execute(schema::sql::scanRootUpdateLastScan(db.dialect()),
+               {static_cast<std::int64_t>(root_id)});
   }
 }
 
@@ -777,10 +780,9 @@ void scanLocalTree(const repo::ScanRoot &sr, const std::vector<DirTask> &starts,
 
         if (c.only_new) {
           std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-          SQLite::Database &db = db::conn(config::get().db_path.string());
-          SQLite::Statement check(db, schema::sql::kTrackByPath);
-          check.bind(1, vpath);
-          if (check.executeStep()) {
+          db::Session &db = db::mainSession();
+          const auto check = db.query(schema::sql::kTrackByPath, {vpath});
+          if (!check.rows.empty()) {
             std::lock_guard<std::mutex> lock(c.mu);
             rp.files_processed++;
             return;
@@ -800,16 +802,16 @@ void scanLocalTree(const repo::ScanRoot &sr, const std::vector<DirTask> &starts,
         int updated = 0;
         {
           std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-          SQLite::Database &db = db::conn(config::get().db_path.string());
-          SQLite::Statement check(db, schema::sql::kTrackByPath);
-          check.bind(1, vpath);
-          const bool exists = check.executeStep();
+          db::Session &db = db::mainSession();
+          const auto check = db.query(schema::sql::kTrackByPath, {vpath});
+          const bool exists = !check.rows.empty();
           if (exists) {
-            const long long old_mtime = check.getColumn(1).getInt64();
-            const long long old_size = check.getColumn(2).getInt64();
+            const auto &row = check.rows.front();
+            const long long old_mtime = intAt(row, 1);
+            const long long old_size = intAt(row, 2);
             if (old_mtime == static_cast<long long>(meta.mtime) &&
                 old_size == static_cast<long long>(meta.size_bytes)) {
-              applyAlbumYear(db, check.getColumn(3).getInt(), meta.year);
+              applyAlbumYear(db, static_cast<int>(intAt(row, 3)), meta.year);
               std::lock_guard<std::mutex> lock(c.mu);
               rp.files_processed++;
               return;
@@ -831,10 +833,8 @@ void scanLocalTree(const repo::ScanRoot &sr, const std::vector<DirTask> &starts,
             linkAlbumArtists(db, album_id,
                              ensureArtists(db, album_artist_names));
             if (!task.cover.empty()) {
-              SQLite::Statement update(db, schema::sql::kAlbumUpdateCover);
-              update.bind(1, task.cover);
-              update.bind(2, album_id);
-              update.executeStep();
+              db.execute(schema::sql::kAlbumUpdateCover,
+                         {task.cover, static_cast<std::int64_t>(album_id)});
             }
           }
           if (exists) {
@@ -928,10 +928,9 @@ void scanLocalTree(const repo::ScanRoot &sr, const std::vector<DirTask> &starts,
 
     if (!g_stop.load(std::memory_order_relaxed)) {
       std::lock_guard<std::recursive_mutex> dblock(g_db_mutex);
-      SQLite::Database &db = db::conn(config::get().db_path.string());
-      SQLite::Statement update(db, schema::sql::kScanRootUpdateLastScan);
-      update.bind(1, static_cast<int>(sr.id));
-      update.executeStep();
+      db::Session &db = db::mainSession();
+      db.execute(schema::sql::scanRootUpdateLastScan(db.dialect()),
+                 {static_cast<std::int64_t>(sr.id)});
     }
 
     rp.scanning = false;
@@ -944,7 +943,7 @@ void scanLocalTree(const repo::ScanRoot &sr, const std::vector<DirTask> &starts,
 
 void runScanAll() {
   try {
-    repo::ScanRootRepo repo(config::get().db_path.string());
+    repo::ScanRootRepo repo(db::mainSession());
     auto roots = repo.list();
 
     Progress progress;
@@ -978,15 +977,14 @@ void scanLocalFile(int root_id, const fs::path &file) {
     const fs::path canonical_path = fs::canonical(file, ec2);
     const std::string path_str = ec2 ? file.string() : canonical_path.string();
 
-    SQLite::Database &db = db::conn(config::get().db_path.string());
-    repo::ScanRootRepo root_repo(config::get().db_path.string());
+    db::Session &db = db::mainSession();
+    repo::ScanRootRepo root_repo(db::mainSession());
     auto root_opt = root_repo.byId(root_id);
     const std::optional<repo::ScanRoot> &root = root_opt;
     const std::string vpath =
         root ? storage::toVirtual(*root, path_str) : path_str;
-    SQLite::Statement check(db, schema::sql::kTrackByPath);
-    check.bind(1, vpath);
-    const bool exists = check.executeStep();
+    const auto check = db.query(schema::sql::kTrackByPath, {vpath});
+    const bool exists = !check.rows.empty();
 
     auto meta_opt = metadata::read(path_str);
     if (!meta_opt) {
@@ -995,7 +993,7 @@ void scanLocalFile(int root_id, const fs::path &file) {
     const metadata::TrackMeta &meta = *meta_opt;
 
     if (exists) {
-      applyAlbumYear(db, check.getColumn(3).getInt(), meta.year);
+      applyAlbumYear(db, static_cast<int>(intAt(check.rows.front(), 3)), meta.year);
       return;
     }
 
@@ -1014,9 +1012,8 @@ void scanLocalFile(int root_id, const fs::path &file) {
       storeLyrics(db, track_id, fetchLyrics(meta, path_str));
     }
 
-    SQLite::Statement update(db, schema::sql::kScanRootUpdateLastScan);
-    update.bind(1, root_id);
-    update.executeStep();
+    db.execute(schema::sql::scanRootUpdateLastScan(db.dialect()),
+               {static_cast<std::int64_t>(root_id)});
   } catch (const std::exception &e) {
     std::cerr << "[scanner] scanLocalFile exception: " << e.what() << std::endl;
   }
@@ -1031,14 +1028,13 @@ void scanWebdavFile(int root_id, const std::string &url) {
       return;
     }
 
-    SQLite::Database &db = db::conn(config::get().db_path.string());
-    repo::ScanRootRepo root_repo(config::get().db_path.string());
+    db::Session &db = db::mainSession();
+    repo::ScanRootRepo root_repo(db::mainSession());
     auto root_opt = root_repo.byId(root_id);
     const std::optional<repo::ScanRoot> &root = root_opt;
     const std::string vpath = root ? storage::toVirtual(*root, url) : url;
-    SQLite::Statement check(db, schema::sql::kTrackByPath);
-    check.bind(1, vpath);
-    const bool exists = check.executeStep();
+    const auto check = db.query(schema::sql::kTrackByPath, {vpath});
+    const bool exists = !check.rows.empty();
 
     auto meta_opt = metadata::read(url);
     if (!meta_opt) {
@@ -1050,7 +1046,8 @@ void scanWebdavFile(int root_id, const std::string &url) {
         parseHttpDate(client.head(target.path).header("last-modified"));
 
     if (exists) {
-      applyAlbumYear(db, check.getColumn(3).getInt(), meta.year);
+      applyAlbumYear(db, static_cast<int>(intAt(check.rows.front(), 3)),
+                     meta.year);
       return;
     }
 
@@ -1069,9 +1066,8 @@ void scanWebdavFile(int root_id, const std::string &url) {
       storeLyrics(db, track_id, fetchLyrics(meta, url));
     }
 
-    SQLite::Statement update(db, schema::sql::kScanRootUpdateLastScan);
-    update.bind(1, root_id);
-    update.executeStep();
+    db.execute(schema::sql::scanRootUpdateLastScan(db.dialect()),
+               {static_cast<std::int64_t>(root_id)});
   } catch (const std::exception &e) {
     std::cerr << "[scanner] scanWebdavFile exception: " << e.what()
               << std::endl;
@@ -1118,7 +1114,7 @@ void scanDir(int root_id, const std::string &dir_path) {
       return;
     }
 
-    repo::ScanRootRepo root_repo(config::get().db_path.string());
+    repo::ScanRootRepo root_repo(db::mainSession());
     auto root_opt = root_repo.byId(root_id);
     if (!root_opt) {
       return;
@@ -1134,7 +1130,7 @@ void scanDirBatch(int root_id, const std::vector<std::string> &paths) {
     return;
   }
   try {
-    repo::ScanRootRepo root_repo(config::get().db_path.string());
+    repo::ScanRootRepo root_repo(db::mainSession());
     auto root_opt = root_repo.byId(root_id);
     if (!root_opt) {
       return;

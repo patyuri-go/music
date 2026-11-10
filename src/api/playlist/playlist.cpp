@@ -1,6 +1,7 @@
 #include "playlist.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -13,8 +14,6 @@
 #include "database.h"
 #include "db.h"
 #include "storage.h"
-#include "SQLiteCpp/Database.h"
-#include "SQLiteCpp/Statement.h"
 
 namespace playlist {
 namespace {
@@ -46,71 +45,96 @@ fs::path filePath(const std::string &id) {
   return dirPath() / (id + ".json");
 }
 
-std::string text(SQLite::Statement &q, int col) {
-  if (q.getColumn(col).isNull()) {
-    return std::string();
+std::string cellText(const db::Row &row, std::size_t index) {
+  static const db::Cell kNull{db::Null{}};
+  const db::Cell &cell = index < row.size() ? row[index] : kNull;
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    return *value;
   }
-  return q.getColumn(col).getText();
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  return {};
 }
 
-std::string albumName(SQLite::Database &db, int album_id) {
-  SQLite::Statement q(db, "SELECT name FROM album WHERE id = ?");
-  q.bind(1, album_id);
-  if (q.executeStep()) {
-    return text(q, 0);
+std::int64_t cellInt(const db::Row &row, std::size_t index) {
+  static const db::Cell kNull{db::Null{}};
+  const db::Cell &cell = index < row.size() ? row[index] : kNull;
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return *value;
   }
-  return std::string();
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return static_cast<std::int64_t>(*value);
+  }
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    try {
+      return std::stoll(*value);
+    } catch (...) {
+      return 0;
+    }
+  }
+  return 0;
 }
 
-std::string joinNames(SQLite::Statement &q) {
+std::string joinNames(const db::ResultSet &result) {
   std::string out;
-  while (q.executeStep()) {
+  for (const auto &row : result.rows) {
     if (!out.empty()) {
       out += "; ";
     }
-    out += text(q, 0);
+    out += cellText(row, 0);
   }
   return out;
 }
 
-std::string trackArtistNames(SQLite::Database &db, int track_id) {
-  SQLite::Statement q(db,
-                      "SELECT a.name FROM artist a JOIN track_artist ta "
-                      "ON ta.artist_id = a.id WHERE ta.track_id = ? "
-                      "ORDER BY ta.position");
-  q.bind(1, track_id);
-  return joinNames(q);
+std::string albumName(db::Session &session, int album_id) {
+  const auto result = session.query("SELECT name FROM album WHERE id = ?",
+                                    {static_cast<std::int64_t>(album_id)});
+  if (result.rows.empty()) {
+    return std::string();
+  }
+  return cellText(result.rows.front(), 0);
 }
 
-std::string albumArtistNames(SQLite::Database &db, int album_id) {
-  SQLite::Statement q(db,
-                      "SELECT a.name FROM artist a JOIN album_artist aa "
-                      "ON aa.artist_id = a.id WHERE aa.album_id = ? "
-                      "ORDER BY aa.position");
-  q.bind(1, album_id);
-  return joinNames(q);
+std::string trackArtistNames(db::Session &session, int track_id) {
+  return joinNames(session.query(
+      "SELECT a.name FROM artist a JOIN track_artist ta "
+      "ON ta.artist_id = a.id WHERE ta.track_id = ? "
+      "ORDER BY ta.position",
+      {static_cast<std::int64_t>(track_id)}));
+}
+
+std::string albumArtistNames(db::Session &session, int album_id) {
+  return joinNames(session.query(
+      "SELECT a.name FROM artist a JOIN album_artist aa "
+      "ON aa.artist_id = a.id WHERE aa.album_id = ? "
+      "ORDER BY aa.position",
+      {static_cast<std::int64_t>(album_id)}));
 }
 
 // 用虚拟路径匹配 DB；命中则补全字段。返回是否命中。
-bool matchSong(SQLite::Database &db, Song &s) {
-  SQLite::Statement q(db,
-                      "SELECT id, title, album_id, duration_ms FROM track "
-                      "WHERE path = ?");
-  q.bind(1, s.path);
-  if (!q.executeStep()) {
+bool matchSong(db::Session &session, Song &s) {
+  const auto result = session.query(
+      "SELECT id, title, album_id, duration_ms FROM track WHERE path = ?",
+      {s.path});
+  if (result.rows.empty()) {
     s.matched = false;
     s.track_id = 0;
     return false;
   }
+  const auto &row = result.rows.front();
   s.matched = true;
-  s.track_id = q.getColumn(0).getInt();
-  s.title = text(q, 1);
-  const int album_id = q.getColumn(2).getInt();
-  s.duration_ms = q.getColumn(3).getInt64();
-  s.artist = trackArtistNames(db, s.track_id);
+  s.track_id = static_cast<int>(cellInt(row, 0));
+  s.title = cellText(row, 1);
+  const int album_id = static_cast<int>(cellInt(row, 2));
+  s.duration_ms = cellInt(row, 3);
+  s.artist = trackArtistNames(session, s.track_id);
   if (album_id > 0) {
-    s.album = albumName(db, album_id);
-    s.album_artist = albumArtistNames(db, album_id);
+    s.album = albumName(session, album_id);
+    s.album_artist = albumArtistNames(session, album_id);
   }
   return true;
 }
@@ -201,10 +225,10 @@ void loadAll() {
     }
     g_playlists[p.id] = std::move(p);
   }
-  SQLite::Database &db = db::conn(config::get().db_path.string());
+  db::Session &session = db::mainSession();
   for (auto &kv : g_playlists) {
     for (auto &s : kv.second.songs) {
-      matchSong(db, s);
+      matchSong(session, s);
     }
   }
 }
@@ -295,15 +319,14 @@ bool addPath(const std::string &id, const std::string &path,
   }
   Song s;
   s.path = path;
-  SQLite::Database &db = db::conn(config::get().db_path.string());
-  matchSong(db, s);
+  matchSong(db::mainSession(), s);
   it->second.songs.push_back(std::move(s));
   saveLocked(it->second);
   return true;
 }
 
 bool addTrack(const std::string &id, int track_id, std::string &err) {
-  repo::TrackRepo tr(config::get().db_path.string());
+  repo::TrackRepo tr(db::mainSession());
   auto track = tr.byId(track_id);
   if (!track) {
     err = "track not found";

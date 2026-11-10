@@ -148,6 +148,53 @@ const Config &load(const std::string &file) {
     if (json.has("db_path")) {
       loaded.db_path = json["db_path"].s();
     }
+    // 未配置 db 段时，sqlite 路径继续跟随旧键 db_path。
+    loaded.database.sql.path = loaded.db_path;
+    if (json.has("db")) {
+      const auto &dbc = json["db"];
+      if (dbc.has("sql")) {
+        const auto &sqc = dbc["sql"];
+        if (sqc.has("path")) {
+          loaded.database.sql.path = sqc["path"].s();
+        }
+      }
+      // 段名大小写不敏感：PostgreSQL / postgresql / postgres 都接受。
+      const char *pgKey = nullptr;
+      if (dbc.has("PostgreSQL")) {
+        pgKey = "PostgreSQL";
+      } else if (dbc.has("postgresql")) {
+        pgKey = "postgresql";
+      } else if (dbc.has("postgres")) {
+        pgKey = "postgres";
+      }
+      if (pgKey != nullptr) {
+        const auto &pgc = dbc[pgKey];
+        if (pgc.has("url")) {
+          loaded.database.postgres.url = pgc["url"].s();
+        }
+        if (pgc.has("user")) {
+          loaded.database.postgres.user = pgc["user"].s();
+        }
+        if (pgc.has("password")) {
+          loaded.database.postgres.password = pgc["password"].s();
+        }
+        if (pgc.has("dbname")) {
+          loaded.database.postgres.dbname = pgc["dbname"].s();
+        }
+        if (pgc.has("password_env")) {
+          loaded.database.postgres.password_env = pgc["password_env"].s();
+        }
+        if (pgc.has("sslmode")) {
+          loaded.database.postgres.sslmode = pgc["sslmode"].s();
+        }
+        if (pgc.has("connect_timeout_seconds")) {
+          loaded.database.postgres.connect_timeout_seconds =
+              static_cast<int>(pgc["connect_timeout_seconds"].i());
+        }
+      }
+    }
+    // db_path 与 db.sql.path 始终同源，旧调用点无需改动。
+    loaded.db_path = loaded.database.sql.path;
     if (json.has("static_dir")) {
       loaded.static_dir = json["static_dir"].s();
     }

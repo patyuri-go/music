@@ -3,14 +3,10 @@
 #include "api/webdav/webdav.h"
 #include "config.h"
 #include "database.h"
+#include "db.h"
 #include "storage.h"
 
-#include <SQLiteCpp/Database.h>
-#include <SQLiteCpp/Statement.h>
-#include <SQLiteCpp/Transaction.h>
-
 #include <openssl/evp.h>
-#include <sqlite3.h>
 
 #include <algorithm>
 #include <array>
@@ -155,7 +151,7 @@ bool underAnyRoot(const fs::path &target) {
   if (ec) {
     return false;
   }
-  repo::ScanRootRepo roots(config::get().db_path.string());
+  repo::ScanRootRepo roots(db::mainSession());
   for (const auto &root : roots.list()) {
     fs::path base = fs::weakly_canonical(root.path, ec);
     if (ec) {
@@ -178,26 +174,30 @@ bool underAnyRoot(const fs::path &target) {
   return false;
 }
 
-SQLite::Database &openDb(const fs::path &path) {
+db::Session &openDb(const fs::path &path) {
   static thread_local std::unordered_map<std::string,
-                                        std::unique_ptr<SQLite::Database>>
+                                        std::unique_ptr<db::Session>>
       connections;
   const std::string key = path.string();
   const auto it = connections.find(key);
   if (it != connections.end()) {
     return *it->second;
   }
-  auto database = std::make_unique<SQLite::Database>(
-      key, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 5000);
-  database->exec("PRAGMA journal_mode=WAL");
-  database->exec("PRAGMA synchronous=NORMAL");
-  database->exec("PRAGMA busy_timeout=5000");
-  SQLite::Database &result = *database;
-  connections.emplace(key, std::move(database));
+  auto session = db::openSqliteSession(key, db::SqliteProfile::ImageCache);
+  db::Session &result = *session;
+  connections.emplace(key, std::move(session));
   return result;
 }
 
-void ensureSchema(SQLite::Database &database) {
+std::int64_t intAt(const db::Row &row, std::size_t index) {
+  return std::get<std::int64_t>(row.at(index).value);
+}
+
+std::string textAt(const db::Row &row, std::size_t index) {
+  return std::get<std::string>(row.at(index).value);
+}
+
+void ensureSchema(db::Session &database) {
   database.exec("CREATE TABLE IF NOT EXISTS image_cache ("
                 "virtual_path TEXT NOT NULL,"
                 "variant TEXT NOT NULL DEFAULT 'original',"
@@ -214,9 +214,10 @@ void ensureSchema(SQLite::Database &database) {
                 "ON image_cache(image_id)");
   database.exec("CREATE INDEX IF NOT EXISTS idx_image_cache_hit "
                 "ON image_cache(last_hit_at)");
-  const int version =
-      database.execAndGet("PRAGMA user_version").getInt();
-  if (version == 0) {
+  const db::ResultSet version = database.query("PRAGMA user_version");
+  const int value =
+      version.rows.empty() ? 0 : static_cast<int>(intAt(version.rows.front(), 0));
+  if (value == 0) {
     database.exec("PRAGMA user_version=1");
   }
 }
@@ -260,7 +261,7 @@ bool ImageCache::init(std::string &error) {
 
   db_path_ = opt_.dir / "index.db";
   try {
-    SQLite::Database &database = openDb(db_path_);
+    db::Session &database = openDb(db_path_);
     ensureSchema(database);
     purgeMissingRows();
   } catch (const std::exception &ex) {
@@ -491,25 +492,24 @@ fs::path ImageCache::cachePath(const std::string &image_id,
 std::optional<ImageCache::Row>
 ImageCache::lookup(const std::string &virtual_path,
                    const std::string &variant) {
-  SQLite::Database &database = openDb(db_path_);
-  SQLite::Statement query(
-      database,
+  db::Session &database = openDb(db_path_);
+  const db::ResultSet result = database.query(
       "SELECT image_id, source_sig, cache_file, bytes, last_hit_at, "
       "next_validate_at, is_local FROM image_cache "
-      "WHERE virtual_path=? AND variant=?");
-  query.bind(1, virtual_path);
-  query.bind(2, variant);
-  if (!query.executeStep()) {
+      "WHERE virtual_path=? AND variant=?",
+      {virtual_path, variant});
+  if (result.rows.empty()) {
     return std::nullopt;
   }
+  const db::Row &query = result.rows.front();
   Row row;
-  row.image_id = query.getColumn(0).getString();
-  row.source_sig = query.getColumn(1).getString();
-  const std::string cache_file = query.getColumn(2).getString();
-  row.bytes = static_cast<std::uintmax_t>(query.getColumn(3).getInt64());
-  row.last_hit_at = query.getColumn(4).getInt64();
-  row.next_validate_at = query.getColumn(5).getInt64();
-  row.is_local = query.getColumn(6).getInt() != 0;
+  row.image_id = textAt(query, 0);
+  row.source_sig = textAt(query, 1);
+  const std::string cache_file = textAt(query, 2);
+  row.bytes = static_cast<std::uintmax_t>(intAt(query, 3));
+  row.last_hit_at = intAt(query, 4);
+  row.next_validate_at = intAt(query, 5);
+  row.is_local = intAt(query, 6) != 0;
   row.path = row.is_local ? fs::path(cache_file) : (opt_.dir / cache_file);
   return row;
 }
@@ -517,15 +517,10 @@ ImageCache::lookup(const std::string &virtual_path,
 void ImageCache::touch(const std::string &virtual_path,
                        const std::string &variant, std::int64_t now) {
   std::lock_guard<std::mutex> lock(db_write_mu_);
-  SQLite::Database &database = openDb(db_path_);
-  SQLite::Statement update(
-      database,
-      "UPDATE image_cache SET last_hit_at=? "
-      "WHERE virtual_path=? AND variant=?");
-  update.bind(1, now);
-  update.bind(2, virtual_path);
-  update.bind(3, variant);
-  update.exec();
+  db::Session &database = openDb(db_path_);
+  database.execute("UPDATE image_cache SET last_hit_at=? "
+                   "WHERE virtual_path=? AND variant=?",
+                   {now, virtual_path, variant});
 }
 
 void ImageCache::upsert(const std::string &virtual_path,
@@ -535,9 +530,9 @@ void ImageCache::upsert(const std::string &virtual_path,
                         const fs::path &cache_file, bool is_local,
                         std::uintmax_t bytes, std::int64_t next_validate_at) {
   std::lock_guard<std::mutex> lock(db_write_mu_);
-  SQLite::Database &database = openDb(db_path_);
-  SQLite::Statement insert(
-      database,
+  db::Session &database = openDb(db_path_);
+  const std::int64_t now = nowSeconds();
+  database.execute(
       "INSERT INTO image_cache(virtual_path, variant, image_id, source_sig, "
       "last_hit_at, cache_file, bytes, created_at, next_validate_at, is_local) "
       "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -545,31 +540,18 @@ void ImageCache::upsert(const std::string &virtual_path,
       "image_id=excluded.image_id, source_sig=excluded.source_sig, "
       "last_hit_at=excluded.last_hit_at, cache_file=excluded.cache_file, "
       "bytes=excluded.bytes, next_validate_at=excluded.next_validate_at, "
-      "is_local=excluded.is_local");
-  const std::int64_t now = nowSeconds();
-  insert.bind(1, virtual_path);
-  insert.bind(2, variant);
-  insert.bind(3, image_id);
-  insert.bind(4, source_sig);
-  insert.bind(5, now);
-  insert.bind(6, cache_file.string());
-  insert.bind(7, static_cast<std::int64_t>(bytes));
-  insert.bind(8, now);
-  insert.bind(9, next_validate_at);
-  insert.bind(10, is_local ? 1 : 0);
-  insert.exec();
+      "is_local=excluded.is_local",
+      {virtual_path, variant, image_id, source_sig, now,
+       cache_file.string(), static_cast<std::int64_t>(bytes), now,
+       next_validate_at, static_cast<std::int64_t>(is_local ? 1 : 0)});
 }
 
 void ImageCache::deleteRow(const std::string &virtual_path,
                            const std::string &variant) {
   std::lock_guard<std::mutex> lock(db_write_mu_);
-  SQLite::Database &database = openDb(db_path_);
-  SQLite::Statement remove(
-      database,
-      "DELETE FROM image_cache WHERE virtual_path=? AND variant=?");
-  remove.bind(1, virtual_path);
-  remove.bind(2, variant);
-  remove.exec();
+  db::Session &database = openDb(db_path_);
+  database.execute("DELETE FROM image_cache WHERE virtual_path=? AND variant=?",
+                   {virtual_path, variant});
 }
 
 void ImageCache::deleteIfMatches(const std::string &virtual_path,
@@ -577,16 +559,11 @@ void ImageCache::deleteIfMatches(const std::string &virtual_path,
                                  const std::string &image_id,
                                  const std::string &source_sig) {
   std::lock_guard<std::mutex> lock(db_write_mu_);
-  SQLite::Database &database = openDb(db_path_);
-  SQLite::Statement remove(
-      database,
+  db::Session &database = openDb(db_path_);
+  database.execute(
       "DELETE FROM image_cache WHERE virtual_path=? AND variant=? "
-      "AND image_id=? AND source_sig=?");
-  remove.bind(1, virtual_path);
-  remove.bind(2, variant);
-  remove.bind(3, image_id);
-  remove.bind(4, source_sig);
-  remove.exec();
+      "AND image_id=? AND source_sig=?",
+      {virtual_path, variant, image_id, source_sig});
 }
 
 void ImageCache::markValidated(const std::string &virtual_path,
@@ -595,17 +572,11 @@ void ImageCache::markValidated(const std::string &virtual_path,
                                const std::string &source_sig,
                                std::int64_t next_at) {
   std::lock_guard<std::mutex> lock(db_write_mu_);
-  SQLite::Database &database = openDb(db_path_);
-  SQLite::Statement update(
-      database,
-      "UPDATE image_cache SET next_validate_at=? "
-      "WHERE virtual_path=? AND variant=? AND image_id=? AND source_sig=?");
-  update.bind(1, next_at);
-  update.bind(2, virtual_path);
-  update.bind(3, variant);
-  update.bind(4, image_id);
-  update.bind(5, source_sig);
-  update.exec();
+  db::Session &database = openDb(db_path_);
+  database.execute("UPDATE image_cache SET next_validate_at=? "
+                   "WHERE virtual_path=? AND variant=? AND image_id=? "
+                   "AND source_sig=?",
+                   {next_at, virtual_path, variant, image_id, source_sig});
 }
 
 bool ImageCache::downloadToTemp(const std::string &resolved_location,
@@ -959,15 +930,13 @@ void ImageCache::gc() {
 
 void ImageCache::runGc() {
   try {
-    SQLite::Database &database = openDb(db_path_);
+    db::Session &database = openDb(db_path_);
     if (opt_.ttl_days > 0) {
       const std::int64_t cutoff =
           nowSeconds() - static_cast<std::int64_t>(opt_.ttl_days) * 86400;
       std::lock_guard<std::mutex> lock(db_write_mu_);
-      SQLite::Statement remove(
-          database, "DELETE FROM image_cache WHERE last_hit_at < ?");
-      remove.bind(1, cutoff);
-      remove.exec();
+      database.execute("DELETE FROM image_cache WHERE last_hit_at < ?",
+                       {cutoff});
     }
   } catch (const std::exception &ex) {
     std::cerr << "[image_cache] TTL cleanup failed: " << ex.what() << '\n';
@@ -1006,7 +975,7 @@ void ImageCache::runGc() {
 }
 
 void ImageCache::evictRows() {
-  SQLite::Database &database = openDb(db_path_);
+  db::Session &database = openDb(db_path_);
   struct Group {
     std::string cache_file;
     std::uintmax_t bytes = 0;
@@ -1015,17 +984,16 @@ void ImageCache::evictRows() {
   std::vector<Group> groups;
   std::uintmax_t total = 0;
   {
-    SQLite::Statement query(
-        database,
+    const db::ResultSet query = database.query(
         "SELECT cache_file, MAX(bytes), MAX(last_hit_at) FROM image_cache "
         "WHERE is_local=0 GROUP BY cache_file "
         "ORDER BY MAX(last_hit_at) ASC");
-    while (query.executeStep()) {
+    groups.reserve(query.rows.size());
+    for (const db::Row &row : query.rows) {
       Group group;
-      group.cache_file = query.getColumn(0).getString();
-      group.bytes =
-          static_cast<std::uintmax_t>(query.getColumn(1).getInt64());
-      group.last_hit = query.getColumn(2).getInt64();
+      group.cache_file = textAt(row, 0);
+      group.bytes = static_cast<std::uintmax_t>(intAt(row, 1));
+      group.last_hit = intAt(row, 2);
       total += group.bytes;
       groups.push_back(std::move(group));
     }
@@ -1036,16 +1004,14 @@ void ImageCache::evictRows() {
 
   const std::uintmax_t target = (opt_.max_bytes / 10) * 9;
   std::lock_guard<std::mutex> lock(db_write_mu_);
-  SQLite::Transaction transaction(database);
+  db::Transaction transaction(database);
   for (const Group &group : groups) {
     if (total <= target) {
       break;
     }
-    SQLite::Statement remove(
-        database,
-        "DELETE FROM image_cache WHERE cache_file=? AND is_local=0");
-    remove.bind(1, group.cache_file);
-    remove.exec();
+    database.execute(
+        "DELETE FROM image_cache WHERE cache_file=? AND is_local=0",
+        {group.cache_file});
     total = group.bytes >= total ? 0 : total - group.bytes;
   }
   transaction.commit();
@@ -1053,11 +1019,11 @@ void ImageCache::evictRows() {
 
 std::set<std::string> ImageCache::referencedFiles() {
   std::set<std::string> files;
-  SQLite::Database &database = openDb(db_path_);
-  SQLite::Statement query(
-      database, "SELECT DISTINCT cache_file FROM image_cache WHERE is_local=0");
-  while (query.executeStep()) {
-    files.insert(query.getColumn(0).getString());
+  db::Session &database = openDb(db_path_);
+  const db::ResultSet query = database.query(
+      "SELECT DISTINCT cache_file FROM image_cache WHERE is_local=0");
+  for (const db::Row &row : query.rows) {
+    files.insert(textAt(row, 0));
   }
   return files;
 }
@@ -1094,31 +1060,28 @@ void ImageCache::removeOrphans(const std::set<std::string> &referenced) {
 }
 
 void ImageCache::purgeMissingRows() {
-  SQLite::Database &database = openDb(db_path_);
+  db::Session &database = openDb(db_path_);
   struct Missing {
     std::string virtual_path;
     std::string variant;
   };
   std::vector<Missing> missing;
-  {
-    SQLite::Statement query(
-        database,
-        "SELECT virtual_path, variant, cache_file, bytes, is_local "
-        "FROM image_cache");
-    while (query.executeStep()) {
-      const std::string virtual_path = query.getColumn(0).getString();
-      const std::string variant = query.getColumn(1).getString();
-      const std::string cache_file = query.getColumn(2).getString();
-      const std::uintmax_t bytes =
-          static_cast<std::uintmax_t>(query.getColumn(3).getInt64());
-      const bool is_local = query.getColumn(4).getInt() != 0;
-      const fs::path path =
-          is_local ? fs::path(cache_file) : (opt_.dir / cache_file);
-      std::error_code ec;
-      const std::uintmax_t size = fs::file_size(path, ec);
-      if (ec || size != bytes || (is_local && !underAnyRoot(path))) {
-        missing.push_back({virtual_path, variant});
-      }
+  const db::ResultSet query = database.query(
+      "SELECT virtual_path, variant, cache_file, bytes, is_local "
+      "FROM image_cache");
+  missing.reserve(query.rows.size());
+  for (const db::Row &row : query.rows) {
+    const std::string virtual_path = textAt(row, 0);
+    const std::string variant = textAt(row, 1);
+    const std::string cache_file = textAt(row, 2);
+    const std::uintmax_t bytes = static_cast<std::uintmax_t>(intAt(row, 3));
+    const bool is_local = intAt(row, 4) != 0;
+    const fs::path path =
+        is_local ? fs::path(cache_file) : (opt_.dir / cache_file);
+    std::error_code ec;
+    const std::uintmax_t size = fs::file_size(path, ec);
+    if (ec || size != bytes || (is_local && !underAnyRoot(path))) {
+      missing.push_back({virtual_path, variant});
     }
   }
   if (missing.empty()) {
@@ -1126,12 +1089,9 @@ void ImageCache::purgeMissingRows() {
   }
   std::lock_guard<std::mutex> lock(db_write_mu_);
   for (const Missing &entry : missing) {
-    SQLite::Statement remove(
-        database,
-        "DELETE FROM image_cache WHERE virtual_path=? AND variant=?");
-    remove.bind(1, entry.virtual_path);
-    remove.bind(2, entry.variant);
-    remove.exec();
+    database.execute(
+        "DELETE FROM image_cache WHERE virtual_path=? AND variant=?",
+        {entry.virtual_path, entry.variant});
   }
 }
 
@@ -1157,18 +1117,16 @@ void ImageCache::gcLoop() {
 Stats ImageCache::stats() const {
   Stats result;
   try {
-    SQLite::Database &database = openDb(db_path_);
-    SQLite::Statement count(database, "SELECT COUNT(*) FROM image_cache");
-    if (count.executeStep()) {
-      result.entries =
-          static_cast<std::uint64_t>(count.getColumn(0).getInt64());
+    db::Session &database = openDb(db_path_);
+    const db::ResultSet count =
+        database.query("SELECT COUNT(*) FROM image_cache");
+    if (!count.rows.empty()) {
+      result.entries = static_cast<std::uint64_t>(intAt(count.rows.front(), 0));
     }
-    SQLite::Statement bytes(
-        database,
+    const db::ResultSet bytes = database.query(
         "SELECT COALESCE(SUM(bytes), 0) FROM image_cache WHERE is_local=0");
-    if (bytes.executeStep()) {
-      result.bytes =
-          static_cast<std::uintmax_t>(bytes.getColumn(0).getInt64());
+    if (!bytes.rows.empty()) {
+      result.bytes = static_cast<std::uintmax_t>(intAt(bytes.rows.front(), 0));
     }
   } catch (const std::exception &) {
   }

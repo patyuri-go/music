@@ -27,12 +27,10 @@
 #include "api/playlist/playlist.h"
 #include "service.h"
 
-#include <SQLiteCpp/Database.h>
-#include <SQLiteCpp/Statement.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -56,6 +54,43 @@ using http_util::urlDecode;
 
 namespace {
 
+const db::Cell &cellAt(const db::Row &row, std::size_t index) {
+  static const db::Cell kNull{db::Null{}};
+  return index < row.size() ? row[index] : kNull;
+}
+
+std::int64_t intAt(const db::Row &row, std::size_t index) {
+  const db::Cell &cell = cellAt(row, index);
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return *value;
+  }
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return static_cast<std::int64_t>(*value);
+  }
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    try {
+      return std::stoll(*value);
+    } catch (...) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+std::string textAt(const db::Row &row, std::size_t index) {
+  const db::Cell &cell = cellAt(row, index);
+  if (const auto *value = std::get_if<std::string>(&cell.value)) {
+    return *value;
+  }
+  if (const auto *value = std::get_if<std::int64_t>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  if (const auto *value = std::get_if<double>(&cell.value)) {
+    return std::to_string(*value);
+  }
+  return {};
+}
+
 std::string rootTypeOf(const std::string &path) {
   return webdav::isWebdavUrl(path) ? "webdav" : "local";
 }
@@ -75,19 +110,31 @@ std::string deriveRootName(const std::string &path) {
 
 void bootstrap() {
   const auto &cfg = config::load();
-  auto &database = db::conn(cfg.db_path.string());
-  schema::migrate(database);
-  schema::selfCheck(database);
 
-  std::cout << "[boot] db=" << cfg.db_path
-            << " static_dir=" << cfg.static_dir
-            << " page_size=" << cfg.page_size << std::endl;
-  std::cout << "[boot] schema 版本 " << schema::kVersion << "，启动自检通过"
+  // 主库后端在启动时一次性确定：本地 SQLite 或远端 PostgreSQL。
+  db::init(cfg.database);
+  db::Session &session = db::mainSession();
+  session.query("SELECT 1");
+
+  const bool use_postgres = session.dialect() == db::Dialect::Postgres;
+  if (use_postgres) {
+    // PostgreSQL 不做 schema 迁移，只建空库并校验版本。
+    schema::ensurePostgresSchema(session);
+    std::cout << "[boot] db=postgres://" << cfg.database.postgres.url
+              << " static_dir=" << cfg.static_dir
+              << " page_size=" << cfg.page_size << std::endl;
+  } else {
+    schema::migrate(session);
+    std::cout << "[boot] db=" << cfg.db_path
+              << " static_dir=" << cfg.static_dir
+              << " page_size=" << cfg.page_size << std::endl;
+  }
+  std::cout << "[boot] schema 版本 " << schema::kVersion << "，就绪"
             << std::endl;
 
   {
     // 扫描根（本地与 WebDAV）只存数据库，配置文件不再声明。
-    repo::ScanRootRepo roots(cfg.db_path.string());
+    repo::ScanRootRepo roots(db::mainSession());
     for (const auto &r : roots.list()) {
       if (r.name.empty()) {
         roots.updateName(r.id, deriveRootName(r.path));
@@ -132,7 +179,7 @@ bool isUnderAnyRoot(const fs::path &target) {
   if (ec) {
     return false;
   }
-  repo::ScanRootRepo repo(config::get().db_path.string());
+  repo::ScanRootRepo repo(db::mainSession());
   for (const auto &root : repo.list()) {
     fs::path base = fs::weakly_canonical(root.path, ec);
     if (ec) {
@@ -205,7 +252,7 @@ crow::response browseWebdavRoot(int root_id, const std::string &root_url,
     const std::string dir_encoded = server_dir.empty() ? dir : server_dir;
     const std::string dir_url = webdav::buildUrl(base, dir_encoded);
 
-    repo::ScanRootRepo root_repo(config::get().db_path.string());
+    repo::ScanRootRepo root_repo(db::mainSession());
     auto root_opt = root_repo.byId(root_id);
     const std::string vbase =
         root_opt ? (root_opt->name + (rel_path.empty() ? "" : "/" + rel_path))
@@ -224,13 +271,12 @@ crow::response browseWebdavRoot(int root_id, const std::string &root_url,
     std::map<std::string, Entry> merged;
 
     {
-      SQLite::Database &db = db::conn(config::get().db_path.string());
-      SQLite::Statement q(db, schema::sql::kTrackPathsUnderRoot);
-      q.bind(1, root_id);
-      q.bind(2, vprefix);
-      q.bind(3, vbase + "0");
-      while (q.executeStep()) {
-        const std::string vp = q.getColumn(1).getText();
+      db::Session &db = db::mainSession();
+      const auto tracks = db.query(
+          schema::sql::kTrackPathsUnderRoot,
+          {static_cast<std::int64_t>(root_id), vprefix, vbase + "0"});
+      for (const auto &row : tracks.rows) {
+        const std::string vp = textAt(row, 1);
         if (vp.compare(0, vprefix.size(), vprefix) != 0) {
           continue;
         }
@@ -242,8 +288,8 @@ crow::response browseWebdavRoot(int root_id, const std::string &root_url,
         Entry &e = merged[urlDecode(real)];
         e.path = real;
         e.inDb = true;
-        e.trackId = q.getColumn(0).getInt();
-        e.title = q.getColumn(2).getText();
+        e.trackId = static_cast<int>(intAt(row, 0));
+        e.title = textAt(row, 2);
         const std::size_t slash = real.rfind('/');
         e.name = urlDecode((slash == std::string::npos) ? real
                                                         : real.substr(slash + 1));
@@ -299,7 +345,7 @@ crow::response browseDir(int root_id, const std::string &rel_path) {
       return jsonResponse(400, "{\"erro\":true}");
     }
 
-    repo::ScanRootRepo root_repo(config::get().db_path.string());
+    repo::ScanRootRepo root_repo(db::mainSession());
     auto root_opt = root_repo.byId(root_id);
     if (!root_opt) {
       return jsonResponse(404, "{\"erro\":true}");
@@ -331,13 +377,12 @@ crow::response browseDir(int root_id, const std::string &rel_path) {
     std::map<std::string, Entry> merged;
 
     {
-      SQLite::Database &db = db::conn(config::get().db_path.string());
-      SQLite::Statement q(db, schema::sql::kTrackPathsUnderRoot);
-      q.bind(1, root_id);
-      q.bind(2, vprefix);
-      q.bind(3, vbase + "0");
-      while (q.executeStep()) {
-        const std::string vp = q.getColumn(1).getText();
+      db::Session &db = db::mainSession();
+      const auto tracks = db.query(
+          schema::sql::kTrackPathsUnderRoot,
+          {static_cast<std::int64_t>(root_id), vprefix, vbase + "0"});
+      for (const auto &row : tracks.rows) {
+        const std::string vp = textAt(row, 1);
         if (vp.compare(0, vprefix.size(), vprefix) != 0) {
           continue;
         }
@@ -349,8 +394,8 @@ crow::response browseDir(int root_id, const std::string &rel_path) {
         Entry &e = merged[real];
         e.path = real;
         e.inDb = true;
-        e.trackId = q.getColumn(0).getInt();
-        e.title = q.getColumn(2).getText();
+        e.trackId = static_cast<int>(intAt(row, 0));
+        e.title = textAt(row, 2);
         e.name = fs::path(real).filename().string();
       }
     }
@@ -516,19 +561,16 @@ std::string artistKeyOf(const std::vector<std::string> &names) {
   return key;
 }
 
-int ensureArtistId(SQLite::Database &db, const std::string &name) {
+int ensureArtistId(db::Session &db, const std::string &name) {
   if (name.empty()) {
     return 0;
   }
-  SQLite::Statement insert(db, schema::sql::kArtistInsert);
-  insert.bind(1, name);
-  insert.executeStep();
-  SQLite::Statement query(db, schema::sql::kArtistByName);
-  query.bind(1, name);
-  return query.executeStep() ? query.getColumn(0).getInt() : 0;
+  db.execute(schema::sql::artistInsert(db.dialect()), {name});
+  const auto result = db.query(schema::sql::kArtistByName, {name});
+  return result.rows.empty() ? 0 : static_cast<int>(intAt(result.rows.front(), 0));
 }
 
-std::vector<int> ensureArtistIds(SQLite::Database &db,
+std::vector<int> ensureArtistIds(db::Session &db,
                                  const std::vector<std::string> &names) {
   std::vector<int> ids;
   for (const auto &n : names) {
@@ -540,50 +582,39 @@ std::vector<int> ensureArtistIds(SQLite::Database &db,
   return ids;
 }
 
-int ensureAlbumId(SQLite::Database &db, const std::string &name,
+int ensureAlbumId(db::Session &db, const std::string &name,
                   const std::string &key) {
-  SQLite::Statement insert(db, schema::sql::kAlbumUpsert);
-  insert.bind(1, name);
-  insert.bind(2, key);
-  insert.executeStep();
-  SQLite::Statement query(db, schema::sql::kAlbumByKey);
-  query.bind(1, name);
-  query.bind(2, key);
-  return query.executeStep() ? query.getColumn(0).getInt() : 0;
+  db.execute(schema::sql::albumUpsert(db.dialect()), {name, key});
+  const auto result = db.query(schema::sql::kAlbumByKey, {name, key});
+  return result.rows.empty() ? 0 : static_cast<int>(intAt(result.rows.front(), 0));
 }
 
-void setTrackArtists(SQLite::Database &db, int track_id,
+void setTrackArtists(db::Session &db, int track_id,
                      const std::vector<int> &artist_ids) {
-  SQLite::Statement clear(db, schema::sql::kTrackArtistClear);
-  clear.bind(1, track_id);
-  clear.executeStep();
-  int position = 0;
+  db.execute(schema::sql::kTrackArtistClear,
+             {static_cast<std::int64_t>(track_id)});
+  std::int64_t position = 0;
   for (const int aid : artist_ids) {
-    SQLite::Statement insert(db, schema::sql::kTrackArtistInsert);
-    insert.bind(1, track_id);
-    insert.bind(2, aid);
-    insert.bind(3, position++);
-    insert.executeStep();
+    db.execute(schema::sql::trackArtistInsert(db.dialect()),
+               {static_cast<std::int64_t>(track_id),
+                static_cast<std::int64_t>(aid), position++});
   }
 }
 
-void setAlbumArtists(SQLite::Database &db, int album_id,
+void setAlbumArtists(db::Session &db, int album_id,
                      const std::vector<int> &artist_ids) {
-  SQLite::Statement clear(db, schema::sql::kAlbumArtistClear);
-  clear.bind(1, album_id);
-  clear.executeStep();
-  int position = 0;
+  db.execute(schema::sql::kAlbumArtistClear,
+             {static_cast<std::int64_t>(album_id)});
+  std::int64_t position = 0;
   for (const int aid : artist_ids) {
-    SQLite::Statement insert(db, schema::sql::kAlbumArtistInsert);
-    insert.bind(1, album_id);
-    insert.bind(2, aid);
-    insert.bind(3, position++);
-    insert.executeStep();
+    db.execute(schema::sql::albumArtistInsert(db.dialect()),
+               {static_cast<std::int64_t>(album_id),
+                static_cast<std::int64_t>(aid), position++});
   }
 }
 
 bool syncFromFileById(int id, int slot = -1) {
-  repo::TrackRepo track_repo(config::get().db_path.string());
+  repo::TrackRepo track_repo(db::mainSession());
   auto track = track_repo.byId(id);
   if (!track) {
     return false;
@@ -601,7 +632,7 @@ bool syncFromFileById(int id, int slot = -1) {
   if (!meta) {
     return false;
   }
-  SQLite::Database &db = db::conn(config::get().db_path.string());
+  db::Session &db = db::mainSession();
 
   std::vector<std::string> artist_names = meta->artists;
   if (artist_names.empty() && !meta->artist.empty()) {
@@ -628,31 +659,24 @@ bool syncFromFileById(int id, int slot = -1) {
     setAlbumArtists(db, album_id, ensureArtistIds(db, album_artist_names));
   }
 
-  SQLite::Statement del(db, "DELETE FROM track_genre WHERE track_id = ?");
-  del.bind(1, id);
-  del.executeStep();
+  db.execute("DELETE FROM track_genre WHERE track_id = ?",
+             {static_cast<std::int64_t>(id)});
   if (!meta->genre.empty()) {
-    SQLite::Statement genre_q(db, schema::sql::kGenreByName);
-    genre_q.bind(1, meta->genre);
-    int genre_id = 0;
-    if (genre_q.executeStep()) {
-      genre_id = genre_q.getColumn(0).getInt();
-    }
+    const auto lookup = [&db](const std::string &name) {
+      const auto result = db.query(schema::sql::kGenreByName, {name});
+      return result.rows.empty()
+                 ? 0
+                 : static_cast<int>(intAt(result.rows.front(), 0));
+    };
+    int genre_id = lookup(meta->genre);
     if (genre_id == 0) {
-      SQLite::Statement genre_ins(db, schema::sql::kGenreInsert);
-      genre_ins.bind(1, meta->genre);
-      genre_ins.executeStep();
-      SQLite::Statement genre_q2(db, schema::sql::kGenreByName);
-      genre_q2.bind(1, meta->genre);
-      if (genre_q2.executeStep()) {
-        genre_id = genre_q2.getColumn(0).getInt();
-      }
+      db.execute(schema::sql::genreInsert(db.dialect()), {meta->genre});
+      genre_id = lookup(meta->genre);
     }
     if (genre_id > 0) {
-      SQLite::Statement tg_ins(db, schema::sql::kTrackGenreInsert);
-      tg_ins.bind(1, id);
-      tg_ins.bind(2, genre_id);
-      tg_ins.executeStep();
+      db.execute(schema::sql::trackGenreInsert(db.dialect()),
+                 {static_cast<std::int64_t>(id),
+                  static_cast<std::int64_t>(genre_id)});
     }
   }
   // The track may have moved to another album / artists; drop now-empty rows.
@@ -668,18 +692,17 @@ bool syncFromFileById(int id, int slot = -1) {
       lyrics = metadata::readSiblingLyrics(real_path);
     }
     if (!lyrics.empty()) {
-      SQLite::Statement lyr(db, schema::sql::kTrackLyricsUpsert);
-      lyr.bind(1, id);
-      lyr.bind(2, lyrics);
-      lyr.bind(3, metadata::isSyncedLyrics(lyrics) ? 1 : 0);
-      lyr.executeStep();
+      db.execute(schema::sql::trackLyricsUpsert(db.dialect()),
+                 {static_cast<std::int64_t>(id), lyrics,
+                  static_cast<std::int64_t>(
+                      metadata::isSyncedLyrics(lyrics) ? 1 : 0)});
     }
   }
   return true;
 }
 
 bool syncToFileById(int id, int slot = -1) {
-  repo::TrackRepo track_repo(config::get().db_path.string());
+  repo::TrackRepo track_repo(db::mainSession());
   auto track = track_repo.byId(id);
   if (!track) {
     return false;
@@ -693,9 +716,9 @@ bool syncToFileById(int id, int slot = -1) {
   } else {
     scanner::setCurrentFile(real_path);
   }
-  SQLite::Database &db = db::conn(config::get().db_path.string());
-  repo::ArtistRepo artist_repo(config::get().db_path.string());
-  repo::AlbumRepo album_repo(config::get().db_path.string());
+  db::Session &db = db::mainSession();
+  repo::ArtistRepo artist_repo(db::mainSession());
+  repo::AlbumRepo album_repo(db::mainSession());
 
   metadata::FileMeta meta;
   meta.title = track->title;
@@ -723,18 +746,18 @@ bool syncToFileById(int id, int slot = -1) {
 
   auto genres = track_repo.genresByTrackId(id);
   if (!genres.empty()) {
-    SQLite::Statement q(db, "SELECT name FROM genre WHERE id = ?");
-    q.bind(1, genres[0]);
-    if (q.executeStep()) {
-      meta.genre = q.getColumn(0).getText();
+    const auto genre = db.query("SELECT name FROM genre WHERE id = ?",
+                                {static_cast<std::int64_t>(genres[0])});
+    if (!genre.rows.empty()) {
+      meta.genre = textAt(genre.rows.front(), 0);
     }
   }
   return metadata::writeFileMeta(real_path, meta);
 }
 
 // Run fn over every id using up to config::scan_threads worker threads. The
-// per-thread SQLite connections (db::conn is thread_local) plus WAL/busy_timeout
-// make concurrent sync operations safe.
+// per-thread main sessions (db::mainSession() is thread_local) plus
+// WAL/busy_timeout make concurrent sync operations safe.
 void runIdsParallel(const std::vector<int> &ids,
                     const std::function<void(int, int)> &fn) {
   if (ids.empty()) {
@@ -773,48 +796,45 @@ void runIdsParallel(const std::vector<int> &ids,
 // live under it. Used by batch sync-from-file / sync-to-file on folders.
 std::vector<int> tracksUnderPath(int root_id, const std::string &path) {
   std::vector<int> ids;
-  repo::ScanRootRepo root_repo(config::get().db_path.string());
+  repo::ScanRootRepo root_repo(db::mainSession());
   auto root = root_repo.byId(root_id);
   if (!root) {
     return ids;
   }
   const std::string vpath = storage::toVirtual(*root, path);
-  SQLite::Database &db = db::conn(config::get().db_path.string());
-  SQLite::Statement q(db,
-                      "SELECT id FROM track WHERE root_id = ? AND "
-                      "(path = ? OR (path >= ? AND path < ?)) ORDER BY id");
-  q.bind(1, root_id);
-  q.bind(2, vpath);
-  q.bind(3, vpath + "/");
-  q.bind(4, vpath + "0");
-  while (q.executeStep()) {
-    ids.push_back(q.getColumn(0).getInt());
+  db::Session &db = db::mainSession();
+  const auto rows = db.query("SELECT id FROM track WHERE root_id = ? AND "
+                             "(path = ? OR (path >= ? AND path < ?)) "
+                             "ORDER BY id",
+                             {static_cast<std::int64_t>(root_id), vpath,
+                              vpath + "/", vpath + "0"});
+  for (const auto &row : rows.rows) {
+    ids.push_back(static_cast<int>(intAt(row, 0)));
   }
   return ids;
 }
 
 std::vector<int> tracksUnderAlbum(int album_id) {
   std::vector<int> ids;
-  SQLite::Database &db = db::conn(config::get().db_path.string());
-  SQLite::Statement q(db, "SELECT id FROM track WHERE album_id = ? ORDER BY id");
-  q.bind(1, album_id);
-  while (q.executeStep()) {
-    ids.push_back(q.getColumn(0).getInt());
+  const auto rows =
+      db::mainSession().query("SELECT id FROM track WHERE album_id = ? "
+                              "ORDER BY id",
+                              {static_cast<std::int64_t>(album_id)});
+  for (const auto &row : rows.rows) {
+    ids.push_back(static_cast<int>(intAt(row, 0)));
   }
   return ids;
 }
 
 std::vector<int> tracksUnderArtist(int artist_id) {
   std::vector<int> ids;
-  SQLite::Database &db = db::conn(config::get().db_path.string());
-  SQLite::Statement q(
-      db,
+  const auto rows = db::mainSession().query(
       "SELECT DISTINCT t.id FROM track t "
       "JOIN album_artist aa ON aa.album_id = t.album_id "
-      "WHERE aa.artist_id = ? ORDER BY t.id");
-  q.bind(1, artist_id);
-  while (q.executeStep()) {
-    ids.push_back(q.getColumn(0).getInt());
+      "WHERE aa.artist_id = ? ORDER BY t.id",
+      {static_cast<std::int64_t>(artist_id)});
+  for (const auto &row : rows.rows) {
+    ids.push_back(static_cast<int>(intAt(row, 0)));
   }
   return ids;
 }
@@ -921,8 +941,7 @@ int main(int argc, char *argv[]) {
 
   // 主服务与 Jellyfin 兼容层共用同一个 Library 对象。
   try {
-    media_library::initialize_library(cfg.local.id, cfg.jellyfin_server_name,
-                                      cfg.db_path.string());
+    media_library::initialize_library(cfg.local.id, cfg.jellyfin_server_name);
   } catch (const std::exception &e) {
     std::cerr << "[fatal] 媒体库初始化失败: " << e.what() << std::endl;
     return 1;
@@ -987,8 +1006,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   try {
     media_library::initialize_media_runtime(std::move(setups),
-                                            priority_orders,
-                                            cfg.db_path.string());
+                                            priority_orders);
   } catch (const std::exception &e) {
     std::cerr << "[fatal] 媒体库路由初始化失败: " << e.what() << std::endl;
     return 1;
@@ -1190,7 +1208,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
   });
 
   CROW_ROUTE(app, "/api/track/<int>").methods("DELETE"_method)([](int id) {
-    repo::TrackRepo repo(config::get().db_path.string());
+    repo::TrackRepo repo(db::mainSession());
     if (repo.remove(id)) {
       return jsonResponse(200, "{\"status\":\"ok\"}");
     }
@@ -1240,32 +1258,24 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   CROW_ROUTE(app, "/api/album/<int>").methods("DELETE"_method)([](int id) {
     try {
-      repo::AlbumRepo album_repo(config::get().db_path.string());
+      repo::AlbumRepo album_repo(db::mainSession());
       if (!album_repo.byId(id)) {
         return jsonResponse(404, "{\"erro\":true}");
       }
-      SQLite::Database &db = db::conn(config::get().db_path.string());
+      db::Session &db = db::mainSession();
 
       int removed = 0;
       {
-        SQLite::Statement count(db,
-                                "SELECT COUNT(*) FROM track WHERE album_id = ?");
-        count.bind(1, id);
-        if (count.executeStep()) {
-          removed = count.getColumn(0).getInt();
+        const auto count =
+            db.query("SELECT COUNT(*) FROM track WHERE album_id = ?",
+                     {static_cast<std::int64_t>(id)});
+        if (!count.rows.empty()) {
+          removed = static_cast<int>(intAt(count.rows.front(), 0));
         }
       }
-      {
-        SQLite::Statement del_tracks(db,
-                                     "DELETE FROM track WHERE album_id = ?");
-        del_tracks.bind(1, id);
-        del_tracks.executeStep();
-      }
-      {
-        SQLite::Statement del_album(db, schema::sql::kAlbumDelete);
-        del_album.bind(1, id);
-        del_album.executeStep();
-      }
+      db.execute("DELETE FROM track WHERE album_id = ?",
+                 {static_cast<std::int64_t>(id)});
+      db.execute(schema::sql::kAlbumDelete, {static_cast<std::int64_t>(id)});
 
       crow::json::wvalue out;
       out["status"] = "ok";
@@ -1279,7 +1289,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
   CROW_ROUTE(app, "/api/album/<int>/update")
       .methods("POST"_method)([](const crow::request &req, int id) {
         try {
-          repo::AlbumRepo album_repo(config::get().db_path.string());
+          repo::AlbumRepo album_repo(db::mainSession());
           auto album = album_repo.byId(id);
           if (!album) {
             return jsonResponse(404, "{\"erro\":true}");
@@ -1290,7 +1300,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
             return jsonResponse(400, "{\"erro\":true}");
           }
 
-          SQLite::Database &db = db::conn(config::get().db_path.string());
+          db::Session &db = db::mainSession();
 
           const std::string new_name =
               body.has("name") ? body["name"].s() : album->name;
@@ -1299,7 +1309,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
           if (body.has("album_artist")) {
             artist_names = metadata::splitArtists(body["album_artist"].s());
           } else {
-            repo::ArtistRepo artist_repo(config::get().db_path.string());
+            repo::ArtistRepo artist_repo(db::mainSession());
             for (const int aid : album->artist_ids) {
               if (auto a = artist_repo.byId(aid)) {
                 artist_names.push_back(a->name);
@@ -1311,49 +1321,42 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
           int existing = 0;
           {
-            SQLite::Statement query(db, schema::sql::kAlbumByKey);
-            query.bind(1, new_name);
-            query.bind(2, key);
-            if (query.executeStep()) {
-              existing = query.getColumn(0).getInt();
+            const auto query =
+                db.query(schema::sql::kAlbumByKey, {new_name, key});
+            if (!query.rows.empty()) {
+              existing = static_cast<int>(intAt(query.rows.front(), 0));
             }
           }
           const int target = (existing != 0 && existing != id) ? existing : id;
 
           if (target != id) {
-            SQLite::Statement reassign(db, schema::sql::kTrackReassignAlbum);
-            reassign.bind(1, target);
-            reassign.bind(2, id);
-            reassign.executeStep();
+            db.execute(schema::sql::kTrackReassignAlbum,
+                       {static_cast<std::int64_t>(target),
+                        static_cast<std::int64_t>(id)});
 
-            SQLite::Statement count(
-                db, "SELECT COUNT(*) FROM track WHERE album_id = ?");
-            count.bind(1, id);
-            if (count.executeStep() && count.getColumn(0).getInt() == 0) {
-              SQLite::Statement del(db, schema::sql::kAlbumDelete);
-              del.bind(1, id);
-              del.executeStep();
+            const auto count =
+                db.query("SELECT COUNT(*) FROM track WHERE album_id = ?",
+                         {static_cast<std::int64_t>(id)});
+            if (!count.rows.empty() && intAt(count.rows.front(), 0) == 0) {
+              db.execute(schema::sql::kAlbumDelete,
+                         {static_cast<std::int64_t>(id)});
             }
           } else {
-            SQLite::Statement update(db, schema::sql::kAlbumUpdateNameKey);
-            update.bind(1, new_name);
-            update.bind(2, key);
-            update.bind(3, id);
-            update.executeStep();
+            db.execute(schema::sql::kAlbumUpdateNameKey,
+                       {new_name, key, static_cast<std::int64_t>(id)});
           }
 
           setAlbumArtists(db, target, artist_ids);
 
           if (body.has("year")) {
-            SQLite::Statement update(db, schema::sql::kAlbumUpdateYear);
-            update.bind(1, static_cast<int>(body["year"].i()));
-            update.bind(2, target);
-            update.executeStep();
+            db.execute(schema::sql::kAlbumUpdateYear,
+                       {static_cast<std::int64_t>(body["year"].i()),
+                        static_cast<std::int64_t>(target)});
           }
           if (body.has("cover_path")) {
             std::string cover_value = body["cover_path"].s();
             if (!cover_value.empty()) {
-              repo::ScanRootRepo cover_roots(config::get().db_path.string());
+              repo::ScanRootRepo cover_roots(db::mainSession());
               for (const auto &r : cover_roots.list()) {
                 const std::string v = storage::toVirtual(r, cover_value);
                 if (v != cover_value) {
@@ -1362,10 +1365,8 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                 }
               }
             }
-            SQLite::Statement update(db, schema::sql::kAlbumUpdateCover);
-            update.bind(1, cover_value);
-            update.bind(2, target);
-            update.executeStep();
+            db.execute(schema::sql::kAlbumUpdateCover,
+                       {cover_value, static_cast<std::int64_t>(target)});
           }
 
           crow::json::wvalue out;
@@ -1513,7 +1514,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
       });
 
   CROW_ROUTE(app, "/api/roots")([] {
-    repo::ScanRootRepo repo(config::get().db_path.string());
+    repo::ScanRootRepo repo(db::mainSession());
     auto roots = repo.list();
     crow::json::wvalue out(crow::json::type::List);
     int i = 0;
@@ -1535,7 +1536,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         if (!json || !json.has("path")) {
           return jsonResponse(400, "{\"erro\":true}");
         }
-        repo::ScanRootRepo repo(config::get().db_path.string());
+        repo::ScanRootRepo repo(db::mainSession());
         const std::string path = json["path"].s();
         const std::string user =
             json.has("user") ? std::string(json["user"].s()) : std::string();
@@ -1559,17 +1560,16 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   CROW_ROUTE(app, "/api/roots/<int>")
       .methods("DELETE"_method)([](int id) {
-        repo::ScanRootRepo repo(config::get().db_path.string());
+        repo::ScanRootRepo repo(db::mainSession());
         if (!repo.byId(id)) {
           return jsonResponse(404, "{\"erro\":true}");
         }
-        SQLite::Database &db = db::conn(config::get().db_path.string());
+        db::Session &db = db::mainSession();
         int removed = 0;
         try {
-          SQLite::Statement del(db, "DELETE FROM track WHERE root_id = ?");
-          del.bind(1, id);
-          del.executeStep();
-          removed = del.getChanges();
+          removed = static_cast<int>(
+              db.execute("DELETE FROM track WHERE root_id = ?",
+                         {static_cast<std::int64_t>(id)}));
           repo.remove(id);
           db.exec("DELETE FROM album WHERE id NOT IN "
                   "(SELECT DISTINCT album_id FROM track WHERE album_id IS NOT NULL)");
@@ -1721,7 +1721,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   CROW_ROUTE(app, "/api/track/<int>/play")
       .methods("POST"_method)([](int id) {
-        repo::TrackRepo repo(config::get().db_path.string());
+        repo::TrackRepo repo(db::mainSession());
         if (repo.recordPlay(id)) {
           return jsonResponse(200, "{\"status\":\"ok\"}");
         }
@@ -1783,13 +1783,13 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         return jsonResponse(400, "{\"erro\":true}");
       }
 
-      repo::ScanRootRepo root_repo(config::get().db_path.string());
+      repo::ScanRootRepo root_repo(db::mainSession());
       auto root_opt = root_repo.byId(root_id);
       if (!root_opt) {
         return jsonResponse(404, "{\"erro\":true}");
       }
 
-      repo::TrackRepo track_repo(config::get().db_path.string());
+      repo::TrackRepo track_repo(db::mainSession());
       auto tracks = track_repo.byRootId(root_id);
 
       crow::json::wvalue out(crow::json::type::List);
@@ -1896,7 +1896,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   CROW_ROUTE(app, "/api/track/<int>/lyrics")
       .methods("POST"_method)([](const crow::request &req, int id) {
-        repo::TrackRepo repo(config::get().db_path.string());
+        repo::TrackRepo repo(db::mainSession());
         if (!repo.byId(id)) {
           return jsonResponse(404, "{\"erro\":true}");
         }
@@ -1905,18 +1905,15 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
           return jsonResponse(400, "{\"erro\":true}");
         }
         const std::string text = body["text"].s();
-        SQLite::Database &db = db::conn(config::get().db_path.string());
+        db::Session &db = db::mainSession();
         if (text.empty()) {
-          SQLite::Statement del(db,
-                                "DELETE FROM track_lyrics WHERE track_id = ?");
-          del.bind(1, id);
-          del.executeStep();
+          db.execute("DELETE FROM track_lyrics WHERE track_id = ?",
+                     {static_cast<std::int64_t>(id)});
         } else {
-          SQLite::Statement up(db, schema::sql::kTrackLyricsUpsert);
-          up.bind(1, id);
-          up.bind(2, text);
-          up.bind(3, metadata::isSyncedLyrics(text) ? 1 : 0);
-          up.executeStep();
+          db.execute(schema::sql::trackLyricsUpsert(db.dialect()),
+                     {static_cast<std::int64_t>(id), text,
+                      static_cast<std::int64_t>(
+                          metadata::isSyncedLyrics(text) ? 1 : 0)});
         }
         return jsonResponse(200, "{\"status\":\"ok\"}");
       });
@@ -1930,7 +1927,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         int root_id = json["rootId"].i();
         std::string dir_path = json["path"].s();
 
-        repo::ScanRootRepo root_repo(config::get().db_path.string());
+        repo::ScanRootRepo root_repo(db::mainSession());
         auto root_opt = root_repo.byId(root_id);
         if (!root_opt) {
           return jsonResponse(404, "{\"erro\":true}");
@@ -1959,7 +1956,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   CROW_ROUTE(app, "/api/track/<int>/sync-from-file")
       .methods("POST"_method)([](int id) {
-        repo::TrackRepo track_repo(config::get().db_path.string());
+        repo::TrackRepo track_repo(db::mainSession());
         if (!track_repo.byId(id)) {
           return jsonResponse(404, "{\"erro\":true}");
         }
@@ -1973,7 +1970,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   CROW_ROUTE(app, "/api/track/<int>/sync-to-file")
       .methods("POST"_method)([](int id) {
-        repo::TrackRepo track_repo(config::get().db_path.string());
+        repo::TrackRepo track_repo(db::mainSession());
         if (!track_repo.byId(id)) {
           return jsonResponse(404, "{\"erro\":true}");
         }
@@ -1992,7 +1989,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
           return jsonResponse(400, "{\"erro\":true}");
         }
 
-        repo::TrackRepo repo(config::get().db_path.string());
+        repo::TrackRepo repo(db::mainSession());
         auto track = repo.byId(id);
         if (!track) {
           return jsonResponse(404, "{\"erro\":true}");
@@ -2002,9 +1999,9 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         if (json.has("title")) {
           t.title = json["title"].s();
         }
-        SQLite::Database &db = db::conn(config::get().db_path.string());
-        repo::ArtistRepo artist_repo(config::get().db_path.string());
-        repo::AlbumRepo album_repo(config::get().db_path.string());
+        db::Session &db = db::mainSession();
+        repo::ArtistRepo artist_repo(db::mainSession());
+        repo::AlbumRepo album_repo(db::mainSession());
 
         std::vector<std::string> artist_names;
         if (json.has("artist")) {
@@ -2049,28 +2046,22 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
           }
         }
         if (json.has("year") && t.album_id > 0) {
-          SQLite::Statement update(db, schema::sql::kAlbumUpdateYear);
-          update.bind(1, json["year"].i());
-          update.bind(2, t.album_id);
-          update.executeStep();
+          db.execute(schema::sql::kAlbumUpdateYear,
+                     {static_cast<std::int64_t>(json["year"].i()),
+                      static_cast<std::int64_t>(t.album_id)});
         }
         if (json.has("genre")) {
           std::string genre_name = json["genre"].s();
-          SQLite::Statement del(db,
-                                "DELETE FROM track_genre WHERE track_id = ?");
-          del.bind(1, id);
-          del.executeStep();
+          db.execute("DELETE FROM track_genre WHERE track_id = ?",
+                     {static_cast<std::int64_t>(id)});
           if (!genre_name.empty()) {
-            SQLite::Statement ins(db, schema::sql::kGenreInsert);
-            ins.bind(1, genre_name);
-            ins.executeStep();
-            SQLite::Statement query(db, schema::sql::kGenreByName);
-            query.bind(1, genre_name);
-            if (query.executeStep()) {
-              SQLite::Statement link(db, schema::sql::kTrackGenreInsert);
-              link.bind(1, id);
-              link.bind(2, query.getColumn(0).getInt());
-              link.executeStep();
+            db.execute(schema::sql::genreInsert(db.dialect()), {genre_name});
+            const auto query =
+                db.query(schema::sql::kGenreByName, {genre_name});
+            if (!query.rows.empty()) {
+              db.execute(schema::sql::trackGenreInsert(db.dialect()),
+                         {static_cast<std::int64_t>(id),
+                          intAt(query.rows.front(), 0)});
             }
           }
         }
@@ -2169,16 +2160,16 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
           } else if (action == "update") {
             int track_id = item["trackId"].i();
             auto fields = item["fields"];
-            repo::TrackRepo track_repo(config::get().db_path.string());
+            repo::TrackRepo track_repo(db::mainSession());
             auto track = track_repo.byId(track_id);
             if (track) {
               repo::Track t = *track;
               if (fields.has("title")) {
                 t.title = fields["title"].s();
               }
-              SQLite::Database &db = db::conn(config::get().db_path.string());
-              repo::ArtistRepo artist_repo(config::get().db_path.string());
-              repo::AlbumRepo album_repo(config::get().db_path.string());
+              db::Session &db = db::mainSession();
+              repo::ArtistRepo artist_repo(db::mainSession());
+              repo::AlbumRepo album_repo(db::mainSession());
               std::vector<std::string> artist_names;
               if (fields.has("artist")) {
                 artist_names = metadata::splitArtists(fields["artist"].s());
@@ -2258,27 +2249,24 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
           } else if (action == "delete-index") {
             if (item.has("trackId") || item.has("albumId") ||
                 item.has("artistId")) {
-              SQLite::Database &db = db::conn(config::get().db_path.string());
+              db::Session &db = db::mainSession();
               int removed = 0;
               try {
                 if (item.has("trackId")) {
-                  SQLite::Statement q(db, "DELETE FROM track WHERE id = ?");
-                  q.bind(1, item["trackId"].i());
-                  q.executeStep();
-                  removed = q.getChanges();
+                  removed = static_cast<int>(
+                      db.execute("DELETE FROM track WHERE id = ?",
+                                 {static_cast<std::int64_t>(
+                                     item["trackId"].i())}));
                 } else if (item.has("albumId")) {
-                  SQLite::Statement q(db, "DELETE FROM track WHERE album_id = ?");
-                  q.bind(1, item["albumId"].i());
-                  q.executeStep();
-                  removed = q.getChanges();
+                  removed = static_cast<int>(
+                      db.execute("DELETE FROM track WHERE album_id = ?",
+                                 {static_cast<std::int64_t>(
+                                     item["albumId"].i())}));
                 } else {
-                  SQLite::Statement q(
-                      db,
+                  removed = static_cast<int>(db.execute(
                       "DELETE FROM track WHERE album_id IN "
-                      "(SELECT album_id FROM album_artist WHERE artist_id = ?)");
-                  q.bind(1, item["artistId"].i());
-                  q.executeStep();
-                  removed = q.getChanges();
+                      "(SELECT album_id FROM album_artist WHERE artist_id = ?)",
+                      {static_cast<std::int64_t>(item["artistId"].i())}));
                 }
                 db.exec("DELETE FROM album WHERE id NOT IN (SELECT DISTINCT "
                         "album_id FROM track WHERE album_id IS NOT NULL)");
@@ -2297,7 +2285,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
             int root_id = item["rootId"].i();
             std::string path = item["path"].s();
             try {
-              repo::ScanRootRepo root_repo(config::get().db_path.string());
+              repo::ScanRootRepo root_repo(db::mainSession());
               auto root_opt = root_repo.byId(root_id);
               if (!root_opt) {
                 result[i]["status"] = "error";
@@ -2337,8 +2325,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                   result[i]["status"] = "error";
                   result[i]["error"] = "outside root";
                 } else {
-                  SQLite::Database &db =
-                      db::conn(config::get().db_path.string());
+                  db::Session &db = db::mainSession();
                   const std::string vtarget =
                       storage::toVirtual(*root_opt, target);
                   const bool is_dir =
@@ -2346,21 +2333,14 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                                         : fs::is_directory(target, ec);
                   int removed = 0;
                   if (is_dir) {
-                    SQLite::Statement q(
-                        db, "DELETE FROM track WHERE root_id = ? AND (path = ? "
-                            "OR (path >= ? AND path < ?))");
-                    q.bind(1, root_id);
-                    q.bind(2, vtarget);
-                    q.bind(3, vtarget + "/");
-                    q.bind(4, vtarget + "0");
-                    q.executeStep();
-                    removed = q.getChanges();
+                    removed = static_cast<int>(db.execute(
+                        "DELETE FROM track WHERE root_id = ? AND (path = ? "
+                        "OR (path >= ? AND path < ?))",
+                        {static_cast<std::int64_t>(root_id), vtarget,
+                         vtarget + "/", vtarget + "0"}));
                   } else {
-                    SQLite::Statement q(db,
-                                        "DELETE FROM track WHERE path = ?");
-                    q.bind(1, vtarget);
-                    q.executeStep();
-                    removed = q.getChanges();
+                    removed = static_cast<int>(db.execute(
+                        "DELETE FROM track WHERE path = ?", {vtarget}));
                   }
                   db.exec("DELETE FROM album WHERE id NOT IN (SELECT "
                           "DISTINCT album_id FROM track WHERE album_id IS NOT "

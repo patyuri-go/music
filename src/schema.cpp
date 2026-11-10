@@ -1,9 +1,8 @@
 #include "schema.h"
 
-#include "SQLiteCpp/Database.h"
-#include "SQLiteCpp/Statement.h"
+#include "schema_pg.h"
 
-#include <sqlite3.h>
+
 
 #include <set>
 #include <stdexcept>
@@ -28,6 +27,218 @@ std::string placeholders(std::size_t count) {
     out += '?';
   }
   return out;
+}
+
+namespace {
+
+bool isPostgres(db::Dialect dialect) {
+  return dialect == db::Dialect::Postgres;
+}
+
+} // namespace
+
+std::string insertOrIgnore(db::Dialect dialect, std::string_view table,
+                           std::string_view columns, std::size_t param_count) {
+  std::string out;
+  out.reserve(table.size() + columns.size() + param_count * 2 + 48);
+  if (isPostgres(dialect)) {
+    out += "INSERT INTO ";
+  } else {
+    out += "INSERT OR IGNORE INTO ";
+  }
+  out += table;
+  out += '(';
+  out += columns;
+  out += ") VALUES (";
+  out += placeholders(param_count);
+  out += ')';
+  if (isPostgres(dialect)) {
+    // 无冲突目标 = 任何唯一约束冲突都跳过，语义等同 INSERT OR IGNORE。
+    out += " ON CONFLICT DO NOTHING";
+  }
+  return out;
+}
+
+std::string upsertLyrics(db::Dialect dialect) {
+  if (isPostgres(dialect)) {
+    return "INSERT INTO track_lyrics(track_id, text, synced) VALUES (?, ?, ?) "
+           "ON CONFLICT(track_id) DO UPDATE SET text = EXCLUDED.text, "
+           "synced = EXCLUDED.synced";
+  }
+  return "INSERT OR REPLACE INTO track_lyrics(track_id, text, synced) "
+         "VALUES (?, ?, ?)";
+}
+
+std::string nowExpr(db::Dialect dialect) {
+  if (isPostgres(dialect)) {
+    // 与 SQLite 的 localtime 保持一致：写进库里的仍是本地时间文本。
+    return "to_char(now(), 'YYYY-MM-DD HH24:MI:SS')";
+  }
+  return "datetime('now','localtime')";
+}
+
+std::string likeOp(db::Dialect dialect) {
+  return isPostgres(dialect) ? "ILIKE" : "LIKE";
+}
+
+std::string artistIdsSubquery(db::Dialect dialect, std::string_view table,
+                              std::string_view key_column,
+                              std::string_view outer_key) {
+  std::string out;
+  out.reserve(160);
+  out += "(SELECT ";
+  if (isPostgres(dialect)) {
+    out += "string_agg(artist_id::text, ',' ORDER BY position)";
+  } else {
+    out += "group_concat(artist_id, ',')";
+  }
+  out += " FROM ";
+  if (isPostgres(dialect)) {
+    out += table;
+  } else {
+    // SQLite 的 group_concat 不保证聚合顺序，先排序再聚合。
+    out += "(SELECT artist_id, position FROM ";
+    out += table;
+    out += " WHERE ";
+    out += key_column;
+    out += " = ";
+    out += outer_key;
+    out += " ORDER BY position, artist_id)";
+  }
+  if (isPostgres(dialect)) {
+    out += " WHERE ";
+    out += key_column;
+    out += " = ";
+    out += outer_key;
+  }
+  out += ')';
+  return out;
+}
+
+std::string artistInsert(db::Dialect dialect) {
+  return insertOrIgnore(dialect, "artist", "name", 1);
+}
+
+std::string artistsSearchByName(db::Dialect dialect) {
+  return "SELECT * FROM artist WHERE name " + likeOp(dialect) +
+         " ? ORDER BY name, id LIMIT ?";
+}
+
+std::string albumById(db::Dialect dialect) {
+  return "SELECT a.*, " +
+         artistIdsSubquery(dialect, "album_artist", "album_id", "a.id") +
+         " FROM album a WHERE a.id = ?";
+}
+
+std::string albumsByArtist(db::Dialect dialect) {
+  return "SELECT a.*, " +
+         artistIdsSubquery(dialect, "album_artist", "album_id", "a.id") +
+         " FROM album a JOIN album_artist aa ON aa.album_id = a.id "
+         "WHERE aa.artist_id = ? ORDER BY a.name";
+}
+
+std::string albumsSearchByName(db::Dialect dialect) {
+  return "SELECT a.*, " +
+         artistIdsSubquery(dialect, "album_artist", "album_id", "a.id") +
+         " FROM album a WHERE a.name " + likeOp(dialect) +
+         " ? ORDER BY a.name, a.id LIMIT ?";
+}
+
+std::string albumUpsert(db::Dialect dialect) {
+  return insertOrIgnore(dialect, "album", "name, artist_key", 2);
+}
+
+std::string albumArtistInsert(db::Dialect dialect) {
+  return insertOrIgnore(dialect, "album_artist",
+                        "album_id, artist_id, position", 3);
+}
+
+std::string trackById(db::Dialect dialect) {
+  return "SELECT t.*, " +
+         artistIdsSubquery(dialect, "track_artist", "track_id", "t.id") +
+         " FROM track t WHERE t.id = ?";
+}
+
+std::string tracksByAlbum(db::Dialect dialect) {
+  return "SELECT t.*, " +
+         artistIdsSubquery(dialect, "track_artist", "track_id", "t.id") +
+         " FROM track t WHERE t.album_id = ? ORDER BY t.disc_no, t.track_no";
+}
+
+std::string tracksByArtist(db::Dialect dialect) {
+  return "SELECT t.*, " +
+         artistIdsSubquery(dialect, "track_artist", "track_id", "t.id") +
+         " FROM track t JOIN track_artist ta ON ta.track_id = t.id "
+         "WHERE ta.artist_id = ? ORDER BY t.added_at DESC LIMIT ?";
+}
+
+std::string trackInsert(db::Dialect dialect) {
+  return "INSERT INTO track(root_id, path, title, album_id, disc_no, "
+         "track_no, duration_ms, bitrate, sample_rate, channels, format, "
+         "size_bytes, mtime, added_at, play_count, last_played, rating) "
+         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?," +
+         nowExpr(dialect) + ",0,NULL,0)";
+}
+
+std::string trackByRootId(db::Dialect dialect) {
+  return "SELECT t.*, " +
+         artistIdsSubquery(dialect, "track_artist", "track_id", "t.id") +
+         " FROM track t WHERE t.root_id = ?";
+}
+
+std::string trackUpdateStats(db::Dialect dialect) {
+  return "UPDATE track SET play_count = play_count + 1, last_played = " +
+         nowExpr(dialect) + " WHERE id = ?";
+}
+
+std::string tracksRecent(db::Dialect dialect) {
+  return "SELECT t.*, " +
+         artistIdsSubquery(dialect, "track_artist", "track_id", "t.id") +
+         " FROM track t WHERE t.id > ? "
+         "ORDER BY t.added_at DESC, t.id DESC LIMIT ?";
+}
+
+std::string tracksByGenre(db::Dialect dialect) {
+  return "SELECT t.*, " +
+         artistIdsSubquery(dialect, "track_artist", "track_id", "t.id") +
+         " FROM track t JOIN track_genre tg ON t.id = tg.track_id "
+         "WHERE tg.genre_id = ? ORDER BY t.added_at DESC LIMIT ?";
+}
+
+std::string searchByTitle(db::Dialect dialect) {
+  return "SELECT t.*, " +
+         artistIdsSubquery(dialect, "track_artist", "track_id", "t.id") +
+         " FROM track t WHERE t.title " + likeOp(dialect) +
+         " ? ORDER BY t.added_at DESC, t.id LIMIT ?";
+}
+
+std::string recentPlays(db::Dialect dialect) {
+  return "SELECT t.*, " +
+         artistIdsSubquery(dialect, "track_artist", "track_id", "t.id") +
+         " FROM track t JOIN play_event pe ON t.id = pe.track_id "
+         "ORDER BY pe.played_at DESC LIMIT ?";
+}
+
+std::string trackArtistInsert(db::Dialect dialect) {
+  return insertOrIgnore(dialect, "track_artist",
+                        "track_id, artist_id, position", 3);
+}
+
+std::string genreInsert(db::Dialect dialect) {
+  return insertOrIgnore(dialect, "genre", "name", 1);
+}
+
+std::string trackGenreInsert(db::Dialect dialect) {
+  return insertOrIgnore(dialect, "track_genre", "track_id, genre_id", 2);
+}
+
+std::string scanRootUpdateLastScan(db::Dialect dialect) {
+  return "UPDATE scan_root SET last_scan = " + nowExpr(dialect) +
+         " WHERE id = ?";
+}
+
+std::string trackLyricsUpsert(db::Dialect dialect) {
+  return upsertLyrics(dialect);
 }
 
 } // namespace sql
@@ -80,7 +291,11 @@ std::string deriveNameFromPath(const std::string &path) {
 
 } // namespace
 
-std::vector<std::string> createStatements() {
+
+std::vector<std::string> createStatements(db::Dialect dialect) {
+  if (dialect == db::Dialect::Postgres) {
+    return postgresCreateStatements();
+  }
   return {
       "CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL)",
       "CREATE TABLE IF NOT EXISTS artist("
@@ -204,84 +419,35 @@ std::vector<std::string> createStatements() {
   };
 }
 
-std::vector<StmtSpec> allStatements() {
-  return {
-      {"Artist::byName", sql::kArtistByName, 1},
-      {"Artist::byId", sql::kArtistById, 1},
-      {"Artist::insert", sql::kArtistInsert, 1},
-      {"Album::byId", sql::kAlbumById, 1},
-      {"Album::byArtist", sql::kAlbumsByArtist, 1},
-      {"Album::upsert", sql::kAlbumUpsert, 2},
-      {"Album::byKey", sql::kAlbumByKey, 2},
-      {"Album::updateCover", sql::kAlbumUpdateCover, 2},
-      {"Album::updateYear", sql::kAlbumUpdateYear, 2},
-      {"Album::updateName", sql::kAlbumUpdateName, 2},
-      {"Album::updateArtistKey", sql::kAlbumUpdateArtistKey, 2},
-      {"Album::updateNameKey", sql::kAlbumUpdateNameKey, 3},
-      {"Album::delete", sql::kAlbumDelete, 1},
-      {"Album::reassignTracks", sql::kTrackReassignAlbum, 2},
-      {"Album::artistClear", sql::kAlbumArtistClear, 1},
-      {"Album::artistInsert", sql::kAlbumArtistInsert, 3},
-      {"Album::artistsByAlbumId", sql::kAlbumArtistsByAlbumId, 1},
-      {"Track::byId", sql::kTrackById, 1},
-      {"Track::delete", sql::kTrackDelete, 1},
-      {"Track::byAlbum", sql::kTracksByAlbum, 1},
-      {"Track::byArtist", sql::kTracksByArtist, 2},
-      {"Track::insert", sql::kTrackInsert, 13},
-      {"Track::update", sql::kTrackUpdate, 12},
-      {"Track::byPath", sql::kTrackByPath, 1},
-      {"Track::byRootId", sql::kTrackByRootId, 1},
-      {"Track::pathsUnderRoot", sql::kTrackPathsUnderRoot, 3},
-      {"Track::deleteByPath", sql::kTrackDeleteByPath, 1},
-      {"Track::genresByTrackId", sql::kTrackGenresByTrackId, 1},
-      {"Track::updatePartial", sql::kTrackUpdatePartial, 13},
-      {"Track::artistClear", sql::kTrackArtistClear, 1},
-      {"Track::artistInsert", sql::kTrackArtistInsert, 3},
-      {"Track::artistsByTrackId", sql::kTrackArtistsByTrackId, 1},
-      {"Track::clearRating", sql::kTrackClearRating, 1},
-      {"Track::updateStats", sql::kTrackUpdateStats, 1},
-      {"Track::recent", sql::kTracksRecent, 2},
-      {"Track::byGenre", sql::kTracksByGenre, 2},
-      {"Track::search", sql::kSearchByTitle, 2},
-      {"PlayEvent::recent", sql::kRecentPlays, 1},
-      {"Genre::byName", sql::kGenreByName, 1},
-      {"Genre::insert", sql::kGenreInsert, 1},
-      {"Genre::trackInsert", sql::kTrackGenreInsert, 2},
-      {"ScanRoot::all", sql::kScanRoots, 0},
-      {"ScanRoot::insert", sql::kScanRootInsert, 5},
-      {"ScanRoot::delete", sql::kScanRootDelete, 1},
-      {"ScanRoot::byPath", sql::kScanRootByPath, 1},
-      {"ScanRoot::byId", sql::kScanRootById, 1},
-      {"ScanRoot::byName", sql::kScanRootByName, 1},
-      {"ScanRoot::credentials", sql::kScanRootCredentials, 0},
-      {"ScanRoot::updateLastScan", sql::kScanRootUpdateLastScan, 1},
-      {"ScanRoot::updateName", sql::kScanRootUpdateName, 2},
-      {"Playlist::all", sql::kPlaylists, 0},
-      {"Playlist::tracks", sql::kPlaylistTracks, 1},
-      {"TrackLyrics::upsert", sql::kTrackLyricsUpsert, 3},
-      {"TrackLyrics::byTrackId", sql::kTrackLyricsByTrackId, 1},
-      {"TrackLyrics::withLyrics", sql::kTracksWithLyrics, 0},
-      {"schema::migrate", sql::kSchemaVersion, 0},
-  };
+namespace {
+
+std::int64_t cellInt(const db::Row &row, std::size_t index) {
+  return std::get<std::int64_t>(row.at(index).value);
 }
 
-void migrate(SQLite::Database &database) {
-  for (const auto &statement : createStatements()) {
-    database.exec(statement);
+std::string cellText(const db::Row &row, std::size_t index) {
+  return std::get<std::string>(row.at(index).value);
+}
+
+} // namespace
+
+void migrate(db::Session &session) {
+  for (const auto &statement : createStatements(db::Dialect::Sqlite)) {
+    session.exec(statement);
   }
 
   bool hasVersion = false;
   int version = 0;
   {
-    SQLite::Statement query(database, sql::kSchemaVersion);
-    if (query.executeStep()) {
+    const db::ResultSet query = session.query(sql::kSchemaVersion);
+    if (!query.rows.empty()) {
       hasVersion = true;
-      version = query.getColumn(0).getInt();
+      version = static_cast<int>(cellInt(query.rows.front(), 0));
     }
   }
 
   if (!hasVersion) {
-    database.exec("INSERT INTO schema_version(version) VALUES (10)");
+    session.exec("INSERT INTO schema_version(version) VALUES (10)");
     return;
   }
 
@@ -295,19 +461,19 @@ void migrate(SQLite::Database &database) {
   }
 
   if (version == 1) {
-    database.exec("DROP TABLE IF EXISTS imgtag");
-    database.exec("DROP TABLE IF EXISTS tagid");
-    database.exec("DROP TABLE IF EXISTS imginfor");
-    database.exec("UPDATE schema_version SET version = 2");
+    session.exec("DROP TABLE IF EXISTS imgtag");
+    session.exec("DROP TABLE IF EXISTS tagid");
+    session.exec("DROP TABLE IF EXISTS imginfor");
+    session.exec("UPDATE schema_version SET version = 2");
     version = 2;
   }
 
   if (version == 2) {
-    database.exec("PRAGMA foreign_keys = OFF;");
+    session.exec("PRAGMA foreign_keys = OFF;");
     try {
-      database.exec("BEGIN");
-      database.exec("DROP TABLE IF EXISTS album_new");
-      database.exec(
+      session.exec("BEGIN");
+      session.exec("DROP TABLE IF EXISTS album_new");
+      session.exec(
           "CREATE TABLE album_new("
           "id INTEGER PRIMARY KEY,"
           "name TEXT NOT NULL,"
@@ -315,19 +481,19 @@ void migrate(SQLite::Database &database) {
           "cover_path TEXT,"
           "artist_key TEXT NOT NULL DEFAULT '',"
           "UNIQUE(name, artist_key))");
-      database.exec(
+      session.exec(
           "INSERT OR IGNORE INTO album_new(id, name, year, cover_path, "
           "artist_key) SELECT al.id, al.name, al.year, al.cover_path, "
           "COALESCE((SELECT lower(ar.name) FROM artist ar "
           "WHERE ar.id = al.artist_id), '') FROM album al");
-      database.exec(
+      session.exec(
           "INSERT OR IGNORE INTO album_artist(album_id, artist_id, position) "
           "SELECT id, artist_id, 0 FROM album WHERE artist_id IS NOT NULL");
-      database.exec("DROP TABLE album");
-      database.exec("ALTER TABLE album_new RENAME TO album");
+      session.exec("DROP TABLE album");
+      session.exec("ALTER TABLE album_new RENAME TO album");
 
-      database.exec("DROP TABLE IF EXISTS track_new");
-      database.exec(
+      session.exec("DROP TABLE IF EXISTS track_new");
+      session.exec(
           "CREATE TABLE track_new("
           "id INTEGER PRIMARY KEY,"
           "root_id INTEGER NOT NULL REFERENCES scan_root(id) ON DELETE CASCADE,"
@@ -347,68 +513,70 @@ void migrate(SQLite::Database &database) {
           "play_count INTEGER NOT NULL DEFAULT 0,"
           "last_played TEXT,"
           "rating INTEGER DEFAULT 0)");
-      database.exec(
+      session.exec(
           "INSERT INTO track_new(id, root_id, path, title, album_id, disc_no, "
           "track_no, duration_ms, bitrate, sample_rate, channels, format, "
           "size_bytes, mtime, added_at, play_count, last_played, rating) "
           "SELECT id, root_id, path, title, album_id, disc_no, track_no, "
           "duration_ms, bitrate, sample_rate, channels, format, size_bytes, "
           "mtime, added_at, play_count, last_played, rating FROM track");
-      database.exec(
+      session.exec(
           "INSERT OR IGNORE INTO track_artist(track_id, artist_id, position) "
           "SELECT id, artist_id, 0 FROM track WHERE artist_id IS NOT NULL");
-      database.exec("DROP TABLE track");
-      database.exec("ALTER TABLE track_new RENAME TO track");
+      session.exec("DROP TABLE track");
+      session.exec("ALTER TABLE track_new RENAME TO track");
 
-      database.exec(
+      session.exec(
           "UPDATE track SET album_id = NULL WHERE album_id IS NOT NULL AND "
           "album_id NOT IN (SELECT id FROM album)");
-      database.exec("UPDATE schema_version SET version = 3");
+      session.exec("UPDATE schema_version SET version = 3");
       version = 3;
-      database.exec("COMMIT");
+      session.exec("COMMIT");
     } catch (...) {
-      database.exec("ROLLBACK");
-      database.exec("PRAGMA foreign_keys = ON;");
+      session.exec("ROLLBACK");
+      session.exec("PRAGMA foreign_keys = ON;");
       throw;
     }
-    database.exec("PRAGMA foreign_keys = ON;");
-    for (const auto &statement : createStatements()) {
-      database.exec(statement);
+    session.exec("PRAGMA foreign_keys = ON;");
+    for (const auto &statement : createStatements(db::Dialect::Sqlite)) {
+      session.exec(statement);
     }
   }
 
   if (version == 3) {
-    database.exec(
+    session.exec(
         "ALTER TABLE scan_root ADD COLUMN user TEXT NOT NULL DEFAULT ''");
-    database.exec(
+    session.exec(
         "ALTER TABLE scan_root ADD COLUMN pass TEXT NOT NULL DEFAULT ''");
-    database.exec("UPDATE schema_version SET version = 4");
+    session.exec("UPDATE schema_version SET version = 4");
     version = 4;
   }
 
   if (version == 4) {
-    database.exec(
+    session.exec(
         "ALTER TABLE scan_root ADD COLUMN name TEXT NOT NULL DEFAULT ''");
-    database.exec(
+    session.exec(
         "ALTER TABLE scan_root ADD COLUMN type TEXT NOT NULL DEFAULT ''");
-    database.exec(
+    session.exec(
         "UPDATE scan_root SET type = CASE WHEN path LIKE 'http://%' OR "
         "path LIKE 'https://%' THEN 'webdav' ELSE 'local' END WHERE type = ''");
-    database.exec("UPDATE schema_version SET version = 5");
+    session.exec("UPDATE schema_version SET version = 5");
     version = 5;
   }
 
   if (version == 5) {
     std::vector<repo::ScanRoot> roots;
     {
-      SQLite::Statement q(database, "SELECT id, path, name, type FROM scan_root");
-      while (q.executeStep()) {
+      const db::ResultSet query =
+          session.query("SELECT id, path, name, type FROM scan_root");
+      roots.reserve(query.rows.size());
+      for (const db::Row &row : query.rows) {
         repo::ScanRoot r;
-        r.id = q.getColumn(0).getInt();
-        r.path = q.getColumn(1).getText();
-        r.name = q.getColumn(2).getText();
-        r.type = q.getColumn(3).getText();
-        roots.push_back(r);
+        r.id = static_cast<int>(cellInt(row, 0));
+        r.path = cellText(row, 1);
+        r.name = cellText(row, 2);
+        r.type = cellText(row, 3);
+        roots.push_back(std::move(r));
       }
     }
     std::set<std::string> used;
@@ -429,10 +597,8 @@ void migrate(SQLite::Database &database) {
       }
       used.insert(candidate);
       r.name = candidate;
-      SQLite::Statement u(database, "UPDATE scan_root SET name = ? WHERE id = ?");
-      u.bind(1, candidate);
-      u.bind(2, r.id);
-      u.executeStep();
+      session.execute("UPDATE scan_root SET name = ? WHERE id = ?",
+                      {candidate, static_cast<std::int64_t>(r.id)});
     }
     const auto rootById =
         [&roots](int id) -> std::optional<std::reference_wrapper<const repo::ScanRoot>> {
@@ -443,13 +609,13 @@ void migrate(SQLite::Database &database) {
       }
       return std::nullopt;
     };
-    std::vector<std::pair<int, std::string>> track_rows;
     {
-      SQLite::Statement q(database, "SELECT id, root_id, path FROM track");
-      while (q.executeStep()) {
-        const int tid = q.getColumn(0).getInt();
-        const int rid = q.getColumn(1).getInt();
-        const std::string real = q.getColumn(2).getText();
+      const db::ResultSet query =
+          session.query("SELECT id, root_id, path FROM track");
+      for (const db::Row &row : query.rows) {
+        const int tid = static_cast<int>(cellInt(row, 0));
+        const int rid = static_cast<int>(cellInt(row, 1));
+        const std::string real = cellText(row, 2);
         const auto root = rootById(rid);
         if (!root.has_value()) {
           continue;
@@ -458,104 +624,64 @@ void migrate(SQLite::Database &database) {
         if (v == real) {
           continue;
         }
-        SQLite::Statement u(database, "UPDATE track SET path = ? WHERE id = ?");
-        u.bind(1, v);
-        u.bind(2, tid);
-        u.executeStep();
+        session.execute("UPDATE track SET path = ? WHERE id = ?",
+                        {v, static_cast<std::int64_t>(tid)});
       }
     }
     std::vector<std::pair<int, std::string>> covers;
     {
-      SQLite::Statement q(database,
-                          "SELECT id, cover_path FROM album WHERE cover_path <> ''");
-      while (q.executeStep()) {
-        covers.emplace_back(q.getColumn(0).getInt(), q.getColumn(1).getText());
+      const db::ResultSet query = session.query(
+          "SELECT id, cover_path FROM album WHERE cover_path <> ''");
+      for (const db::Row &row : query.rows) {
+        covers.emplace_back(static_cast<int>(cellInt(row, 0)), cellText(row, 1));
       }
     }
     for (auto &c : covers) {
       for (const auto &root : roots) {
         const std::string v = storage::toVirtual(root, c.second);
         if (v != c.second) {
-          SQLite::Statement u(database,
-                              "UPDATE album SET cover_path = ? WHERE id = ?");
-          u.bind(1, v);
-          u.bind(2, c.first);
-          u.executeStep();
+          session.execute("UPDATE album SET cover_path = ? WHERE id = ?",
+                          {v, static_cast<std::int64_t>(c.first)});
           break;
         }
       }
     }
-    database.exec("UPDATE schema_version SET version = 6");
+    session.exec("UPDATE schema_version SET version = 6");
     version = 6;
   }
 
   if (version == 6) {
-    database.exec(
+    session.exec(
         "CREATE TABLE IF NOT EXISTS track_lyrics("
         "track_id INTEGER PRIMARY KEY REFERENCES track(id) ON DELETE CASCADE,"
         "text TEXT NOT NULL DEFAULT '',"
         "synced INTEGER NOT NULL DEFAULT 0)");
-    database.exec("UPDATE schema_version SET version = 7");
+    session.exec("UPDATE schema_version SET version = 7");
     version = 7;
   }
 
   if (version == 7) {
     // CREATE TABLE 已在 migrate 开始时执行；这里只推进版本。
-    database.exec("UPDATE schema_version SET version = 8");
+    session.exec("UPDATE schema_version SET version = 8");
     version = 8;
   }
 
   if (version == 8) {
     // 库内映射表下线：对外 id 直接用本地库主键，远端用平台 id。
-    database.exec("DROP INDEX IF EXISTS idx_entity_mapping_state");
-    database.exec("DROP TABLE IF EXISTS entity_mapping");
-    database.exec("UPDATE schema_version SET version = 9");
+    session.exec("DROP INDEX IF EXISTS idx_entity_mapping_state");
+    session.exec("DROP TABLE IF EXISTS entity_mapping");
+    session.exec("UPDATE schema_version SET version = 9");
     version = 9;
   }
 
   if (version == 9) {
     // 三张链接表已由 createStatements() 创建；这里只推进版本。
-    database.exec("UPDATE schema_version SET version = 10");
-    version = 10;
+    session.exec("UPDATE schema_version SET version = 10");
+    return;
   }
 
   throw std::runtime_error("缺少从 schema 版本 " + std::to_string(version) +
                            " 升级到 " + std::to_string(kVersion) + " 的迁移步骤");
-}
-
-void selfCheck(SQLite::Database &database) {
-  sqlite3 *handle = database.getHandle();
-
-  for (const auto &spec : allStatements()) {
-    sqlite3_stmt *raw = nullptr;
-    const char *tail = nullptr;
-    const int rc =
-        sqlite3_prepare_v2(handle, spec.sql.c_str(), -1, &raw, &tail);
-    // prepared 持有语句生命周期，避免手写 finalize。
-    const std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> prepared(
-        raw, &sqlite3_finalize);
-
-    if (rc != SQLITE_OK || !prepared) {
-      throw std::runtime_error(
-          "启动自检失败：语句 " + spec.name + " 无法 prepare（" +
-          std::string(sqlite3_errmsg(handle)) + "）\n  SQL: " + spec.sql);
-    }
-
-    const int actual = sqlite3_bind_parameter_count(prepared.get());
-    const bool fullyConsumed = (tail != nullptr && *tail == '\0');
-
-    if (!fullyConsumed) {
-      throw std::runtime_error("启动自检失败：语句 " + spec.name +
-                               " 含有除首条之外的多余内容\n  SQL: " + spec.sql);
-    }
-
-    if (actual != spec.params) {
-      throw std::runtime_error(
-          "启动自检失败：语句 " + spec.name + " 的绑定参数个数不符（登记期望 " +
-          std::to_string(spec.params) + "，SQL 中实际 " + std::to_string(actual) +
-          "）—— 通常是代码里拼了占位符却忘了 bind\n  SQL: " + spec.sql);
-    }
-  }
 }
 
 } // namespace schema

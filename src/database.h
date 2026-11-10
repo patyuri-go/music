@@ -5,9 +5,9 @@
 #include <string>
 #include <vector>
 
-namespace SQLite {
-class Database;
-} // namespace SQLite
+namespace db {
+class Session;
+} // namespace db
 
 namespace repo {
 
@@ -60,7 +60,7 @@ struct ScanRoot {
 
 class ScanRootRepo {
 public:
-  explicit ScanRootRepo(const std::string &path);
+  explicit ScanRootRepo(db::Session &session);
   std::vector<ScanRoot> list();
   std::optional<ScanRoot> byId(int id);
   std::optional<ScanRoot> byName(const std::string &name);
@@ -71,12 +71,12 @@ public:
   bool remove(int id);
 
 private:
-  SQLite::Database &pdb_;
+  db::Session &pdb_;
 };
 
 class TrackRepo {
 public:
-  explicit TrackRepo(const std::string &path);
+  explicit TrackRepo(db::Session &session);
   std::optional<Track> byId(int id);
   std::vector<Track> byAlbum(int album_id);
   std::vector<Track> byArtist(int artist_id, int limit);
@@ -92,12 +92,12 @@ public:
   bool remove(int id);
 
 private:
-  SQLite::Database &pdb_;
+  db::Session &pdb_;
 };
 
 class AlbumRepo {
 public:
-  explicit AlbumRepo(const std::string &path);
+  explicit AlbumRepo(db::Session &session);
   std::optional<Album> byId(int id);
   std::vector<Album> byArtist(int artist_id);
   // 专辑名包含匹配，供 Searcher 出 Album 命中。
@@ -105,18 +105,18 @@ public:
   std::vector<int> artistIdsByAlbumId(int album_id);
 
 private:
-  SQLite::Database &pdb_;
+  db::Session &pdb_;
 };
 
 class ArtistRepo {
 public:
-  explicit ArtistRepo(const std::string &path);
+  explicit ArtistRepo(db::Session &session);
   std::optional<Artist> byId(int id);
   // 艺术家名包含匹配，供 Searcher 出 Artist 命中。
   std::vector<Artist> search(const std::string &query, int limit);
 
 private:
-  SQLite::Database &pdb_;
+  db::Session &pdb_;
 };
 
 } // namespace repo

@@ -6,6 +6,7 @@
 #include "media_library/snapshot.h"
 
 #include "database.h"
+#include "db/session.h"
 
 #include <optional>
 #include <string>
@@ -26,8 +27,7 @@ class LocalLibrary : public Library,
                      public ArtworkBytes,
                      public std::enable_shared_from_this<LocalLibrary> {
 public:
-  LocalLibrary(std::string library_id, std::string display_name,
-               std::string db_path);
+  LocalLibrary(std::string library_id, std::string display_name);
 
   // 必须在 make_shared 之后调用：注册能力接口。
   void initialize();
@@ -114,7 +114,8 @@ private:
 
   std::string library_id_;
   std::string display_name_;
-  std::string db_path_;
+  // 每次取当前线程的主库会话；不能缓存引用，session 是 thread_local。
+  db::Session &db() const;
 };
 
 } // namespace media_library

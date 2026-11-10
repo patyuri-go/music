@@ -75,8 +75,43 @@ struct LibraryPriorityConfig {
   std::vector<std::string> library_ids;
 };
 
+// 本地 SQLite 主库。
+struct DatabaseSqlConfig {
+  fs::path path{"./music.db"};
+};
+
+// 远端主库：直接连外部提供的 PostgreSQL 服务（SOCI + 系统 libpq）。
+//
+// `url` 是 libpq 连接串，两种写法都接受：
+//   1. URI：`postgresql://[user[:pass]@]host[:port][/dbname][?k=v...]`
+//   2. 关键字：`host=127.0.0.1 port=5432 user=musicd`
+// `password` / `dbname` 会追加到 `url` 上（URI 走查询参数，关键字形式直接追加）。
+// `url` 为空表示不启用 PostgreSQL，主库回退到 `sql`。
+struct DatabasePostgresConfig {
+  std::string url;
+  std::string user{"musicd"};
+  std::string password;
+  std::string dbname{"music"};
+  // password 为空时回退读取该环境变量；两者都空则由服务端认证失败报错。
+  std::string password_env{"MUSICD_DB_PASSWORD"};
+  // 追加到连接串的 sslmode；空表示不追加。取值见 libpq 文档。
+  std::string sslmode;
+  int connect_timeout_seconds{5};
+};
+
+// 主库配置。同一二进制同时包含 sqlite 与 postgres 两种实现；
+// `postgres.url` 非空即走 PostgreSQL，否则走本地 SQLite。
+struct DatabaseConfig {
+  DatabaseSqlConfig sql;
+  DatabasePostgresConfig postgres;
+
+  bool usePostgres() const { return !postgres.url.empty(); }
+};
+
 struct Config {
   fs::path db_path{"./music.db"};
+  // 新的后端配置；未配置 database 段时 sqlite_path 继承 db_path。
+  DatabaseConfig database;
   fs::path static_dir{"web"};
   // 主服务端口（配置文件键名 main_port）。
   int port{5666};

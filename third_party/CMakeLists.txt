@@ -19,6 +19,7 @@ FetchContent_Declare(
   fmt
   URL https://github.com/fmtlib/fmt/archive/407c905e45ad75fc29bf0f9bb7c5c2fd3475976f.tar.gz
   URL_HASH SHA256=2bc1fe4a5b6d5d6a614239b4ca1d520e66e152a02d3d262684d26dfd6ab3438a
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(fmt)
 
@@ -37,12 +38,24 @@ set(SOCI_FIREBIRD OFF CACHE STRING "" FORCE)
 set(SOCI_MYSQL OFF CACHE STRING "" FORCE)
 set(SOCI_ODBC OFF CACHE STRING "" FORCE)
 set(SOCI_ORACLE OFF CACHE STRING "" FORCE)
-set(SOCI_POSTGRESQL OFF CACHE STRING "" FORCE)
+
+# PostgreSQL 后端：启用后 SOCI 自己会 find_package(PostgreSQL)，依赖目标
+# PostgreSQL::PostgreSQL（CMake 自带 FindPostgreSQL 提供）。方案 A：用系统
+# libpq，不做 FetchContent。没有 libpq 时可把开关关掉，构建 SQLite-only。
+option(MUSICD_ENABLE_POSTGRES "启用 SOCI 的 PostgreSQL 后端（需要系统 libpq）" ON)
+if (MUSICD_ENABLE_POSTGRES)
+  # AUTO=OFF 让缺依赖时 FATAL_ERROR，而不是静默禁用后端。
+  set(SOCI_POSTGRESQL ON CACHE STRING "" FORCE)
+  set(SOCI_POSTGRESQL_AUTO OFF CACHE BOOL "" FORCE)
+else()
+  set(SOCI_POSTGRESQL OFF CACHE STRING "" FORCE)
+endif()
 
 FetchContent_Declare(
   SOCI
   URL https://github.com/SOCI/soci/archive/refs/tags/v4.1.4.tar.gz
   URL_HASH SHA256=144f017cccc2e2d806badb3313d6ab3c67a1925bccaa747a46fb3907108a615d
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(SOCI)
 
