@@ -193,6 +193,33 @@ const Config &load(const std::string &file) {
         }
       }
     }
+    // 云端实体库（entity）：字段与主库 PostgreSQL 段一致。
+    if (json.has("entity_db")) {
+      const auto &edc = json["entity_db"];
+      auto &entity = loaded.entity_db;
+      if (edc.has("url")) {
+        entity.url = edc["url"].s();
+      }
+      if (edc.has("user")) {
+        entity.user = edc["user"].s();
+      }
+      if (edc.has("password")) {
+        entity.password = edc["password"].s();
+      }
+      if (edc.has("dbname")) {
+        entity.dbname = edc["dbname"].s();
+      }
+      if (edc.has("password_env")) {
+        entity.password_env = edc["password_env"].s();
+      }
+      if (edc.has("sslmode")) {
+        entity.sslmode = edc["sslmode"].s();
+      }
+      if (edc.has("connect_timeout_seconds")) {
+        entity.connect_timeout_seconds =
+            static_cast<int>(edc["connect_timeout_seconds"].i());
+      }
+    }
     // db_path 与 db.sql.path 始终同源，旧调用点无需改动。
     loaded.db_path = loaded.database.sql.path;
     if (json.has("static_dir")) {

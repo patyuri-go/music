@@ -112,6 +112,10 @@ struct Config {
   fs::path db_path{"./music.db"};
   // 新的后端配置；未配置 database 段时 sqlite_path 继承 db_path。
   DatabaseConfig database;
+  // 云端实体库（库名 entity）：track/album 的 entity_id 在此库中查文件位置。
+  // url 为空表示不启用，播放仍按本地扫描根解析。
+  DatabasePostgresConfig entity_db{
+      "", "musicd", "", "entity", "MUSICD_ENTITY_DB_PASSWORD", "", 5};
   fs::path static_dir{"web"};
   // 主服务端口（配置文件键名 main_port）。
   int port{5666};

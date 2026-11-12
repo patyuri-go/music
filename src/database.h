@@ -31,6 +31,8 @@ struct Track {
   int play_count = 0;
   std::string last_played;
   int rating = 0;
+  // 云端实体库 entity 的全局实体 ID（schema 11）；未回填时为空。
+  std::string entity_id;
 };
 
 struct Album {
@@ -39,6 +41,8 @@ struct Album {
   std::vector<int> artist_ids;
   int year = 0;
   std::string cover_path;
+  // 云端实体库 entity 的封面实体 ID（schema 11）；未回填时为空。
+  std::string entity_id;
 };
 
 struct Artist {

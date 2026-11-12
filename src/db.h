@@ -26,6 +26,11 @@ Session &mainSession();
 std::unique_ptr<Session> openSqliteSession(const std::string &path,
                                            SqliteProfile profile);
 
+/// 打开一个独立的 PostgreSQL 会话（不参与主库后端选择），
+/// 例如云端实体库 entity。`url` 为空时返回 nullptr。
+std::unique_ptr<Session> openPostgresSession(
+    const config::DatabasePostgresConfig &options);
+
 /// 由 db.PostgreSQL 配置拼出 libpq 连接串（含密码）。
 /// **不要写进日志**。
 std::string makePgConninfo(const config::DatabasePostgresConfig &options);

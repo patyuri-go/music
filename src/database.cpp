@@ -88,7 +88,10 @@ Track readTrack(const db::Row &row) {
   t.play_count = static_cast<int>(asInt(cellAt(row, 15)));
   t.last_played = asText(cellAt(row, 16));
   t.rating = static_cast<int>(asInt(cellAt(row, 17)));
-  t.artist_ids = parseIntList(asText(cellAt(row, 18)));
+  // 位置 18 是表尾的 entity_id（schema 11 新增），artist_ids 由 SQL
+  // 追加在 t.* 之后，因此是最后一列。
+  t.entity_id = asText(cellAt(row, 18));
+  t.artist_ids = parseIntList(asText(cellAt(row, 19)));
   return t;
 }
 
@@ -98,7 +101,10 @@ Album readAlbum(const db::Row &row) {
   a.name = asText(cellAt(row, 1));
   a.year = static_cast<int>(asInt(cellAt(row, 2)));
   a.cover_path = asText(cellAt(row, 3));
-  a.artist_ids = parseIntList(asText(cellAt(row, 5)));
+  // 位置 4 是 artist_key，5 是表尾的 entity_id（schema 11 新增），
+  // artist_ids 由 SQL 追加在 a.* 之后。
+  a.entity_id = asText(cellAt(row, 5));
+  a.artist_ids = parseIntList(asText(cellAt(row, 6)));
   return a;
 }
 

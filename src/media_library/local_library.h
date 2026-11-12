@@ -115,6 +115,13 @@ private:
   std::vector<Artist> build_artists(const std::vector<repo::Artist> &rows);
   std::vector<std::string> genres_of(int track_id) const;
   std::optional<repo::Album> album_of(const repo::Track &row) const;
+  // 封面的两个来源：本地虚拟路径 + 云端实体 ID，至少一个非空。
+  // 与播放解析一致：entity_id 优先，取不到再回退虚拟路径。
+  struct CoverSource {
+    std::string path;
+    std::string entity_id;
+  };
+  CoverSource cover_source_of(const SourceRef &owner) const;
   std::string cover_path_of(const SourceRef &owner) const;
 
   std::string library_id_;

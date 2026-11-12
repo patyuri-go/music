@@ -308,6 +308,10 @@ std::vector<std::string> createStatements(db::Dialect dialect) {
       "year INTEGER,"
       "cover_path TEXT,"
       "artist_key TEXT NOT NULL DEFAULT '',"
+      // 云端实体库（库名 entity）的全局实体 ID；由 scripts/sync_entity_ids.py
+      // 按文件路径后缀匹配回填，未匹配时为空。必须是最后一列：
+      // readAlbum() 按位置读列，artist_ids 由 SQL 追加在 * 之后。
+      "entity_id TEXT,"
       "UNIQUE(name, artist_key))",
       "CREATE TABLE IF NOT EXISTS genre("
       "id INTEGER PRIMARY KEY,"
@@ -339,7 +343,9 @@ std::vector<std::string> createStatements(db::Dialect dialect) {
       "added_at TEXT DEFAULT (datetime('now','localtime')),"
       "play_count INTEGER NOT NULL DEFAULT 0,"
       "last_played TEXT,"
-      "rating INTEGER DEFAULT 0)",
+      "rating INTEGER DEFAULT 0,"
+      // 同 album.entity_id：云端实体库的全局实体 ID，未匹配时为空。
+      "entity_id TEXT)",
       "CREATE TABLE IF NOT EXISTS track_artist("
       "track_id INTEGER NOT NULL REFERENCES track(id) ON DELETE CASCADE,"
       "artist_id INTEGER NOT NULL REFERENCES artist(id) ON DELETE CASCADE,"
@@ -419,6 +425,15 @@ std::vector<std::string> createStatements(db::Dialect dialect) {
   };
 }
 
+// entity_id 列在老库里要先 ALTER 补上，索引不能放进 createStatements()，
+// 否则在还没有该列的旧表上直接建索引会失败。
+static void createEntityIdIndexes(db::Session &session) {
+  session.exec(
+      "CREATE INDEX IF NOT EXISTS idx_track_entity ON track(entity_id)");
+  session.exec(
+      "CREATE INDEX IF NOT EXISTS idx_album_entity ON album(entity_id)");
+}
+
 namespace {
 
 std::int64_t cellInt(const db::Row &row, std::size_t index) {
@@ -447,7 +462,9 @@ void migrate(db::Session &session) {
   }
 
   if (!hasVersion) {
-    session.exec("INSERT INTO schema_version(version) VALUES (10)");
+    session.exec("INSERT INTO schema_version(version) VALUES (" +
+                 std::to_string(kVersion) + ")");
+    createEntityIdIndexes(session);
     return;
   }
 
@@ -677,6 +694,17 @@ void migrate(db::Session &session) {
   if (version == 9) {
     // 三张链接表已由 createStatements() 创建；这里只推进版本。
     session.exec("UPDATE schema_version SET version = 10");
+    version = 10;
+  }
+
+  if (version == 10) {
+    // 老库补「云端实体 ID」列。新建库的建表语句已含该列，
+    // 因此这里只在升级路径上执行，且列必须追加在表尾（readTrack/readAlbum
+    // 按位置读列，artist_ids 由 SQL 追加在 * 之后）。
+    session.exec("ALTER TABLE track ADD COLUMN entity_id TEXT");
+    session.exec("ALTER TABLE album ADD COLUMN entity_id TEXT");
+    createEntityIdIndexes(session);
+    session.exec("UPDATE schema_version SET version = 11");
     return;
   }
 

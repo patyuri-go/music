@@ -162,6 +162,14 @@ std::unique_ptr<Session> openSqliteSession(const std::string &path,
       SociOptions::sqlite(path, profile));
 }
 
+std::unique_ptr<Session> openPostgresSession(
+    const config::DatabasePostgresConfig &options) {
+  if (options.url.empty()) {
+    return nullptr;
+  }
+  return std::make_unique<SociSession>(makePgOptions(options));
+}
+
 std::string makePgConninfo(const config::DatabasePostgresConfig &options) {
   return makePgOptions(options).conninfo;
 }
