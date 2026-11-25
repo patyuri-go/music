@@ -7,9 +7,6 @@
 #include <string>
 #include <system_error>
 
-#include "api/webdav/webdav.h"
-#include "image_cache.h"
-#include "storage.h"
 
 namespace http_util {
 
@@ -159,107 +156,6 @@ ResponsePtr serveFile(const fs::path &path, const std::string &req_range) {
   res->setStatusCode(static_cast<drogon::HttpStatusCode>(partial ? 206 : 200));
   res->addHeader("Accept-Ranges", "bytes");
   return res;
-}
-
-ResponsePtr serveResource(const std::string &location,
-                          const std::string &req_range) {
-  if (!webdav::isWebdavUrl(location)) {
-    return serveFile(fs::path(location), req_range);
-  }
-
-  webdav::Url u = webdav::resolveCredentials(location);
-  std::vector<std::string> extra;
-  if (!req_range.empty()) {
-    extra.push_back("Range: " + req_range);
-  }
-  webdav::Stream s = webdav::openStream(u, u.path, extra);
-  if (s.status != 200 && s.status != 206) {
-    std::cerr << "[res] open error url=" << location << " status=" << s.status
-              << " range=[" << req_range << "]" << std::endl;
-    return jsonResponse(s.status == 0 ? 502 : s.status, "{\"erro\":true}");
-  }
-  std::cerr << "[res] open url=" << location << " status=" << s.status
-            << " len=" << s.length << " range=[" << req_range << "]"
-            << std::endl;
-
-  const auto cr_it = s.headers.find("content-range");
-  const std::string cr =
-      cr_it == s.headers.end() ? std::string() : cr_it->second;
-  // 长度未知整块缓冲
-  if (s.length < 0) {
-    std::string body;
-    char buf[65536];
-    while (true) {
-      const long long n = s.read(buf, sizeof(buf));
-      if (n <= 0) {
-        break;
-      }
-      body.append(buf, static_cast<std::size_t>(n));
-    }
-    s.close();
-    std::cerr << "[res] buffered url=" << location << " bytes=" << body.size()
-              << std::endl;
-
-    ResponsePtr res = drogon::HttpResponse::newHttpResponse();
-    res->setStatusCode(static_cast<drogon::HttpStatusCode>(s.status));
-    res->setContentTypeString(mimeType(fs::path(u.path)));
-    res->addHeader("Accept-Ranges", "bytes");
-    if (!cr.empty()) {
-      res->addHeader("Content-Range", cr);
-    }
-    res->addHeader("Content-Length", std::to_string(body.size()));
-    res->setBody(std::move(body));
-    return res;
-  }
-
-  auto stream = std::make_shared<webdav::Stream>(std::move(s));
-  auto sent = std::make_shared<long long>(0);
-  const long long declared_length = stream->length;
-
-  ResponsePtr res = drogon::HttpResponse::newStreamResponse(
-      [stream, sent, location](char *buf, std::size_t len) -> std::size_t {
-        // buf == nullptr 表示响应已完成或连接中断：关闭远端流。
-        if (buf == nullptr) {
-          stream->close();
-          return 0;
-        }
-        const long long n = stream->read(buf, len);
-        if (n <= 0) {
-          std::cerr << "[res] done url=" << location << " sent=" << *sent
-                    << std::endl;
-          return 0;
-        }
-        *sent += n;
-        return static_cast<std::size_t>(n);
-      },
-      "", drogon::CT_NONE, mimeType(fs::path(u.path)));
-  res->setStatusCode(static_cast<drogon::HttpStatusCode>(stream->status));
-  if (declared_length > 0) {
-    res->addHeader("Content-Length", std::to_string(declared_length));
-  }
-  res->addHeader("Accept-Ranges", "bytes");
-  if (!cr.empty()) {
-    res->addHeader("Content-Range", cr);
-  }
-  return res;
-}
-
-ResponsePtr serveImage(const std::string &virtual_path,
-                       const std::string &variant) {
-  if (auto cache = image_cache::get()) {
-    std::string error;
-    if (const auto hit = cache->ensure(virtual_path, variant, error)) {
-      return serveFile(*hit, "");
-    }
-    LOG_DEBUG << "[image_cache] ensure failed for " << virtual_path << ": "
-              << error;
-  }
-  const std::string location = storage::resolve(virtual_path);
-  if (!webdav::isWebdavUrl(location) &&
-      !storage::isUnderAnyRoot(fs::path(location))) {
-    return jsonResponse(404, "{\"erro\":true}");
-  }
-  return serveResource(location, "");
 }
 
 } // namespace http_util

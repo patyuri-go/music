@@ -745,36 +745,42 @@ http_server::ResponsePtr track(const http_server::RequestPtr &req, const std::st
   return track_aspect(req, ref_text, text_param(req, "aspect").value_or(""));
 }
 
-http_server::ResponsePtr track_stream(const http_server::RequestPtr &req, const std::string &ref) {
+void track_stream(const http_server::RequestPtr &req, const std::string &ref,
+                  std::function<void(const http_server::ResponsePtr &)> callback) {
   const std::optional<SourceRef> parsed = parse_ref_param(ref);
   if (!parsed.has_value()) {
-    return bad_ref();
+    callback(bad_ref());
+    return;
   }
   if (parsed->entity_type != EntityType::Track) {
-    return invalid("expected a track reference");
+    callback(invalid("expected a track reference"));
+    return;
   }
-  // 出字节：open_playback -> open_stream -> Range 输出。locator 不出进程。
-  return stream_http::serve_track(req, *parsed, req && req->method() == drogon::Head);
+  // 出字节：本地库按实体 id 直连存储服务，远端库沿用同步路径。
+  stream_http::serve_track_async(
+      req, *parsed, req && req->isHead(), std::move(callback));
 }
 
 http_server::ResponsePtr track_lyrics(const http_server::RequestPtr &req, const std::string &ref) {
   return track_aspect(req, ref, "lyrics");
 }
 
-http_server::ResponsePtr track_artwork(const http_server::RequestPtr &req, const std::string &ref) {
-  // 字节出口：owner 是曲目本身，由 ArtworkService 经 MediaRouter 选源后
-  // 落到对应库的 ArtworkProvider/ArtworkBytes；locator 不出进程。
+void track_artwork(const http_server::RequestPtr &req, const std::string &ref,
+                   std::function<void(const http_server::ResponsePtr &)> callback) {
+  // 字节出口：owner 是曲目本身，本地库解析到专辑的封面实体 id。
   const std::optional<SourceRef> parsed = parse_ref_param(ref);
   if (!parsed.has_value()) {
-    return bad_ref();
+    callback(bad_ref());
+    return;
   }
   if (parsed->entity_type != EntityType::Track) {
-    return invalid("expected a track reference");
+    callback(invalid("expected a track reference"));
+    return;
   }
   media_library::ArtworkRef artwork;
   artwork.owner = *parsed;
-  return stream_http::serve_artwork(req, artwork,
-                                    req && req->method() == drogon::Head);
+  stream_http::serve_artwork_async(
+      req, artwork, req && req->isHead(), std::move(callback));
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,7 +1326,7 @@ http_server::ResponsePtr playback_close(const http_server::RequestPtr &,
 
 http_server::ResponsePtr playback_stream(const http_server::RequestPtr &req,
                                const std::string &session_id) {
-  return stream_http::serve_session(req, session_id, req && req->method() == drogon::Head);
+  return stream_http::serve_session(req, session_id, req && req->isHead());
 }
 
 } // namespace api_v1

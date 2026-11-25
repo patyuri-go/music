@@ -27,6 +27,9 @@ config.json
 /lyrics_test
 /artists_test
 /amll_ttml_test
+/storage_test
+/fake_storage
+/test_fixture
 
 /third_party/*/tests/
 /third_party/*/test/

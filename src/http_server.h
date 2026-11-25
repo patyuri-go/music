@@ -20,10 +20,11 @@
 // 只提供三件事：
 //   1. 统一的请求/响应智能指针别名；
 //   2. 响应构造助手（避免每个 handler 手搓 HttpResponse）;
-//   3. 同步 handler 的路由注册（handler 拿到解析好的路径参数，直接返回响应）。
+//   3. 路由注册：同步 handler 直接返回 ResponsePtr；异步 handler 收下 Drogon
+//      的 callback，可以交给工作线程稍后再回。
 //
-// handler 一律写成「同步返回 ResponsePtr」，Drogon 的异步回调形态由 on()
-// 内部适配，业务代码不需要感知协程/回调。
+// 绝大多数 handler 写成「同步返回 ResponsePtr」，Drogon 的回调形态由 on()
+// 内部适配；只有需要等待上游网络（如存储服务）的路由才用 onAsync()。
 namespace http_server {
 
 using RequestPtr = drogon::HttpRequestPtr;
@@ -93,6 +94,46 @@ struct handler_traits<R (C::*)(A...) const> {
   using args = std::tuple<A...>;
 };
 
+// 异步 handler：第二个形参是 Drogon 的 callback，可以留到工作线程再调用。
+// 这里只提取路径参数，callback 本身不计入 args。
+template <typename R, typename... A>
+struct handler_traits<R (*)(const RequestPtr &,
+                            std::function<void(const ResponsePtr &)>, A...)> {
+  using args = std::tuple<A...>;
+};
+
+template <typename R, typename... A>
+struct handler_traits<R (*)(RequestPtr,
+                            std::function<void(const ResponsePtr &)>, A...)> {
+  using args = std::tuple<A...>;
+};
+
+template <typename R, typename C, typename... A>
+struct handler_traits<R (C::*)(const RequestPtr &,
+                              std::function<void(const ResponsePtr &)>,
+                              A...) const> {
+  using args = std::tuple<A...>;
+};
+
+template <typename R, typename C, typename... A>
+struct handler_traits<R (C::*)(RequestPtr,
+                              std::function<void(const ResponsePtr &)>,
+                              A...) const> {
+  using args = std::tuple<A...>;
+};
+
+// 省略 request、只收 callback + 路径参数。
+template <typename R, typename... A>
+struct handler_traits<R (*)(std::function<void(const ResponsePtr &)>, A...)> {
+  using args = std::tuple<A...>;
+};
+
+template <typename R, typename C, typename... A>
+struct handler_traits<R (C::*)(std::function<void(const ResponsePtr &)>,
+                              A...) const> {
+  using args = std::tuple<A...>;
+};
+
 template <typename F>
 struct handler_traits : handler_traits<decltype(&F::operator())> {};
 
@@ -132,6 +173,48 @@ void register_regex(drogon::HttpMethod method, const std::string &pattern, F f,
       {drogon::internal::HttpConstraint{method}});
 }
 
+// 异步 handler：callback 原样交出去，由 handler 决定何时/在哪个线程调用。
+template <typename F, typename... A>
+void invoke_async_handler(F &f, const RequestPtr &req,
+                          std::function<void(const ResponsePtr &)> &&callback,
+                          A &&...args) {
+  if constexpr (std::is_invocable_v<
+                    F &, const RequestPtr &,
+                    std::function<void(const ResponsePtr &)>, A...>) {
+    f(req, std::move(callback), std::forward<A>(args)...);
+  } else {
+    f(std::move(callback), std::forward<A>(args)...);
+  }
+}
+
+template <typename F, typename Tuple, std::size_t... I>
+void register_async_path(drogon::HttpMethod method, const std::string &pattern,
+                         F f, std::index_sequence<I...>) {
+  drogon::app().registerHandler(
+      pattern,
+      [f](const RequestPtr &req,
+          std::function<void(const ResponsePtr &)> &&callback,
+          std::decay_t<std::tuple_element_t<I, Tuple>>... args) {
+        invoke_async_handler(f, req, std::move(callback),
+                             std::move(args)...);
+      },
+      {drogon::internal::HttpConstraint{method}});
+}
+
+template <typename F, typename Tuple, std::size_t... I>
+void register_async_regex(drogon::HttpMethod method, const std::string &pattern,
+                          F f, std::index_sequence<I...>) {
+  drogon::app().registerHandlerViaRegex(
+      pattern,
+      [f](const RequestPtr &req,
+          std::function<void(const ResponsePtr &)> &&callback,
+          std::decay_t<std::tuple_element_t<I, Tuple>>... args) {
+        invoke_async_handler(f, req, std::move(callback),
+                             std::move(args)...);
+      },
+      {drogon::internal::HttpConstraint{method}});
+}
+
 } // namespace detail
 
 // 注册一条 `{1}`/`{2}` 风格的路径路由。
@@ -150,6 +233,26 @@ template <typename F>
 void onRegex(drogon::HttpMethod method, const std::string &pattern, F handler) {
   using args = typename detail::handler_traits<std::decay_t<F>>::args;
   detail::register_regex<F, args>(
+      method, pattern, std::move(handler),
+      std::make_index_sequence<std::tuple_size<args>::value>{});
+}
+
+// 同 on()，但 handler 形态是
+//   void(const RequestPtr&, std::function<void(const ResponsePtr&)>, Arg1, ...)
+// callback 可以从任意线程调用；路由本身不阻塞 Drogon 的 IO 线程。
+template <typename F>
+void onAsync(drogon::HttpMethod method, const std::string &pattern, F handler) {
+  using args = typename detail::handler_traits<std::decay_t<F>>::args;
+  detail::register_async_path<F, args>(
+      method, pattern, std::move(handler),
+      std::make_index_sequence<std::tuple_size<args>::value>{});
+}
+
+template <typename F>
+void onRegexAsync(drogon::HttpMethod method, const std::string &pattern,
+                  F handler) {
+  using args = typename detail::handler_traits<std::decay_t<F>>::args;
+  detail::register_async_regex<F, args>(
       method, pattern, std::move(handler),
       std::make_index_sequence<std::tuple_size<args>::value>{});
 }
@@ -176,6 +279,18 @@ template <typename F>
 void onPortRegex(int port, drogon::HttpMethod method, const std::string &pattern,
                  F handler) {
   onRegex(method, portPrefix(port) + pattern, std::move(handler));
+}
+
+template <typename F>
+void onPortAsync(int port, drogon::HttpMethod method, const std::string &path,
+                 F handler) {
+  onAsync(method, portPrefix(port) + path, std::move(handler));
+}
+
+template <typename F>
+void onPortRegexAsync(int port, drogon::HttpMethod method,
+                      const std::string &pattern, F handler) {
+  onRegexAsync(method, portPrefix(port) + pattern, std::move(handler));
 }
 
 // 安装端口前缀改写（必须在 run() 之前调用一次）。

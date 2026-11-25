@@ -16,8 +16,6 @@
 #include <optional>
 #include <vector>
 
-#include "api/webdav/webdav.h"
-#include "api/webdav/webdav_stream.h"
 
 namespace metadata {
 
@@ -255,18 +253,6 @@ void applyFileMeta(TagLib::FileRef &fileRef, const FileMeta &meta) {
 } // namespace
 
 std::optional<TrackMeta> read(const std::string &path) {
-  if (webdav::isWebdavUrl(path)) {
-    WebdavStream stream(path, true);
-    if (!stream.isOpen()) {
-      return std::nullopt;
-    }
-    TagLib::FileRef fileRef(&stream, true, TagLib::AudioProperties::Average);
-    if (fileRef.isNull() || !fileRef.tag()) {
-      return std::nullopt;
-    }
-    return buildTrackMeta(fileRef, path);
-  }
-
   TagLib::FileRef fileRef(path.c_str());
   if (fileRef.isNull() || !fileRef.tag()) {
     return std::nullopt;
@@ -291,24 +277,6 @@ std::optional<TrackMeta> read(const std::string &path) {
 }
 
 std::optional<FileMeta> readFileMeta(const std::string &path) {
-  if (webdav::isWebdavUrl(path)) {
-    WebdavStream stream(path, true);
-    if (!stream.isOpen()) {
-      return std::nullopt;
-    }
-    TagLib::FileRef fileRef(&stream, true, TagLib::AudioProperties::Average);
-    if (fileRef.isNull() || !fileRef.tag()) {
-      return std::nullopt;
-    }
-    FileMeta meta = buildFileMeta(fileRef);
-    meta.format = formatFromPath(path);
-    const long long len = stream.length();
-    if (len > 0) {
-      meta.size_bytes = len;
-    }
-    return meta;
-  }
-
   TagLib::FileRef fileRef(path.c_str());
   if (fileRef.isNull() || !fileRef.tag()) {
     return std::nullopt;
@@ -324,24 +292,6 @@ std::optional<FileMeta> readFileMeta(const std::string &path) {
 }
 
 bool writeFileMeta(const std::string &path, const FileMeta &meta) {
-  if (webdav::isWebdavUrl(path)) {
-    WebdavStream stream(path, false);
-    if (!stream.isOpen()) {
-      return false;
-    }
-    {
-      TagLib::FileRef fileRef(&stream, false);
-      if (fileRef.isNull() || !fileRef.tag()) {
-        return false;
-      }
-      applyFileMeta(fileRef, meta);
-      if (!fileRef.save()) {
-        return false;
-      }
-    }
-    return stream.flush();
-  }
-
   TagLib::FileRef fileRef(path.c_str());
   if (fileRef.isNull() || !fileRef.tag()) {
     return false;
@@ -351,17 +301,7 @@ bool writeFileMeta(const std::string &path, const FileMeta &meta) {
 }
 
 std::string readSiblingLyrics(const std::string &path) {
-  const std::string lrc = replaceExtension(path, ".lrc");
-  if (webdav::isWebdavUrl(path)) {
-    webdav::Url u = webdav::resolveCredentials(lrc);
-    webdav::Client client(u);
-    webdav::Response r = client.getAll(u.path);
-    if (r.status == 200) {
-      return r.body;
-    }
-    return {};
-  }
-  return readLocalTextFile(lrc);
+  return readLocalTextFile(replaceExtension(path, ".lrc"));
 }
 
 bool isSyncedLyrics(const std::string &text) {

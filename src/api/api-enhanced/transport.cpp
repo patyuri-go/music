@@ -1,6 +1,6 @@
 #include "api/api-enhanced/transport.h"
 
-#include "api/webdav/webdav.h"
+#include "http_client.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -28,9 +28,9 @@ std::string build_query(
     if (!out.empty()) {
       out.push_back('&');
     }
-    out.append(webdav::encodePathSegment(item.first));
+    out.append(http_client::encodePathSegment(item.first));
     out.push_back('=');
-    out.append(webdav::encodePathSegment(item.second));
+    out.append(http_client::encodePathSegment(item.second));
   }
   if (!out.empty()) {
     out.push_back('&');
@@ -79,7 +79,7 @@ media_library::Error http_error(int status, const std::string &path) {
 
 class HttpTransport final : public NeteaseTransport {
 public:
-  HttpTransport(webdav::Url base, std::string path_prefix, int timeout_ms)
+  HttpTransport(http_client::Url base, std::string path_prefix, int timeout_ms)
       : client_(std::move(base)), path_prefix_(std::move(path_prefix)),
         timeout_ms_(timeout_ms) {}
 
@@ -88,7 +88,7 @@ public:
       const std::vector<std::pair<std::string, std::string>> &query,
       const media_library::CallContext &ctx) override {
     (void)ctx;
-    // webdav::Client 内部固定 30s 超时，timeout_ms 暂未生效：
+    // http_client::Client 内部固定 30s 超时，timeout_ms 暂未生效：
     // 真的超时控制要等 N2 换成自己的 asio 客户端。
     (void)timeout_ms_;
 
@@ -97,7 +97,7 @@ public:
     target.push_back('?');
     target.append(build_query(query));
 
-    const webdav::Response response =
+    const http_client::Response response =
         client_.request("GET", target, {}, std::string());
     if (response.status != 200) {
       return media_library::Result<std::string>::failure(
@@ -107,7 +107,7 @@ public:
   }
 
 private:
-  webdav::Client client_;
+  http_client::Client client_;
   std::string path_prefix_;
   int timeout_ms_;
 };
@@ -241,8 +241,8 @@ private:
 
 std::shared_ptr<NeteaseTransport>
 make_http_transport(const NeteaseTransportOptions &options) {
-  webdav::Url base;
-  if (options.api_base.empty() || !webdav::parseUrl(options.api_base, base)) {
+  http_client::Url base;
+  if (options.api_base.empty() || !http_client::parseUrl(options.api_base, base)) {
     return nullptr;
   }
   // api_base 允许带路径前缀（反代到 /netease 之类）；根路径视为空前缀。

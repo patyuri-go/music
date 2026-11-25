@@ -15,14 +15,12 @@
 #include "tools/lyrics_ttml.h"
 #include "media_library/media_runtime.h"
 #include "media_library/netease_library.h"
+#include "storage_client.h"
 #include "stream_http.h"
 #include "api/v1/v1.h"
 #include "api/api-enhanced/ids.h"
 #include "metadata.h"
-#include "api/webdav/webdav.h"
 #include "schema.h"
-#include "scanner.h"
-#include "storage.h"
 #include "api/playlist/playlist.h"
 #include "service.h"
 
@@ -49,7 +47,6 @@
 namespace fs = std::filesystem;
 
 using http_util::jsonResponse;
-using http_util::serveFile;
 using http_util::urlDecode;
 
 namespace {
@@ -91,25 +88,8 @@ std::string textAt(const db::Row &row, std::size_t index) {
   return {};
 }
 
-std::string rootTypeOf(const std::string &path) {
-  return webdav::isWebdavUrl(path) ? "webdav" : "local";
-}
-
-std::string deriveRootName(const std::string &path) {
-  std::string p = path;
-  while (!p.empty() && p.back() == '/') {
-    p.pop_back();
-  }
-  const std::size_t slash = p.find_last_of('/');
-  std::string last = (slash == std::string::npos) ? p : p.substr(slash + 1);
-  if (last.empty()) {
-    last = p;
-  }
-  return urlDecode(last);
-}
-
-void bootstrap() {
-  const auto &cfg = config::load();
+void bootstrap(const std::string &config_file) {
+  const auto &cfg = config::load(config_file);
 
   // 主库后端在启动时一次性确定：本地 SQLite 或远端 PostgreSQL。
   db::init(cfg.database);
@@ -132,23 +112,10 @@ void bootstrap() {
   std::cout << "[boot] schema 版本 " << schema::kVersion << "，就绪"
             << std::endl;
 
-  {
-    // 扫描根（本地与 WebDAV）只存数据库，配置文件不再声明。
-    repo::ScanRootRepo roots(db::mainSession());
-    for (const auto &r : roots.list()) {
-      if (r.name.empty()) {
-        roots.updateName(r.id, deriveRootName(r.path));
-      }
-    }
-  }
-
-  if (cfg.local.scan_on_start) {
-    scanner::enqueueJob("scan-all", [] { scanner::scanAllBlocking(); });
-  }
-
   playlist::loadAll();
 }
 
+// 静态资源路径限定在 static_dir 内（/web/<path>）。
 std::optional<fs::path> resolveWithin(const fs::path &root,
                                       const std::string &relative) {
   std::error_code ec;
@@ -160,7 +127,6 @@ std::optional<fs::path> resolveWithin(const fs::path &root,
   if (ec) {
     return std::nullopt;
   }
-
   const fs::path rel = target.lexically_relative(base);
   if (rel.empty()) {
     return std::nullopt;
@@ -173,297 +139,6 @@ std::optional<fs::path> resolveWithin(const fs::path &root,
   return target;
 }
 
-bool isUnderAnyRoot(const fs::path &target) {
-  std::error_code ec;
-  const fs::path canonical = fs::weakly_canonical(target, ec);
-  if (ec) {
-    return false;
-  }
-  repo::ScanRootRepo repo(db::mainSession());
-  for (const auto &root : repo.list()) {
-    fs::path base = fs::weakly_canonical(root.path, ec);
-    if (ec) {
-      continue;
-    }
-    const fs::path rel = canonical.lexically_relative(base);
-    if (!rel.empty() && rel.native().rfind("..", 0) != 0) {
-      for (const auto &part : rel) {
-        if (part == "..") {
-          return false;
-        }
-      }
-      return true;
-    }
-  }
-  return false;
-}
-
-http_server::ResponsePtr browseWebdavRoot(int root_id, const std::string &root_url,
-                                const std::string &rel_path) {
-  try {
-    webdav::Url base = webdav::resolveCredentials(root_url);
-    if (base.path.empty()) {
-      base.path = "/";
-    }
-    std::string dir = base.path;
-    while (dir.size() > 1 && dir.back() == '/') {
-      dir.pop_back();
-    }
-    {
-      std::size_t start = 0;
-      while (start <= rel_path.size()) {
-        const std::size_t slash = rel_path.find('/', start);
-        const std::string seg = (slash == std::string::npos)
-                                    ? rel_path.substr(start)
-                                    : rel_path.substr(start, slash - start);
-        if (!seg.empty()) {
-          dir = webdav::joinPath(dir, seg);
-        }
-        if (slash == std::string::npos) {
-          break;
-        }
-        start = slash + 1;
-      }
-    }
-
-    const std::string req_path = (dir == "/") ? "/" : dir + "/";
-    webdav::Client client(base);
-    webdav::Response res = client.propfind(req_path, 1);
-    if (res.status != 207) {
-      return jsonResponse(400, "{\"erro\":true}");
-    }
-    std::vector<webdav::Resource> items = webdav::parsePropfind(res.body);
-
-    // 服务器的 href 可能与我们配置的 URL 百分号编码方式不同（如 [ -> %5B、
-    // 空格 -> %20、非 ASCII -> UTF-8 转义），因此比较时统一解码，
-    // 并用服务器返回的“自身”条目来确定当前目录的编码形式，保证 DB 前缀匹配。
-    const std::string dir_dec = urlDecode(dir);
-    std::string server_dir;
-    for (const auto &item : items) {
-      std::string ipath = item.path;
-      while (ipath.size() > 1 && ipath.back() == '/') {
-        ipath.pop_back();
-      }
-      if (urlDecode(ipath) == dir_dec) {
-        server_dir = ipath;
-        break;
-      }
-    }
-    const std::string dir_encoded = server_dir.empty() ? dir : server_dir;
-    const std::string dir_url = webdav::buildUrl(base, dir_encoded);
-
-    repo::ScanRootRepo root_repo(db::mainSession());
-    auto root_opt = root_repo.byId(root_id);
-    const std::string vbase =
-        root_opt ? (root_opt->name + (rel_path.empty() ? "" : "/" + rel_path))
-                 : dir_url;
-    const std::string vprefix = vbase + "/";
-
-    struct Entry {
-      std::string name;
-      std::string path;
-      bool isDir = false;
-      bool onDisk = false;
-      bool inDb = false;
-      int trackId = 0;
-      std::string title;
-    };
-    std::map<std::string, Entry> merged;
-
-    {
-      db::Session &db = db::mainSession();
-      const auto tracks = db.query(
-          schema::sql::kTrackPathsUnderRoot,
-          {static_cast<std::int64_t>(root_id), vprefix, vbase + "0"});
-      for (const auto &row : tracks.rows) {
-        const std::string vp = textAt(row, 1);
-        if (vp.compare(0, vprefix.size(), vprefix) != 0) {
-          continue;
-        }
-        const std::string rest = vp.substr(vprefix.size());
-        if (rest.empty() || rest.find('/') != std::string::npos) {
-          continue;
-        }
-        const std::string real = root_opt ? storage::toReal(*root_opt, vp) : vp;
-        Entry &e = merged[urlDecode(real)];
-        e.path = real;
-        e.inDb = true;
-        e.trackId = static_cast<int>(intAt(row, 0));
-        e.title = textAt(row, 2);
-        const std::size_t slash = real.rfind('/');
-        e.name = urlDecode((slash == std::string::npos) ? real
-                                                        : real.substr(slash + 1));
-      }
-    }
-
-    for (const auto &item : items) {
-      std::string ipath = item.path;
-      if (ipath.size() > 1 && ipath.back() == '/') {
-        ipath.pop_back();
-      }
-      if (urlDecode(ipath) == dir_dec) {
-        continue;
-      }
-      const std::size_t slash = ipath.rfind('/');
-      const std::string raw_name =
-          (slash == std::string::npos) ? ipath : ipath.substr(slash + 1);
-      if (raw_name.empty()) {
-        continue;
-      }
-      const std::string full = webdav::buildUrl(base, ipath);
-      Entry &e = merged[urlDecode(full)];
-      e.path = full;
-      e.onDisk = true;
-      e.isDir = item.collection;
-      e.name = urlDecode(raw_name);
-    }
-
-    Json::Value out(Json::arrayValue);
-    int i = 0;
-    for (const auto &kv : merged) {
-      const Entry &e = kv.second;
-      out[i]["name"] = e.name;
-      out[i]["isDir"] = e.isDir;
-      out[i]["path"] = e.path;
-      out[i]["inDb"] = e.inDb;
-      out[i]["onDisk"] = e.onDisk;
-      out[i]["trackId"] = e.trackId;
-      out[i]["title"] = e.title;
-      out[i]["status"] =
-          (e.inDb && e.onDisk) ? "both" : (e.inDb ? "db" : "disk");
-      ++i;
-    }
-    return jsonResponse(200, json_util::dump(out));
-  } catch (const std::exception &e) {
-    return jsonResponse(500, "{\"erro\":true}");
-  }
-}
-
-http_server::ResponsePtr browseDir(int root_id, const std::string &rel_path) {
-  try {
-    if (root_id <= 0) {
-      return jsonResponse(400, "{\"erro\":true}");
-    }
-
-    repo::ScanRootRepo root_repo(db::mainSession());
-    auto root_opt = root_repo.byId(root_id);
-    if (!root_opt) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    if (webdav::isWebdavUrl(root_opt->path)) {
-      return browseWebdavRoot(root_id, root_opt->path, rel_path);
-    }
-    fs::path base = fs::weakly_canonical(root_opt->path);
-    fs::path target = base / rel_path;
-
-    std::error_code ec;
-    if (!fs::is_directory(target, ec)) {
-      return jsonResponse(400, "{\"erro\":true}");
-    }
-
-    const std::string vbase =
-        root_opt->name + (rel_path.empty() ? "" : "/" + rel_path);
-    const std::string vprefix = vbase + "/";
-
-    struct Entry {
-      std::string name;
-      std::string path;
-      bool isDir = false;
-      bool onDisk = false;
-      bool inDb = false;
-      int trackId = 0;
-      std::string title;
-    };
-    std::map<std::string, Entry> merged;
-
-    {
-      db::Session &db = db::mainSession();
-      const auto tracks = db.query(
-          schema::sql::kTrackPathsUnderRoot,
-          {static_cast<std::int64_t>(root_id), vprefix, vbase + "0"});
-      for (const auto &row : tracks.rows) {
-        const std::string vp = textAt(row, 1);
-        if (vp.compare(0, vprefix.size(), vprefix) != 0) {
-          continue;
-        }
-        const std::string rest = vp.substr(vprefix.size());
-        if (rest.empty() || rest.find('/') != std::string::npos) {
-          continue;
-        }
-        const std::string real = storage::toReal(*root_opt, vp);
-        Entry &e = merged[real];
-        e.path = real;
-        e.inDb = true;
-        e.trackId = static_cast<int>(intAt(row, 0));
-        e.title = textAt(row, 2);
-        e.name = fs::path(real).filename().string();
-      }
-    }
-
-    std::error_code ec_dir;
-    for (const auto &dir_entry : fs::directory_iterator(target, ec_dir)) {
-      if (ec_dir) break;
-      const fs::path &p = dir_entry.path();
-      std::error_code ec_type;
-      bool is_dir = false;
-      try {
-        is_dir = fs::is_directory(p, ec_type);
-      } catch (...) {
-        continue;
-      }
-      if (ec_type) continue;
-
-      std::string path_str;
-      std::error_code ec_can;
-      try {
-        path_str = fs::canonical(p, ec_can).string();
-      } catch (...) {
-        path_str = p.string();
-      }
-      if (ec_can) {
-        path_str = p.string();
-      }
-
-      Entry &e = merged[path_str];
-      e.path = path_str;
-      e.onDisk = true;
-      e.isDir = is_dir;
-      e.name = p.filename().string();
-    }
-
-    Json::Value out(Json::arrayValue);
-    int i = 0;
-    for (const auto &kv : merged) {
-      const Entry &e = kv.second;
-      out[i]["name"] = e.name;
-      out[i]["isDir"] = e.isDir;
-      out[i]["path"] = e.path;
-      out[i]["inDb"] = e.inDb;
-      out[i]["onDisk"] = e.onDisk;
-      out[i]["trackId"] = e.trackId;
-      out[i]["title"] = e.title;
-      out[i]["status"] = (e.inDb && e.onDisk)
-                             ? "both"
-                             : (e.inDb ? "db" : "disk");
-      ++i;
-    }
-    return jsonResponse(200, json_util::dump(out));
-  } catch (const std::exception &e) {
-    return jsonResponse(500, "{\"erro\":true}");
-  }
-}
-
-// ---------------------------------------------------------------------------
-// library.html 的读接口（/api/track|album|artist|album/cover|track/lyrics）
-//
-// 搜索不在这一组里：前端直接用 /api/v1/search（支持 types 与分页）。
-//
-// 一律经 MediaRouter 取领域模型，id 是 SourceRef 规范串。本地传输细节
-// （文件路径、封面文件路径）不属于领域模型，接口也不再输出：封面显隐由
-// artwork 字段决定（非空表示有图）。
-// ---------------------------------------------------------------------------
-
-// id 解析：类型不符与解析失败一律当作 404。
 std::optional<media_library::SourceRef>
 api_ref(const std::string &text, media_library::EntityType type) {
   const std::optional<media_library::SourceRef> ref =
@@ -610,232 +285,6 @@ void setAlbumArtists(db::Session &db, int album_id,
   }
 }
 
-bool syncFromFileById(int id, int slot = -1) {
-  repo::TrackRepo track_repo(db::mainSession());
-  auto track = track_repo.byId(id);
-  if (!track) {
-    return false;
-  }
-  const std::string real_path = storage::resolve(track->path);
-  if (!webdav::isWebdavUrl(real_path) && !fs::exists(real_path)) {
-    return false;
-  }
-  if (slot >= 0) {
-    scanner::activePathsSet(slot, real_path);
-  } else {
-    scanner::setCurrentFile(real_path);
-  }
-  auto meta = metadata::readFileMeta(real_path);
-  if (!meta) {
-    return false;
-  }
-  db::Session &db = db::mainSession();
-
-  std::vector<std::string> artist_names = meta->artists;
-  if (artist_names.empty() && !meta->artist.empty()) {
-    artist_names.push_back(meta->artist);
-  }
-  const std::vector<int> artist_ids = ensureArtistIds(db, artist_names);
-
-  std::vector<std::string> album_artist_names = meta->album_artists;
-  if (album_artist_names.empty()) {
-    album_artist_names = artist_names;
-  }
-  const int album_id =
-      ensureAlbumId(db, meta->album, artistKeyOf(album_artist_names));
-
-  repo::Track t = *track;
-  t.title = meta->title;
-  t.album_id = album_id;
-  t.track_no = meta->track_no;
-  t.disc_no = meta->disc_no;
-  track_repo.updatePartial(t);
-
-  setTrackArtists(db, id, artist_ids);
-  if (album_id != 0) {
-    setAlbumArtists(db, album_id, ensureArtistIds(db, album_artist_names));
-  }
-
-  db.execute("DELETE FROM track_genre WHERE track_id = ?",
-             {static_cast<std::int64_t>(id)});
-  if (!meta->genre.empty()) {
-    const auto lookup = [&db](const std::string &name) {
-      const auto result = db.query(schema::sql::kGenreByName, {name});
-      return result.rows.empty()
-                 ? 0
-                 : static_cast<int>(intAt(result.rows.front(), 0));
-    };
-    int genre_id = lookup(meta->genre);
-    if (genre_id == 0) {
-      db.execute(schema::sql::genreInsert(db.dialect()), {meta->genre});
-      genre_id = lookup(meta->genre);
-    }
-    if (genre_id > 0) {
-      db.execute(schema::sql::trackGenreInsert(db.dialect()),
-                 {static_cast<std::int64_t>(id),
-                  static_cast<std::int64_t>(genre_id)});
-    }
-  }
-  // The track may have moved to another album / artists; drop now-empty rows.
-  db.exec("DELETE FROM album WHERE id NOT IN "
-          "(SELECT DISTINCT album_id FROM track WHERE album_id IS NOT NULL)");
-  db.exec("DELETE FROM artist WHERE id NOT IN "
-          "(SELECT DISTINCT artist_id FROM track_artist) AND id NOT IN "
-          "(SELECT DISTINCT artist_id FROM album_artist)");
-  // Import lyrics from the file: embedded lyrics preferred, else sibling .lrc.
-  {
-    std::string lyrics = meta->lyrics;
-    if (lyrics.empty()) {
-      lyrics = metadata::readSiblingLyrics(real_path);
-    }
-    if (!lyrics.empty()) {
-      db.execute(schema::sql::trackLyricsUpsert(db.dialect()),
-                 {static_cast<std::int64_t>(id), lyrics,
-                  static_cast<std::int64_t>(
-                      metadata::isSyncedLyrics(lyrics) ? 1 : 0)});
-    }
-  }
-  return true;
-}
-
-bool syncToFileById(int id, int slot = -1) {
-  repo::TrackRepo track_repo(db::mainSession());
-  auto track = track_repo.byId(id);
-  if (!track) {
-    return false;
-  }
-  const std::string real_path = storage::resolve(track->path);
-  if (!webdav::isWebdavUrl(real_path) && !fs::exists(real_path)) {
-    return false;
-  }
-  if (slot >= 0) {
-    scanner::activePathsSet(slot, real_path);
-  } else {
-    scanner::setCurrentFile(real_path);
-  }
-  db::Session &db = db::mainSession();
-  repo::ArtistRepo artist_repo(db::mainSession());
-  repo::AlbumRepo album_repo(db::mainSession());
-
-  metadata::FileMeta meta;
-  meta.title = track->title;
-  meta.track_no = track->track_no;
-  meta.disc_no = track->disc_no;
-  for (const int aid : track->artist_ids) {
-    if (auto artist = artist_repo.byId(aid)) {
-      meta.artists.push_back(artist->name);
-    }
-  }
-  if (!meta.artists.empty()) {
-    meta.artist = meta.artists.front();
-  }
-  if (auto album = album_repo.byId(track->album_id)) {
-    meta.album = album->name;
-    meta.year = album->year;
-    for (const int aid : album->artist_ids) {
-      if (auto artist = artist_repo.byId(aid)) {
-        meta.album_artists.push_back(artist->name);
-      }
-    }
-  }
-  meta.genre = "";
-  meta.comment = "";
-
-  auto genres = track_repo.genresByTrackId(id);
-  if (!genres.empty()) {
-    const auto genre = db.query("SELECT name FROM genre WHERE id = ?",
-                                {static_cast<std::int64_t>(genres[0])});
-    if (!genre.rows.empty()) {
-      meta.genre = textAt(genre.rows.front(), 0);
-    }
-  }
-  return metadata::writeFileMeta(real_path, meta);
-}
-
-// Run fn over every id using up to config::scan_threads worker threads. The
-// per-thread main sessions (db::mainSession() is thread_local) plus
-// WAL/busy_timeout make concurrent sync operations safe.
-void runIdsParallel(const std::vector<int> &ids,
-                    const std::function<void(int, int)> &fn) {
-  if (ids.empty()) {
-    return;
-  }
-  int threads = config::get().local.scan_threads;
-  if (threads < 1) {
-    threads = 1;
-  }
-  if (threads > static_cast<int>(ids.size())) {
-    threads = static_cast<int>(ids.size());
-  }
-  scanner::activePathsBegin(threads);
-  std::atomic<std::size_t> next{0};
-  std::vector<std::thread> pool;
-  pool.reserve(static_cast<std::size_t>(threads));
-  for (int t = 0; t < threads; ++t) {
-    pool.emplace_back([&ids, &fn, &next, t]() {
-      while (true) {
-        const std::size_t i = next.fetch_add(1);
-        if (i >= ids.size()) {
-          break;
-        }
-        fn(ids[i], t);
-      }
-      scanner::activePathsSet(t, std::string());
-    });
-  }
-  for (auto &th : pool) {
-    th.join();
-  }
-  scanner::activePathsEnd();
-}
-
-// Expand a file or directory (real path / WebDAV URL) into all track ids that
-// live under it. Used by batch sync-from-file / sync-to-file on folders.
-std::vector<int> tracksUnderPath(int root_id, const std::string &path) {
-  std::vector<int> ids;
-  repo::ScanRootRepo root_repo(db::mainSession());
-  auto root = root_repo.byId(root_id);
-  if (!root) {
-    return ids;
-  }
-  const std::string vpath = storage::toVirtual(*root, path);
-  db::Session &db = db::mainSession();
-  const auto rows = db.query("SELECT id FROM track WHERE root_id = ? AND "
-                             "(path = ? OR (path >= ? AND path < ?)) "
-                             "ORDER BY id",
-                             {static_cast<std::int64_t>(root_id), vpath,
-                              vpath + "/", vpath + "0"});
-  for (const auto &row : rows.rows) {
-    ids.push_back(static_cast<int>(intAt(row, 0)));
-  }
-  return ids;
-}
-
-std::vector<int> tracksUnderAlbum(int album_id) {
-  std::vector<int> ids;
-  const auto rows =
-      db::mainSession().query("SELECT id FROM track WHERE album_id = ? "
-                              "ORDER BY id",
-                              {static_cast<std::int64_t>(album_id)});
-  for (const auto &row : rows.rows) {
-    ids.push_back(static_cast<int>(intAt(row, 0)));
-  }
-  return ids;
-}
-
-std::vector<int> tracksUnderArtist(int artist_id) {
-  std::vector<int> ids;
-  const auto rows = db::mainSession().query(
-      "SELECT DISTINCT t.id FROM track t "
-      "JOIN album_artist aa ON aa.album_id = t.album_id "
-      "WHERE aa.artist_id = ? ORDER BY t.id",
-      {static_cast<std::int64_t>(artist_id)});
-  for (const auto &row : rows.rows) {
-    ids.push_back(static_cast<int>(intAt(row, 0)));
-  }
-  return ids;
-}
-
 Json::Value playlistSummaryJson(const playlist::Playlist &p) {
   Json::Value w;
   w["id"] = p.id;
@@ -929,6 +378,17 @@ struct RouteBuilder {
       }
     }
   }
+
+  // 异步 handler：void(req, callback, args...)。用于需要等存储服务的路由。
+  template <typename F> void async(F f) const {
+    for (const drogon::HttpMethod method : verbs) {
+      if (spec.regex) {
+        http_server::onPortRegexAsync(port, method, spec.pattern, f);
+      } else {
+        http_server::onPortAsync(port, method, spec.pattern, f);
+      }
+    }
+  }
 };
 
 } // namespace
@@ -936,8 +396,18 @@ struct RouteBuilder {
 #define MUSICD_ROUTE(app, url) RouteBuilder((cfg.port), (url))
 
 int main(int argc, char *argv[]) {
+  // --config 必须在加载配置之前解析；其余参数都是加载后的覆盖项。
+  std::string config_file = "config.json";
   try {
-    bootstrap();
+    for (int i = 1; i < argc; ++i) {
+      if (std::string(argv[i]) == "--config") {
+        if (i + 1 >= argc) {
+          throw std::runtime_error("--config 缺少参数值");
+        }
+        config_file = argv[++i];
+      }
+    }
+    bootstrap(config_file);
   } catch (const std::exception &e) {
     std::cerr << "[fatal] 启动失败: " << e.what() << std::endl;
     return 1;
@@ -952,7 +422,9 @@ int main(int argc, char *argv[]) {
         }
         return argv[++i];
       };
-      if (arg == "--port") {
+      if (arg == "--config") {
+        next("--config");  // 已在 bootstrap 前读取。
+      } else if (arg == "--port") {
         config::setPort(std::stoi(next("--port")));
       } else if (arg == "--jellyfin-port") {
         config::setJellyfinPort(std::stoi(next("--jellyfin-port")));
@@ -971,8 +443,9 @@ int main(int argc, char *argv[]) {
         config::setNeteaseUid(next("--netease-uid"));
       } else if (arg == "--help" || arg == "-h") {
         std::cout << "用法: musicd [选项]\n"
-                  << "  --port N               主服务端口 (默认 5666)\n"
-                  << "  --jellyfin-port N      Jellyfin 端口 (默认 8096)\n"
+                  << "  --config PATH          配置文件 (默认 config.json)\n"
+                  << "  --port N               主服务端口 (默认 5667)\n"
+                  << "  --jellyfin-port N      Jellyfin 端口 (默认 9000)\n"
                   << "  --jellyfin-enabled B   是否启用 Jellyfin (1/0)\n"
                   << "  --netease-enabled B    是否启用网易云库 (1/0)\n"
                   << "  --netease-api URL      api-enhanced 地址\n"
@@ -992,6 +465,22 @@ int main(int argc, char *argv[]) {
   }
 
   const auto &cfg = config::get();
+
+  // 本地库的字节来源：外部存储服务。其余库（网易云等）不走这条链路。
+  {
+    storage_client::Options storage;
+    storage.host = cfg.local.storage_host;
+    storage.port = cfg.local.storage_port;
+    storage.scheme = cfg.local.storage_scheme;
+    storage.token = cfg.local.storage_token;
+    storage.timeout_ms = cfg.local.storage_timeout_ms;
+    storage.max_concurrent = cfg.local.storage_max_concurrent;
+    storage.workers = cfg.local.storage_workers;
+    storage_client::initialize(storage);
+    std::cout << "[boot] storage=" << storage.scheme << "://" << storage.host
+              << ":" << storage.port << " workers=" << storage.workers
+              << std::endl;
+  }
 
   image_cache::Options cache_options;
   cache_options.enabled = cfg.image_cache.enabled;
@@ -1120,18 +609,23 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     return api_v1::track(req, ref);
   });
   MUSICD_ROUTE(app, "/api/v1/tracks/<string>/stream")
-      .methods(drogon::Get, drogon::Head)(
-          [](const http_server::RequestPtr &req, std::string ref) {
-            return api_v1::track_stream(req, ref);
-          });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req,
+                std::function<void(const http_server::ResponsePtr &)> callback,
+                std::string ref) {
+        api_v1::track_stream(req, ref, std::move(callback));
+      });
   MUSICD_ROUTE(app, "/api/v1/tracks/<string>/lyrics")([](const http_server::RequestPtr &req,
                                                        std::string ref) {
     return api_v1::track_lyrics(req, ref);
   });
-  MUSICD_ROUTE(app, "/api/v1/tracks/<string>/artwork")([](const http_server::RequestPtr &req,
-                                                        std::string ref) {
-    return api_v1::track_artwork(req, ref);
-  });
+  MUSICD_ROUTE(app, "/api/v1/tracks/<string>/artwork")
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req,
+                std::function<void(const http_server::ResponsePtr &)> callback,
+                std::string ref) {
+        api_v1::track_artwork(req, ref, std::move(callback));
+      });
   MUSICD_ROUTE(app, "/api/v1/albums/<string>")([](const http_server::RequestPtr &req,
                                                 std::string ref) {
     return api_v1::album(req, ref);
@@ -1421,17 +915,8 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                         static_cast<std::int64_t>(target)});
           }
           if (body.isMember("cover_path")) {
-            std::string cover_value = body["cover_path"].asString();
-            if (!cover_value.empty()) {
-              repo::ScanRootRepo cover_roots(db::mainSession());
-              for (const auto &r : cover_roots.list()) {
-                const std::string v = storage::toVirtual(r, cover_value);
-                if (v != cover_value) {
-                  cover_value = v;
-                  break;
-                }
-              }
-            }
+            // 仅记录外部写入方给出的路径，本进程不再读取它。
+            const std::string cover_value = body["cover_path"].asString();
             db.execute(schema::sql::kAlbumUpdateCover,
                        {cover_value, static_cast<std::int64_t>(target)});
           }
@@ -1579,163 +1064,6 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         return jsonResponse(200, "{\"status\":\"ok\"}");
       });
 
-  MUSICD_ROUTE(app, "/api/roots")([] {
-    repo::ScanRootRepo repo(db::mainSession());
-    auto roots = repo.list();
-    Json::Value out(Json::arrayValue);
-    int i = 0;
-    for (const auto &r : roots) {
-      out[i]["id"] = r.id;
-      out[i]["path"] = r.path;
-      out[i]["added_at"] = r.added_at;
-      out[i]["last_scan"] = r.last_scan;
-      out[i]["name"] = r.name;
-      out[i]["type"] = r.type;
-      ++i;
-    }
-    return jsonResponse(200, json_util::dump(out));
-  });
-
-  MUSICD_ROUTE(app, "/api/roots")
-      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
-        const Json::Value json = json_util::parseOrNull(req->body());
-        if (json.isNull() || !json.isMember("path")) {
-          return jsonResponse(400, "{\"erro\":true}");
-        }
-        repo::ScanRootRepo repo(db::mainSession());
-        const std::string path = json["path"].asString();
-        const std::string user =
-            json.isMember("user") ? std::string(json["user"].asString()) : std::string();
-        const std::string pass =
-            json.isMember("pass") ? std::string(json["pass"].asString()) : std::string();
-        std::string name =
-            json.isMember("name") ? std::string(json["name"].asString()) : std::string();
-        if (name.empty()) {
-          name = deriveRootName(path);
-        }
-        std::string type =
-            json.isMember("type") ? std::string(json["type"].asString()) : std::string();
-        if (type.empty()) {
-          type = rootTypeOf(path);
-        }
-        int id = repo.add(path, user, pass, name, type);
-        Json::Value out;
-        out["id"] = id;
-        return jsonResponse(200, json_util::dump(out));
-      });
-
-  MUSICD_ROUTE(app, "/api/roots/<int>")
-      .methods(drogon::Delete)([](int id) {
-        repo::ScanRootRepo repo(db::mainSession());
-        if (!repo.byId(id)) {
-          return jsonResponse(404, "{\"erro\":true}");
-        }
-        db::Session &db = db::mainSession();
-        int removed = 0;
-        try {
-          removed = static_cast<int>(
-              db.execute("DELETE FROM track WHERE root_id = ?",
-                         {static_cast<std::int64_t>(id)}));
-          repo.remove(id);
-          db.exec("DELETE FROM album WHERE id NOT IN "
-                  "(SELECT DISTINCT album_id FROM track WHERE album_id IS NOT NULL)");
-          db.exec("DELETE FROM artist WHERE id NOT IN "
-                  "(SELECT DISTINCT artist_id FROM track_artist) AND id NOT IN "
-                  "(SELECT DISTINCT artist_id FROM album_artist)");
-        } catch (const std::exception &) {
-          return jsonResponse(500, "{\"erro\":true}");
-        }
-        Json::Value out;
-        out["status"] = "ok";
-        out["tracks_removed"] = removed;
-        return jsonResponse(200, json_util::dump(out));
-      });
-
-  MUSICD_ROUTE(app, "/api/scan")
-      .methods(drogon::Post)([](const http_server::RequestPtr &) {
-        const int job_id = scanner::enqueueJob(
-            "scan-all", [] { scanner::scanAllBlocking(); });
-        Json::Value out;
-        out["status"] = "queued";
-        out["jobId"] = job_id;
-        return jsonResponse(202, json_util::dump(out));
-      });
-
-  MUSICD_ROUTE(app, "/api/scan/status")([] {
-    const auto p = scanner::status();
-    Json::Value out;
-    out["scanning"] = p.scanning;
-    out["total_roots"] = p.total_roots;
-    out["current_root_index"] = p.current_root_index;
-    out["roots"] = Json::Value(Json::arrayValue);
-    for (size_t i = 0; i < p.roots.size(); ++i) {
-      const auto &r = p.roots[i];
-      out["roots"][static_cast<Json::ArrayIndex>(i)]["id"] = r.id;
-      out["roots"][static_cast<Json::ArrayIndex>(i)]["path"] = r.path;
-      out["roots"][static_cast<Json::ArrayIndex>(i)]["scanning"] = r.scanning;
-      out["roots"][static_cast<Json::ArrayIndex>(i)]["files_processed"] = r.files_processed;
-      out["roots"][static_cast<Json::ArrayIndex>(i)]["files_added"] = r.files_added;
-      out["roots"][static_cast<Json::ArrayIndex>(i)]["files_updated"] = r.files_updated;
-      out["roots"][static_cast<Json::ArrayIndex>(i)]["files_removed"] = r.files_removed;
-      out["roots"][static_cast<Json::ArrayIndex>(i)]["errors"] = r.errors;
-      out["roots"][static_cast<Json::ArrayIndex>(i)]["current_file"] = r.current_file;
-    }
-    return jsonResponse(200, json_util::dump(out));
-  });
-
-  MUSICD_ROUTE(app, "/api/jobs")([] {
-    const auto jobs = scanner::jobList();
-    Json::Value out(Json::arrayValue);
-    int i = 0;
-    for (const auto &j : jobs) {
-      Json::Value item;
-      item["id"] = j.id;
-      item["kind"] = j.kind;
-      item["state"] = j.state;
-      item["processed"] = j.processed;
-      item["added"] = j.added;
-      item["updated"] = j.updated;
-      item["removed"] = j.removed;
-      item["errors"] = j.errors;
-      item["current"] = j.current;
-      item["threads"] = j.threads;
-      Json::Value paths(Json::arrayValue);
-      for (const auto &p : j.current_paths) {
-        paths.append(p);
-      }
-      item["current_paths"] = std::move(paths);
-      item["error"] = j.error;
-      out[i] = std::move(item);
-      ++i;
-    }
-    return jsonResponse(200, json_util::dump(out));
-  });
-
-  MUSICD_ROUTE(app, "/api/jobs/<int>")([](int id) {
-    const auto j = scanner::jobStatus(id);
-    if (j.id == 0) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    Json::Value out;
-    out["id"] = j.id;
-    out["kind"] = j.kind;
-    out["state"] = j.state;
-    out["processed"] = j.processed;
-    out["added"] = j.added;
-    out["updated"] = j.updated;
-    out["removed"] = j.removed;
-    out["errors"] = j.errors;
-    out["current"] = j.current;
-    out["threads"] = j.threads;
-    Json::Value paths(Json::arrayValue);
-    for (const auto &p : j.current_paths) {
-      paths.append(p);
-    }
-    out["current_paths"] = std::move(paths);
-    out["error"] = j.error;
-    return jsonResponse(200, json_util::dump(out));
-  });
-
   // TODO(legacy): 跨库聚合后由媒体库层直接提供最近播放列表。
   MUSICD_ROUTE(app, "/api/recent")([] {
     media_library::CatalogSnapshot snap;
@@ -1758,32 +1086,37 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
   });
 
   MUSICD_ROUTE(app, "/api/album/<string>/cover")
-      .methods(drogon::Get, drogon::Head)(
-          [](const http_server::RequestPtr &req, std::string id_text) {
-            const std::optional<media_library::SourceRef> ref =
-                api_ref(id_text, media_library::EntityType::Album);
-            if (!ref.has_value()) {
-              return jsonResponse(404, "{\"erro\":true}");
-            }
-            media_library::ArtworkRef artwork;
-            artwork.owner = *ref;
-            return stream_http::serve_artwork(
-                req, artwork, req->method() == drogon::Head);
-          });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req,
+                std::function<void(const http_server::ResponsePtr &)> callback,
+                std::string id_text) {
+        const std::optional<media_library::SourceRef> ref =
+            api_ref(id_text, media_library::EntityType::Album);
+        if (!ref.has_value()) {
+          callback(jsonResponse(404, "{\"erro\":true}"));
+          return;
+        }
+        media_library::ArtworkRef artwork;
+        artwork.owner = *ref;
+        stream_http::serve_artwork_async(
+            req, artwork, req->isHead(), std::move(callback));
+      });
 
   MUSICD_ROUTE(app, "/api/track/<int>/file")
-      .methods(drogon::Get, drogon::Head)(
-          [](const http_server::RequestPtr &req, int id) {
-            // TODO(legacy): 对外 id 仍是库内 int；改走 SourceRef 后这条路由可删除。
-            const auto ref = media_library::compat_ref_for(
-                media_library::EntityType::Track, id);
-            if (!ref) {
-              return jsonResponse(404, "{\"erro\":true}");
-            }
-            // 选源交给 MediaRouter（经 PlaybackService），locator 不再出现在 HTTP 层。
-            return stream_http::serve_track(
-                req, *ref, req->method() == drogon::Head);
-          });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req,
+                std::function<void(const http_server::ResponsePtr &)> callback,
+                int id) {
+        // TODO(legacy): 对外 id 仍是库内 int；改走 SourceRef 后这条路由可删除。
+        const auto ref = media_library::compat_ref_for(
+            media_library::EntityType::Track, id);
+        if (!ref) {
+          callback(jsonResponse(404, "{\"erro\":true}"));
+          return;
+        }
+        stream_http::serve_track_async(
+            req, *ref, req->isHead(), std::move(callback));
+      });
 
   MUSICD_ROUTE(app, "/api/track/<int>/play")
       .methods(drogon::Post)([](int id) {
@@ -1793,140 +1126,6 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         }
         return jsonResponse(404, "{\"erro\":true}");
       });
-
-  MUSICD_ROUTE(app, "/api/fs/browse/<int>")([](int root_id) {
-    return browseDir(root_id, "");
-  });
-
-  MUSICD_ROUTE(app, "/api/fs/browse/<int>/<path>")([](int root_id, std::string path) {
-    return browseDir(root_id, urlDecode(path));
-  });
-
-  MUSICD_ROUTE(app, "/api/fs/file-meta/<path>")([](std::string path) {
-    const std::string p = urlDecode(path);
-    if (!webdav::isWebdavUrl(p) && (!isUnderAnyRoot(p) || !fs::exists(p))) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    auto meta = metadata::readFileMeta(p);
-    if (!meta) {
-      return jsonResponse(500, "{\"erro\":true}");
-    }
-    Json::Value out;
-    out["title"] = meta->title;
-    out["artist"] = meta->artist;
-    out["album"] = meta->album;
-    out["genre"] = meta->genre;
-    out["year"] = meta->year;
-    out["comment"] = meta->comment;
-    out["track_no"] = meta->track_no;
-    out["disc_no"] = meta->disc_no;
-    out["size_bytes"] = static_cast<Json::Int64>(meta->size_bytes);
-    out["bitrate"] = meta->bitrate;
-    out["sample_rate"] = meta->sample_rate;
-    out["channels"] = meta->channels;
-    out["format"] = meta->format;
-    Json::Value artists(Json::arrayValue);
-    for (const auto &name : meta->artists) {
-      artists.append(name);
-    }
-    out["artists"] = artists;
-    Json::Value album_artists(Json::arrayValue);
-    for (const auto &name : meta->album_artists) {
-      album_artists.append(name);
-    }
-    out["album_artists"] = album_artists;
-    return jsonResponse(200, json_util::dump(out));
-  });
-
-  MUSICD_ROUTE(app, "/api/fs/orphans")([](const http_server::RequestPtr &req) {
-    try {
-      int root_id = 0;
-      std::string root_id_str = http_server::Query(req).getOr("rootId", "");
-      if (!root_id_str.empty()) {
-        root_id = std::stoi(root_id_str);
-      }
-      if (root_id <= 0) {
-        return jsonResponse(400, "{\"erro\":true}");
-      }
-
-      repo::ScanRootRepo root_repo(db::mainSession());
-      auto root_opt = root_repo.byId(root_id);
-      if (!root_opt) {
-        return jsonResponse(404, "{\"erro\":true}");
-      }
-
-      repo::TrackRepo track_repo(db::mainSession());
-      auto tracks = track_repo.byRootId(root_id);
-
-      Json::Value out(Json::arrayValue);
-      int i = 0;
-      for (const auto &t : tracks) {
-        if (!fs::exists(t.path)) {
-          out[i]["id"] = t.id;
-          out[i]["path"] = t.path;
-          out[i]["title"] = t.title;
-          out[i]["album_id"] = t.album_id;
-          Json::Value aids(Json::arrayValue);
-          for (const int aid : t.artist_ids) {
-            aids.append(aid);
-          }
-          out[i]["artist_ids"] = aids;
-          ++i;
-        }
-      }
-      return jsonResponse(200, json_util::dump(out));
-    } catch (...) {
-      return jsonResponse(500, "{\"erro\":true}");
-    }
-  });
-
-  MUSICD_ROUTE(app, "/api/track/<int>/file-meta")([](int id) {
-    // TODO(legacy): 直接读本地文件标签，只对本地库有意义。
-    const auto ref = media_library::compat_ref_for(
-        media_library::EntityType::Track, id);
-    if (!ref) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    const auto source = media_library::media_router().resolve_stream(*ref, {});
-    if (!source.ok() || source.value().value.internal_locator.empty()) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-    const std::string track_real = source.value().value.internal_locator;
-    if (!webdav::isWebdavUrl(track_real) && !fs::exists(track_real)) {
-      return jsonResponse(404, "{\"erro\":true}");
-    }
-
-    auto meta = metadata::readFileMeta(track_real);
-    if (!meta) {
-      return jsonResponse(500, "{\"erro\":true}");
-    }
-
-    Json::Value out;
-    out["title"] = meta->title;
-    out["artist"] = meta->artist;
-    out["album"] = meta->album;
-    out["genre"] = meta->genre;
-    out["year"] = meta->year;
-    out["comment"] = meta->comment;
-    out["track_no"] = meta->track_no;
-    out["disc_no"] = meta->disc_no;
-    out["size_bytes"] = static_cast<Json::Int64>(meta->size_bytes);
-    out["bitrate"] = meta->bitrate;
-    out["sample_rate"] = meta->sample_rate;
-    out["channels"] = meta->channels;
-    out["format"] = meta->format;
-    Json::Value artists(Json::arrayValue);
-    for (const auto &name : meta->artists) {
-      artists.append(name);
-    }
-    out["artists"] = artists;
-    Json::Value album_artists(Json::arrayValue);
-    for (const auto &name : meta->album_artists) {
-      album_artists.append(name);
-    }
-    out["album_artists"] = album_artists;
-    return jsonResponse(200, json_util::dump(out));
-  });
 
   MUSICD_ROUTE(app, "/api/track/<string>/lyrics")([](std::string id_text) {
     const std::optional<media_library::SourceRef> ref =
@@ -1982,70 +1181,6 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                           metadata::isSyncedLyrics(text) ? 1 : 0)});
         }
         return jsonResponse(200, "{\"status\":\"ok\"}");
-      });
-
-  MUSICD_ROUTE(app, "/api/scan/dir")
-      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
-        const Json::Value json = json_util::parseOrNull(req->body());
-        if (json.isNull() || !json.isMember("rootId") || !json.isMember("path")) {
-          return jsonResponse(400, "{\"erro\":true}");
-        }
-        int root_id = json["rootId"].asInt64();
-        std::string dir_path = json["path"].asString();
-
-        repo::ScanRootRepo root_repo(db::mainSession());
-        auto root_opt = root_repo.byId(root_id);
-        if (!root_opt) {
-          return jsonResponse(404, "{\"erro\":true}");
-        }
-
-        std::string target = dir_path;
-        if (!webdav::isWebdavUrl(dir_path) &&
-            !webdav::isWebdavUrl(root_opt->path)) {
-          std::error_code ec;
-          fs::path full_path = fs::weakly_canonical(root_opt->path) / dir_path;
-          if (!fs::is_directory(full_path, ec) &&
-              !fs::is_regular_file(full_path, ec)) {
-            return jsonResponse(400, "{\"erro\":true}");
-          }
-          target = full_path.string();
-        }
-
-        const int job_id = scanner::enqueueJob(
-            "scan-dir",
-            [root_id, target] { scanner::scanDir(root_id, target); });
-        Json::Value out;
-        out["status"] = "queued";
-        out["jobId"] = job_id;
-        return jsonResponse(202, json_util::dump(out));
-      });
-
-  MUSICD_ROUTE(app, "/api/track/<int>/sync-from-file")
-      .methods(drogon::Post)([](int id) {
-        repo::TrackRepo track_repo(db::mainSession());
-        if (!track_repo.byId(id)) {
-          return jsonResponse(404, "{\"erro\":true}");
-        }
-        const int job_id = scanner::enqueueJob(
-            "sync-from-file", [id] { syncFromFileById(id); });
-        Json::Value out;
-        out["status"] = "queued";
-        out["jobId"] = job_id;
-        return jsonResponse(202, json_util::dump(out));
-      });
-
-  MUSICD_ROUTE(app, "/api/track/<int>/sync-to-file")
-      .methods(drogon::Post)([](int id) {
-        repo::TrackRepo track_repo(db::mainSession());
-        if (!track_repo.byId(id)) {
-          return jsonResponse(404, "{\"erro\":true}");
-        }
-        const int job_id = scanner::enqueueJob(
-            "sync-to-file", [id] { syncToFileById(id); });
-        Json::Value out;
-        out["status"] = "queued";
-        out["jobId"] = job_id;
-        return jsonResponse(202, json_util::dump(out));
       });
 
   MUSICD_ROUTE(app, "/api/track/<int>/update")
@@ -2166,306 +1301,6 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         return jsonResponse(200, "{\"status\":\"ok\"}");
       });
 
-  MUSICD_ROUTE(app, "/api/fs/batch")
-      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
-        const Json::Value json = json_util::parseOrNull(req->body());
-        if (json.isNull()) {
-          return jsonResponse(400, "{\"erro\":true}");
-        }
-        const bool is_list = json.isArray();
-        if (!is_list) {
-          return jsonResponse(400, "{\"erro\":true}");
-        }
-
-        Json::Value result(Json::arrayValue);
-        std::map<int, std::vector<std::string>> scan_paths_by_root;
-        std::map<int, std::vector<int>> scan_indices_by_root;
-        std::vector<int> sync_from_ids;
-        std::vector<int> sync_from_indices;
-        std::vector<int> sync_to_ids;
-        std::vector<int> sync_to_indices;
-        const auto collectTrackIds = [](const Json::Value &item,
-                                        std::vector<int> &out) {
-          if (item.isMember("trackId")) {
-            out.push_back(item["trackId"].asInt64());
-            return;
-          }
-          if (item.isMember("albumId")) {
-            for (const int id : tracksUnderAlbum(item["albumId"].asInt64())) {
-              out.push_back(id);
-            }
-            return;
-          }
-          if (item.isMember("artistId")) {
-            for (const int id : tracksUnderArtist(item["artistId"].asInt64())) {
-              out.push_back(id);
-            }
-            return;
-          }
-          if (item.isMember("path")) {
-            const int root_id = item["rootId"].asInt64();
-            for (const int id : tracksUnderPath(root_id, item["path"].asString())) {
-              out.push_back(id);
-            }
-          }
-        };
-        int i = 0;
-        for (const auto &item : json) {
-          std::string action = item["action"].asString();
-          if (action == "scan") {
-            const int root_id = item["rootId"].asInt64();
-            scan_paths_by_root[root_id].push_back(item["path"].asString());
-            scan_indices_by_root[root_id].push_back(i);
-          } else if (action == "sync-from-file") {
-            collectTrackIds(item, sync_from_ids);
-            sync_from_indices.push_back(i);
-          } else if (action == "sync-to-file") {
-            collectTrackIds(item, sync_to_ids);
-            sync_to_indices.push_back(i);
-          } else if (action == "update") {
-            int track_id = item["trackId"].asInt64();
-            auto fields = item["fields"];
-            repo::TrackRepo track_repo(db::mainSession());
-            auto track = track_repo.byId(track_id);
-            if (track) {
-              repo::Track t = *track;
-              if (fields.isMember("title")) {
-                t.title = fields["title"].asString();
-              }
-              db::Session &db = db::mainSession();
-              repo::ArtistRepo artist_repo(db::mainSession());
-              repo::AlbumRepo album_repo(db::mainSession());
-              std::vector<std::string> artist_names;
-              if (fields.isMember("artist")) {
-                artist_names = metadata::splitArtists(fields["artist"].asString());
-              }
-              std::vector<std::string> album_artist_names;
-              if (fields.isMember("album_artist")) {
-                album_artist_names =
-                    metadata::splitArtists(fields["album_artist"].asString());
-              } else if (!artist_names.empty()) {
-                album_artist_names = artist_names;
-              }
-              std::string album_name;
-              if (fields.isMember("album")) {
-                album_name = fields["album"].asString();
-              }
-              if (!artist_names.empty()) {
-                setTrackArtists(db, track_id, ensureArtistIds(db, artist_names));
-              }
-              if (fields.isMember("album") || fields.isMember("album_artist")) {
-                if (album_name.empty() && t.album_id > 0) {
-                  if (auto a = album_repo.byId(t.album_id)) {
-                    album_name = a->name;
-                  }
-                }
-                if (album_artist_names.empty() && t.album_id > 0) {
-                  for (const int aid :
-                       album_repo.artistIdsByAlbumId(t.album_id)) {
-                    if (auto a = artist_repo.byId(aid)) {
-                      album_artist_names.push_back(a->name);
-                    }
-                  }
-                }
-                const int album_id = ensureAlbumId(
-                    db, album_name, artistKeyOf(album_artist_names));
-                if (album_id != 0) {
-                  t.album_id = album_id;
-                  setAlbumArtists(db, album_id,
-                                  ensureArtistIds(db, album_artist_names));
-                }
-              }
-              if (fields.isMember("disc_no")) {
-                t.disc_no = fields["disc_no"].asInt64();
-              }
-              if (fields.isMember("track_no")) {
-                t.track_no = fields["track_no"].asInt64();
-              }
-              if (fields.isMember("duration_ms")) {
-                t.duration_ms = fields["duration_ms"].asInt64();
-              }
-              if (fields.isMember("bitrate")) {
-                t.bitrate = fields["bitrate"].asInt64();
-              }
-              if (fields.isMember("sample_rate")) {
-                t.sample_rate = fields["sample_rate"].asInt64();
-              }
-              if (fields.isMember("channels")) {
-                t.channels = fields["channels"].asInt64();
-              }
-              if (fields.isMember("format")) {
-                t.format = fields["format"].asString();
-              }
-              if (fields.isMember("size_bytes")) {
-                t.size_bytes = fields["size_bytes"].asInt64();
-              }
-              if (fields.isMember("mtime")) {
-                t.mtime = fields["mtime"].asInt64();
-              }
-              if (fields.isMember("rating")) {
-                t.rating = fields["rating"].asInt64();
-              }
-              track_repo.updatePartial(t);
-              result[i]["status"] = "ok";
-            } else {
-              result[i]["status"] = "error";
-              result[i]["error"] = "track not found";
-            }
-          } else if (action == "delete-index") {
-            if (item.isMember("trackId") || item.isMember("albumId") ||
-                item.isMember("artistId")) {
-              db::Session &db = db::mainSession();
-              int removed = 0;
-              try {
-                if (item.isMember("trackId")) {
-                  removed = static_cast<int>(
-                      db.execute("DELETE FROM track WHERE id = ?",
-                                 {static_cast<std::int64_t>(
-                                     item["trackId"].asInt64())}));
-                } else if (item.isMember("albumId")) {
-                  removed = static_cast<int>(
-                      db.execute("DELETE FROM track WHERE album_id = ?",
-                                 {static_cast<std::int64_t>(
-                                     item["albumId"].asInt64())}));
-                } else {
-                  removed = static_cast<int>(db.execute(
-                      "DELETE FROM track WHERE album_id IN "
-                      "(SELECT album_id FROM album_artist WHERE artist_id = ?)",
-                      {static_cast<std::int64_t>(item["artistId"].asInt64())}));
-                }
-                db.exec("DELETE FROM album WHERE id NOT IN (SELECT DISTINCT "
-                        "album_id FROM track WHERE album_id IS NOT NULL)");
-                db.exec("DELETE FROM artist WHERE id NOT IN (SELECT DISTINCT "
-                        "artist_id FROM track_artist) AND id NOT IN "
-                        "(SELECT DISTINCT artist_id FROM album_artist)");
-                result[i]["status"] = "ok";
-                result[i]["tracks_removed"] = removed;
-              } catch (...) {
-                result[i]["status"] = "error";
-                result[i]["error"] = "delete failed";
-              }
-              ++i;
-              continue;
-            }
-            int root_id = item["rootId"].asInt64();
-            std::string path = item["path"].asString();
-            try {
-              repo::ScanRootRepo root_repo(db::mainSession());
-              auto root_opt = root_repo.byId(root_id);
-              if (!root_opt) {
-                result[i]["status"] = "error";
-                result[i]["error"] = "root not found";
-              } else {
-                std::error_code ec;
-                const bool is_webdav = webdav::isWebdavUrl(path);
-                std::string target;
-                std::string root_canon;
-                bool inside = false;
-                if (is_webdav) {
-                  target = path;
-                  webdav::Url target_url;
-                  webdav::Url root_url;
-                  if (webdav::parseUrl(path, target_url) &&
-                      webdav::parseUrl(root_opt->path, root_url)) {
-                    std::string target_path = urlDecode(target_url.path);
-                    std::string root_path = urlDecode(root_url.path);
-                    while (root_path.size() > 1 && root_path.back() == '/') {
-                      root_path.pop_back();
-                    }
-                    inside = target_url.https == root_url.https &&
-                             target_url.host == root_url.host &&
-                             target_url.port == root_url.port &&
-                             target_path.rfind(root_path, 0) == 0;
-                  }
-                } else {
-                  const fs::path canonical = fs::weakly_canonical(path, ec);
-                  target = ec ? path : canonical.string();
-                  const fs::path root_canonical =
-                      fs::weakly_canonical(root_opt->path, ec);
-                  root_canon =
-                      ec ? root_opt->path : root_canonical.string();
-                  inside = target.rfind(root_canon, 0) == 0;
-                }
-                if (!inside) {
-                  result[i]["status"] = "error";
-                  result[i]["error"] = "outside root";
-                } else {
-                  db::Session &db = db::mainSession();
-                  const std::string vtarget =
-                      storage::toVirtual(*root_opt, target);
-                  const bool is_dir =
-                      item.isMember("isDir") ? item["isDir"].asBool()
-                                        : fs::is_directory(target, ec);
-                  int removed = 0;
-                  if (is_dir) {
-                    removed = static_cast<int>(db.execute(
-                        "DELETE FROM track WHERE root_id = ? AND (path = ? "
-                        "OR (path >= ? AND path < ?))",
-                        {static_cast<std::int64_t>(root_id), vtarget,
-                         vtarget + "/", vtarget + "0"}));
-                  } else {
-                    removed = static_cast<int>(db.execute(
-                        "DELETE FROM track WHERE path = ?", {vtarget}));
-                  }
-                  db.exec("DELETE FROM album WHERE id NOT IN (SELECT "
-                          "DISTINCT album_id FROM track WHERE album_id IS NOT "
-                          "NULL)");
-                  result[i]["status"] = "ok";
-                  result[i]["tracks_removed"] = removed;
-                }
-              }
-            } catch (...) {
-              result[i]["status"] = "error";
-              result[i]["error"] = "delete failed";
-            }
-          } else {
-            result[i]["status"] = "error";
-            result[i]["error"] = "unknown action";
-          }
-          ++i;
-        }
-
-        // One import task -> one job. All selected paths of a root are scanned
-        // by a single job that runs the scan multi-threaded internally; jobs
-        // themselves execute one at a time.
-        for (auto &kv : scan_paths_by_root) {
-          const int root_id = kv.first;
-          const std::vector<std::string> paths = kv.second;
-          const int job_id = scanner::enqueueJob("scan", [root_id, paths] {
-            scanner::scanDirBatch(root_id, paths);
-          });
-          for (const int idx : scan_indices_by_root[root_id]) {
-            result[idx]["status"] = "queued";
-            result[idx]["jobId"] = job_id;
-          }
-        }
-        if (!sync_from_ids.empty()) {
-          const std::vector<int> ids = sync_from_ids;
-          const int job_id = scanner::enqueueJob("sync-from-file", [ids] {
-            runIdsParallel(ids, [](int id, int slot) {
-              syncFromFileById(id, slot);
-            });
-          });
-          for (const int idx : sync_from_indices) {
-            result[idx]["status"] = "queued";
-            result[idx]["jobId"] = job_id;
-          }
-        }
-        if (!sync_to_ids.empty()) {
-          const std::vector<int> ids = sync_to_ids;
-          const int job_id = scanner::enqueueJob("sync-to-file", [ids] {
-            runIdsParallel(ids, [](int id, int slot) {
-              syncToFileById(id, slot);
-            });
-          });
-          for (const int idx : sync_to_indices) {
-            result[idx]["status"] = "queued";
-            result[idx]["jobId"] = job_id;
-          }
-        }
-        return jsonResponse(200, json_util::dump(result));
-      });
-
   std::cout << "[boot] 生效端口 主=" << cfg.port << " Jellyfin="
             << (cfg.jellyfin_enabled ? std::to_string(cfg.jellyfin_port)
                                      : std::string("off"))
@@ -2497,6 +1332,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   drogon::app().run();
 
+  storage_client::shutdown();
   media_library::shutdown_media_runtime();
   media_library::shutdown_library();
   image_cache::shutdown();

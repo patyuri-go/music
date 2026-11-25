@@ -3,13 +3,16 @@
 #include "http_util.h"
 #include "json_util.h"
 #include "media_library/media_runtime.h"
+#include "storage_client.h"
 
 #include <json/json.h>
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace stream_http {
@@ -80,6 +83,15 @@ Json::Value error_json(const Error &error) {
 
 std::shared_ptr<PlaybackService> playback() {
   return media_library::playback_service_ptr();
+}
+
+// 远端库仍是同步实现（打开上游连接后返回流式响应）。放到独立线程执行，
+// 避免阻塞 Drogon 的 IO 线程；callback 由 Drogon 保证可以从任意线程调用。
+void run_off_loop(std::function<ResponsePtr()> work, AsyncCallback callback) {
+  std::thread([work = std::move(work),
+               callback = std::move(callback)]() mutable {
+    callback(work());
+  }).detach();
 }
 
 ResponsePtr rangeNotSatisfiable(std::int64_t size) {
@@ -304,6 +316,61 @@ ResponsePtr serve_artwork(const RequestPtr &req,
   }
   res->addHeader("Cache-Control", "public, max-age=3600");
   return res;
+}
+
+void serve_track_async(const RequestPtr &req,
+                       const media_library::TrackRef &track, bool head_only,
+                       AsyncCallback callback) {
+  const auto internal_id = media_library::compat_internal_id_of(track);
+  if (internal_id.has_value()) {
+    // 本地库：唯一合法来源是存储服务；entity_id 缺失视为硬失败，
+    // 不回退到任何本地路径（见 document/STORAGE_PROXY_DECISIONS.md）。
+    const auto entity_id = media_library::compat_entity_id(
+        media_library::EntityType::Track, *internal_id);
+    if (!entity_id.has_value()) {
+      callback(error_response(Error::make(
+          ErrorCode::NotFound, "track has no entity id")));
+      return;
+    }
+    if (!storage_client::enabled()) {
+      callback(error_response(Error::make(
+          ErrorCode::ProviderUnavailable, "storage service is not configured")));
+      return;
+    }
+    storage_client::serve_content(req, *entity_id, false, head_only,
+                                  std::move(callback));
+    return;
+  }
+  run_off_loop([req, track, head_only] {
+    return serve_track(req, track, head_only);
+  }, std::move(callback));
+}
+
+void serve_artwork_async(const RequestPtr &req,
+                         const media_library::ArtworkRef &artwork,
+                         bool head_only, AsyncCallback callback) {
+  const auto internal_id =
+      media_library::compat_internal_id_of(artwork.owner);
+  if (internal_id.has_value()) {
+    const auto entity_id =
+        media_library::compat_artwork_entity_id(artwork.owner);
+    if (!entity_id.has_value()) {
+      callback(error_response(Error::make(
+          ErrorCode::NotFound, "album has no entity id")));
+      return;
+    }
+    if (!storage_client::enabled()) {
+      callback(error_response(Error::make(
+          ErrorCode::ProviderUnavailable, "storage service is not configured")));
+      return;
+    }
+    storage_client::serve_content(req, *entity_id, true, head_only,
+                                  std::move(callback));
+    return;
+  }
+  run_off_loop([req, artwork, head_only] {
+    return serve_artwork(req, artwork, head_only);
+  }, std::move(callback));
 }
 
 } // namespace stream_http

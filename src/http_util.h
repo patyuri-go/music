@@ -20,14 +20,6 @@ std::pair<std::streamoff, std::streamoff>
 parseRange(const std::string &range_header, std::streamoff file_size);
 ResponsePtr serveFile(const fs::path &path, const std::string &req_range);
 
-/// 本地路径或 http(s) WebDAV URL 统一读取；URL 走远端 Range 透传代理。
-ResponsePtr serveResource(const std::string &location,
-                          const std::string &req_range);
-
-/// 图片专用：按虚拟路径读取，优先走图片缓存；未命中回退到流式转发。
-ResponsePtr serveImage(const std::string &virtual_path,
-                       const std::string &variant = "original");
-
 } // namespace http_util
 
 #endif

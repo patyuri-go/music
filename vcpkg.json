@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "本地优先的音乐库服务",
   "dependencies": [
-    "asio",
+    "curl",
     "drogon",
     "fmt",
     "libpq",

@@ -98,6 +98,8 @@ std::string drogonPath(const std::string &raw_path) {
 // Jellyfin 路由声明助手：保留「路径 + .methods(...) + lambda」的写法，
 // 内部翻译成 Drogon 注册。Drogon 的路径正则本身 icase，
 // 所以不需要再额外注册小写形态（参数值也不会被改写）。
+using AsyncCallback = std::function<void(const http_server::ResponsePtr &)>;
+
 struct RouteBuilder {
   int port;
   std::string path;
@@ -113,6 +115,13 @@ struct RouteBuilder {
   template <typename F> void operator()(F f) const {
     for (const drogon::HttpMethod method : verbs) {
       http_server::onPort(port, method, path, f);
+    }
+  }
+
+  // 异步 handler：void(req, callback, args...)。
+  template <typename F> void async(F f) const {
+    for (const drogon::HttpMethod method : verbs) {
+      http_server::onPortAsync(port, method, path, f);
     }
   }
 };
@@ -651,8 +660,9 @@ http_server::ResponsePtr handleItem(const std::string &idstr) {
 }
 
 // 封面字节统一从 ArtworkService 出：选源交给 MediaRouter，locator 不外泄。
-http_server::ResponsePtr handleImage(const http_server::RequestPtr &req, const std::string &idstr) {
-  const bool head_only = req->method() == drogon::Head;
+void handleImage(const http_server::RequestPtr &req, const std::string &idstr,
+                 AsyncCallback callback) {
+  const bool head_only = req->isHead();
 
   // 歌单没有独立的封面实体（封面属于专辑），路由器不提供该能力：歌单 id 走到
   // 下面的 parse_path_ref 后自然 404，不做本地特例实现。
@@ -662,25 +672,28 @@ http_server::ResponsePtr handleImage(const http_server::RequestPtr &req, const s
        ref->entity_type != media_library::EntityType::Album &&
        ref->entity_type != media_library::EntityType::Artist &&
        ref->entity_type != media_library::EntityType::AlbumArtist)) {
-    return http_util::jsonResponse(404, "{}");
+    callback(http_util::jsonResponse(404, "{}"));
+    return;
   }
   media_library::ArtworkRef artwork;
   artwork.owner = ref->entity_type == media_library::EntityType::AlbumArtist
                       ? media_library::as_artist_ref(*ref)
                       : *ref;
-  return stream_http::serve_artwork(req, artwork, head_only);
+  stream_http::serve_artwork_async(req, artwork, head_only,
+                                   std::move(callback));
 }
 
-http_server::ResponsePtr handleStream(const http_server::RequestPtr &req,
-                            const std::string &idstr) {
+void handleStream(const http_server::RequestPtr &req, const std::string &idstr,
+                  AsyncCallback callback) {
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
       ref->entity_type != media_library::EntityType::Track) {
-    return http_util::jsonResponse(404, "{}");
+    callback(http_util::jsonResponse(404, "{}"));
+    return;
   }
-  // 音频字节统一从播放会话出：选源交给 MediaRouter，locator 不外泄。
-  return stream_http::serve_track(req, *ref,
-                                  req->method() == drogon::Head);
+  // 音频字节：本地库按实体 id 直连存储服务，远端库沿用同步路径。
+  stream_http::serve_track_async(req, *ref, req->isHead(),
+                                 std::move(callback));
 }
 
 // 字符个数（按码点计）。Jellyfin 的 Cue.Position 是 Text 里的下标，
@@ -959,14 +972,14 @@ http_server::ResponsePtr handlePlaybackInfo(const http_server::RequestPtr &,
 }
 
 // 仅支持 Primary 图片，其它图片类型返回 404。
-http_server::ResponsePtr handleImageType(const http_server::RequestPtr &req,
-                               const std::string &idstr,
-                               const std::string &imageType,
-                               const std::string &) {
+void handleImageType(const http_server::RequestPtr &req,
+                     const std::string &idstr, const std::string &imageType,
+                     const std::string &, AsyncCallback callback) {
   if (lower(imageType) != "primary") {
-    return http_util::jsonResponse(404, "{}");
+    callback(http_util::jsonResponse(404, "{}"));
+    return;
   }
-  return handleImage(req, idstr);
+  handleImage(req, idstr, std::move(callback));
 }
 
 // 相似条目：同专辑 + 同流派的其它曲目。
@@ -977,16 +990,17 @@ http_server::ResponsePtr handleSimilar(const std::string &idstr) {
 }
 
 // 下载原始文件（与 /Items/<id>/File 同义）。
-http_server::ResponsePtr handleDownload(const http_server::RequestPtr &req,
-                              const std::string &idstr) {
+void handleDownload(const http_server::RequestPtr &req,
+                    const std::string &idstr, AsyncCallback callback) {
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
       ref->entity_type != media_library::EntityType::Track) {
-    return http_util::jsonResponse(404, "{}");
+    callback(http_util::jsonResponse(404, "{}"));
+    return;
   }
-  // 下载与在线播放走同一条会话路径：字节来源一致，Range 语义一致。
-  return stream_http::serve_track(req, *ref,
-                                  req->method() == drogon::Head);
+  // 下载与在线播放走同一条路径：字节来源一致，Range 语义一致。
+  stream_http::serve_track_async(req, *ref, req->isHead(),
+                                 std::move(callback));
 }
 
 // 搜索建议：曲目 / 专辑 / 艺术家。
@@ -1241,24 +1255,31 @@ void mount(const config::Config &cfg) {
             return handlePlaybackInfo(req, itemId);
           });
   JF_ROUTE(app, "/Items/<string>/Images/<string>/<string>")
-  ([](const http_server::RequestPtr &req, std::string itemId, std::string imageType,
-      std::string imageIndex) {
-    return handleImageType(req, itemId, imageType, imageIndex);
-  });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req, AsyncCallback callback,
+                std::string itemId, std::string imageType,
+                std::string imageIndex) {
+        handleImageType(req, itemId, imageType, imageIndex,
+                        std::move(callback));
+      });
   JF_ROUTE(app, "/Items/<string>/Images/<string>")
-  ([](const http_server::RequestPtr &req, std::string itemId, std::string imageType) {
-    return handleImageType(req, itemId, imageType, "");
-  });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req, AsyncCallback callback,
+                std::string itemId, std::string imageType) {
+        handleImageType(req, itemId, imageType, "", std::move(callback));
+      });
   JF_ROUTE(app, "/Items/<string>/Download")
-      .methods(drogon::Get, drogon::Head)(
-          [](const http_server::RequestPtr &req, std::string itemId) {
-            return handleDownload(req, itemId);
-          });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req, AsyncCallback callback,
+                std::string itemId) {
+        handleDownload(req, itemId, std::move(callback));
+      });
   JF_ROUTE(app, "/Items/<string>/File")
-      .methods(drogon::Get, drogon::Head)(
-          [](const http_server::RequestPtr &req, std::string itemId) {
-            return handleDownload(req, itemId);
-          });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req, AsyncCallback callback,
+                std::string itemId) {
+        handleDownload(req, itemId, std::move(callback));
+      });
   JF_ROUTE(app, "/Items/<string>/Similar")
   ([](const http_server::RequestPtr &, std::string itemId) {
     return handleSimilar(itemId);
@@ -1280,10 +1301,11 @@ void mount(const config::Config &cfg) {
     return handleLyrics(itemId, req);
   });
   JF_ROUTE(app, "/Audio/<string>/<string>")
-      .methods(drogon::Get, drogon::Head)(
-          [](const http_server::RequestPtr &req, std::string itemId, std::string) {
-            return handleStream(req, itemId);
-          });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req, AsyncCallback callback,
+                std::string itemId, std::string) {
+        handleStream(req, itemId, std::move(callback));
+      });
 
   // 艺术家/流派
   JF_ROUTE(app, "/Artists")
@@ -1291,9 +1313,11 @@ void mount(const config::Config &cfg) {
   JF_ROUTE(app, "/Artists/AlbumArtists")
   ([](const http_server::RequestPtr &req) { return handleArtists(req, true); });
   JF_ROUTE(app, "/Artists/<string>/Images/<string>")
-  ([](const http_server::RequestPtr &req, std::string name, std::string imageType) {
-    return handleImageType(req, name, imageType, "");
-  });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req, AsyncCallback callback,
+                std::string name, std::string imageType) {
+        handleImageType(req, name, imageType, "", std::move(callback));
+      });
   JF_ROUTE(app, "/Artists/<string>/Similar")
   ([](const http_server::RequestPtr &, std::string name) {
     return handleArtistSimilar(name);

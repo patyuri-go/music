@@ -1,24 +1,19 @@
-// 播放列表接口测试（C++，走真实 HTTP）。
-// 用法：先启动 musicd（主 5666 / Jellyfin 9000），再运行本程序。
+// 播放列表接口测试（夹具驱动，走真实 HTTP）。
 //
-//   ./playlist_test            # 默认 127.0.0.1:5666 / :9000
-//   ./playlist_test <host> <port> <jellyfin_port>
+// 用法：./playlist_test [host] [port] [jellyfin_port]
+//       默认 127.0.0.1:5667 / :9000
 //
 // 退出码：0 表示全部通过，非 0 表示有失败。
+// 依赖 test_fixture seed 导出的 FIXTURE_TRACK_ROLE_ID / FIXTURE_ALBUM_ID。
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "test_http.h"
+
+#include "fixture_ids.h"
 
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
-#include <map>
-#include <sstream>
 #include <string>
-#include <vector>
 
 #include <json/json.h>
 
@@ -26,65 +21,7 @@
 
 namespace {
 
-struct HttpResponse {
-  int status = 0;
-  std::string body;
-};
-
-HttpResponse httpRequest(const std::string &host, int port,
-                         const std::string &method, const std::string &path,
-                         const std::string &body = std::string()) {
-  HttpResponse resp;
-  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) {
-    return resp;
-  }
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(port));
-  ::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-    ::close(fd);
-    return resp;
-  }
-  std::ostringstream req;
-  req << method << " " << path << " HTTP/1.1\r\n";
-  req << "Host: " << host << ":" << port << "\r\n";
-  req << "Connection: close\r\n";
-  if (!body.empty()) {
-    req << "Content-Length: " << body.size() << "\r\n";
-    req << "Content-Type: application/json\r\n";
-  }
-  req << "\r\n" << body;
-  const std::string raw_req = req.str();
-  ::send(fd, raw_req.data(), raw_req.size(), 0);
-
-  std::string raw;
-  char buf[8192];
-  ssize_t n = 0;
-  while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0) {
-    raw.append(buf, static_cast<std::size_t>(n));
-  }
-  ::close(fd);
-
-  const std::size_t head_end = raw.find("\r\n\r\n");
-  if (head_end == std::string::npos) {
-    return resp;
-  }
-  const std::string head = raw.substr(0, head_end);
-  resp.body = raw.substr(head_end + 4);
-  const std::size_t sp = head.find(' ');
-  if (sp != std::string::npos) {
-    resp.status = std::atoi(head.c_str() + sp + 1);
-  }
-  return resp;
-}
-
-std::string trackGuid(int track_id) {
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), "%08x%024x", 1, track_id);
-  return std::string(buf);
-}
+using test_http::Response;
 
 int g_pass = 0;
 int g_fail = 0;
@@ -99,64 +36,38 @@ void check(bool ok, const std::string &msg) {
   }
 }
 
-// 依次通过 album-artists -> artist -> album -> tracks 找一首曲目的 id。
-int findTrackId(const std::string &host, int port) {
-  HttpResponse r = httpRequest(host, port, "GET", "/api/album-artists");
-  auto artists = json_util::parseOrNull(r.body);
-  if (artists.isNull() || !artists.isArray() || artists.size() == 0) {
-    return 0;
-  }
-  const int artist_id = static_cast<int>(artists[0]["id"].asInt64());
-  r = httpRequest(host, port, "GET", "/api/artist/" + std::to_string(artist_id));
-  auto artist = json_util::parseOrNull(r.body);
-  if (artist.isNull() || !artist.isMember("albums") ||
-      !artist["albums"].isArray() ||
-      artist["albums"].size() == 0) {
-    return 0;
-  }
-  const int album_id = static_cast<int>(artist["albums"][0]["id"].asInt64());
-  r = httpRequest(host, port, "GET", "/api/album/" + std::to_string(album_id));
-  auto album = json_util::parseOrNull(r.body);
-  if (album.isNull() || !album.isMember("tracks") ||
-      !album["tracks"].isArray() ||
-      album["tracks"].size() == 0) {
-    return 0;
-  }
-  return static_cast<int>(album["tracks"][0]["id"].asInt64());
+bool has(const Json::Value &j, const char *key) {
+  return j.isObject() && j.isMember(key);
 }
 
-// 通过 album-artists -> artist -> album 找第一个专辑 id。
-int findAlbumId(const std::string &host, int port) {
-  HttpResponse r = httpRequest(host, port, "GET", "/api/album-artists");
-  auto artists = json_util::parseOrNull(r.body);
-  if (artists.isNull() || !artists.isArray() || artists.size() == 0) {
-    return 0;
+std::string fixtureEnv(const char *key) {
+  const char *value = std::getenv(key);
+  if (value == nullptr || *value == '\0') {
+    std::cerr << "缺少环境变量 " << key << "（先运行 test_fixture seed）\n";
+    std::exit(2);
   }
-  const int artist_id = static_cast<int>(artists[0]["id"].asInt64());
-  r = httpRequest(host, port, "GET", "/api/artist/" + std::to_string(artist_id));
-  auto artist = json_util::parseOrNull(r.body);
-  if (artist.isNull() || !artist.isMember("albums") ||
-      !artist["albums"].isArray() ||
-      artist["albums"].size() == 0) {
-    return 0;
-  }
-  return static_cast<int>(artist["albums"][0]["id"].asInt64());
+  return std::string{value};
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
   const std::string host = argc > 1 ? argv[1] : "127.0.0.1";
-  const int port = argc > 2 ? std::atoi(argv[2]) : 5666;
+  const int port = argc > 2 ? std::atoi(argv[2]) : 5667;
   const int jf_port = argc > 3 ? std::atoi(argv[3]) : 9000;
+
+  const int track_id =
+      std::atoi(fixtureEnv(fixture::kEnvTrackRoleId).c_str());
+  const std::string pl_name = fixture::kPrefix + " Playlist Test";
 
   std::cout << "== 主服务播放列表接口 ==\n";
 
-  HttpResponse r = httpRequest(host, port, "POST", "/api/playlists/refresh");
+  Response r =
+      test_http::httpRequest(host, port, "POST", "/api/playlists/refresh");
   check(r.status == 200, "POST /api/playlists/refresh -> 200");
 
-  r = httpRequest(host, port, "POST", "/api/playlists",
-                  "{\"name\":\"Test Playlist\"}");
+  r = test_http::httpRequest(host, port, "POST", "/api/playlists",
+                             "{\"name\":\"" + pl_name + "\"}");
   check(r.status == 200, "POST /api/playlists -> 200");
   std::string pl_id;
   {
@@ -166,211 +77,143 @@ int main(int argc, char **argv) {
     }
   }
   check(!pl_id.empty(), "新建歌单返回 id");
-
   if (pl_id.empty()) {
     std::cout << "无法继续（未创建歌单）\n";
     return 1;
   }
 
-  r = httpRequest(host, port, "GET", "/api/playlists/" + pl_id);
+  r = test_http::httpRequest(host, port, "GET", "/api/playlists/" + pl_id);
   check(r.status == 200, "GET /api/playlists/<id> -> 200");
   {
     auto j = json_util::parseOrNull(r.body);
-    check(!j.isNull() && j.isMember("song_count") && j["song_count"].asInt64() == 0,
+    check(!j.isNull() && j.isMember("song_count") &&
+              j["song_count"].asInt64() == 0,
           "新歌单 song_count=0");
   }
 
-  r = httpRequest(host, port, "GET", "/api/playlists");
+  r = test_http::httpRequest(host, port, "GET", "/api/playlists");
   check(r.status == 200, "GET /api/playlists -> 200");
 
-  const int track_id = findTrackId(host, port);
-  if (track_id > 0) {
-    r = httpRequest(host, port, "POST", "/api/playlists/" + pl_id + "/songs",
-                    "{\"trackId\":" + std::to_string(track_id) + "}");
-    check(r.status == 200, "POST /api/playlists/<id>/songs (trackId) -> 200");
-    {
-      auto j = json_util::parseOrNull(r.body);
-      check(!j.isNull() && j.isMember("song_count") && j["song_count"].asInt64() == 1,
-            "添加后 song_count=1");
-      bool matched = false;
-      if (!j.isNull() && j.isMember("songs") && j["songs"].size() > 0) {
-        matched = j["songs"][0]["matched"].asBool();
-      }
-      check(matched, "添加的曲目 matched=true");
+  r = test_http::httpRequest(host, port, "POST", "/api/playlists/" + pl_id +
+                                                   "/songs",
+                             "{\"trackId\":" + std::to_string(track_id) + "}");
+  check(r.status == 200, "POST /api/playlists/<id>/songs (trackId) -> 200");
+  {
+    auto j = json_util::parseOrNull(r.body);
+    check(!j.isNull() && j.isMember("song_count") &&
+              j["song_count"].asInt64() == 1,
+          "添加后 song_count=1");
+    bool matched = false;
+    if (!j.isNull() && j.isMember("songs") && j["songs"].size() > 0) {
+      matched = j["songs"][0]["matched"].asBool();
     }
-
-    r = httpRequest(host, port, "DELETE",
-                    "/api/playlists/" + pl_id + "/songs/0");
-    check(r.status == 200, "DELETE /api/playlists/<id>/songs/0 -> 200");
-    r = httpRequest(host, port, "GET", "/api/playlists/" + pl_id);
-    {
-      auto j = json_util::parseOrNull(r.body);
-      check(!j.isNull() && j["song_count"].asInt64() == 0, "删除曲目后 song_count=0");
-    }
-  } else {
-    std::cout << "  SKIP  数据库无曲目，跳过加歌测试\n";
+    check(matched, "添加的曲目 matched=true");
   }
 
-  r = httpRequest(host, port, "DELETE", "/api/playlists/" + pl_id);
+  r = test_http::httpRequest(host, port, "DELETE",
+                             "/api/playlists/" + pl_id + "/songs/0");
+  check(r.status == 200, "DELETE /api/playlists/<id>/songs/0 -> 200");
+  r = test_http::httpRequest(host, port, "GET", "/api/playlists/" + pl_id);
+  {
+    auto j = json_util::parseOrNull(r.body);
+    check(!j.isNull() && j["song_count"].asInt64() == 0,
+          "删除曲目后 song_count=0");
+  }
+
+  r = test_http::httpRequest(host, port, "DELETE", "/api/playlists/" + pl_id);
   check(r.status == 200, "DELETE /api/playlists/<id> -> 200");
-  r = httpRequest(host, port, "GET", "/api/playlists/" + pl_id);
+  r = test_http::httpRequest(host, port, "GET", "/api/playlists/" + pl_id);
   check(r.status == 404, "删除后 GET /api/playlists/<id> -> 404");
 
-  std::cout << "\n== Jellyfin 播放列表接口 ==\n";
+  std::cout << "\n== Jellyfin 播放列表写入（保持原有 501）==\n";
+  // Jellyfin 歌单写入从未注册能力，迁移前后都返回 501；此处锁定该行为。
+  r = test_http::httpRequest(host, jf_port, "POST",
+                             "/Playlists?name=" + fixture::kPrefix +
+                                 "%20Unsupported");
+  check(r.status == 501, "POST /Playlists -> 501");
+  r = test_http::httpRequest(
+      host, jf_port, "POST", "/Playlists",
+      "{\"Name\":\"" + fixture::kPrefix + "Body Unsupported\",\"Ids\":[]}");
+  check(r.status == 501, "POST /Playlists (JSON body) -> 501");
 
-  r = httpRequest(host, jf_port, "POST", "/Playlists?name=JF%20Playlist");
-  check(r.status == 200, "POST /Playlists -> 200");
-  std::string jf_id;
+  std::cout << "\n== Jellyfin 读取主服务歌单 ==\n";
+  // 歌单是 JSON 文件存储，唯一写入口是主服务 API；先建一个再让 Jellyfin 读。
+  const std::string track_ref = fixtureEnv(fixture::kEnvTrackRoleRef);
+  std::string jf_read_id;
+  r = test_http::httpRequest(
+      host, port, "POST", "/api/playlists",
+      "{\"name\":\"" + fixture::kPrefix + " Jellyfin Read\"}");
+  if (auto j = json_util::parseOrNull(r.body); has(j, "id")) {
+    jf_read_id = j["id"].asString();
+  }
+  check(!jf_read_id.empty(), "创建 Jellyfin 读取用歌单");
+  const std::string pl_ref = "local-main:playlist:" + jf_read_id;
+  if (!jf_read_id.empty()) {
+    r = test_http::httpRequest(
+        host, port, "POST", "/api/playlists/" + jf_read_id + "/songs",
+        "{\"trackId\":" + std::to_string(track_id) + "}");
+    check(r.status == 200, "向该歌单添加夹具曲目");
+  }
+
+  r = test_http::httpRequest(host, jf_port, "GET", "/Playlists/" + pl_ref);
+  check(r.status == 200, "GET /Playlists/<ref> -> 200");
   {
     auto j = json_util::parseOrNull(r.body);
-    if (!j.isNull() && j.isMember("Id")) {
-      jf_id = j["Id"].asString();
-    }
-  }
-  check(!jf_id.empty(), "Jellyfin 新建歌单返回 Id");
-
-  if (!jf_id.empty() && track_id > 0) {
-    const std::string guid = trackGuid(track_id);
-    r = httpRequest(host, jf_port, "POST",
-                    "/Playlists/" + jf_id + "/Items?ids=" + guid);
-    check(r.status == 204, "POST /Playlists/<id>/Items -> 204");
-
-    r = httpRequest(host, jf_port, "GET", "/Playlists/" + jf_id);
-    check(r.status == 200, "GET /Playlists/<id> -> 200");
-    {
-      auto j = json_util::parseOrNull(r.body);
-      bool found = false;
-      if (!j.isNull() && j.isMember("ItemIds")) {
-        for (const auto &x : j["ItemIds"]) {
-          if (std::string(x.asString()) == guid) {
-            found = true;
-          }
+    check(has(j, "Id") && j["Id"].asString() == pl_ref,
+          "歌单 Id 与引用一致");
+    check(has(j, "ChildCount") && j["ChildCount"].asInt64() == 1,
+          "歌单 ChildCount=1");
+    bool found = false;
+    if (has(j, "ItemIds")) {
+      for (const auto &x : j["ItemIds"]) {
+        if (x.asString() == track_ref) {
+          found = true;
         }
       }
-      check(found, "GetPlaylist ItemIds 含刚添加的曲目");
     }
-    {
-      auto j = json_util::parseOrNull(r.body);
-      check(!j.isNull() && j.isMember("RunTimeTicks") && j["RunTimeTicks"].asInt64() > 0,
-            "歌单 RunTimeTicks>0（总时长）");
-    }
-
-    r = httpRequest(host, jf_port, "GET", "/Playlists/" + jf_id + "/Items");
-    check(r.status == 200, "GET /Playlists/<id>/Items -> 200");
-
-    r = httpRequest(host, jf_port, "DELETE",
-                    "/Playlists/" + jf_id + "/Items?entryIds=" + guid);
-    check(r.status == 204, "DELETE /Playlists/<id>/Items -> 204");
-  } else if (!jf_id.empty()) {
-    std::cout << "  SKIP  数据库无曲目，跳过 Jellyfin 加歌测试\n";
+    check(found, "ItemIds 含夹具曲目");
+    check(has(j, "RunTimeTicks") && j["RunTimeTicks"].asInt64() > 0,
+          "歌单 RunTimeTicks>0");
   }
 
-  if (!jf_id.empty()) {
-    r = httpRequest(host, jf_port, "DELETE", "/Playlists/" + jf_id);
-    check(r.status == 204, "DELETE /Playlists/<id> -> 204");
-  }
-
-  std::cout << "\n== Jellyfin 播放列表接口（JSON body，模拟客户端）==\n";
-  r = httpRequest(host, jf_port, "POST", "/Playlists",
-                  "{\"Name\":\"Body Playlist\",\"Ids\":[]}");
-  check(r.status == 200, "POST /Playlists (body Name) -> 200");
-  std::string body_id;
+  r = test_http::httpRequest(host, jf_port, "GET",
+                             "/Playlists/" + pl_ref + "/Items");
+  check(r.status == 200, "GET /Playlists/<ref>/Items -> 200");
   {
     auto j = json_util::parseOrNull(r.body);
-    if (!j.isNull() && j.isMember("Id")) {
-      body_id = j["Id"].asString();
-    }
+    check(has(j, "Items") && j["Items"].isArray() && j["Items"].size() == 1,
+          "歌单曲目列表含 1 条");
   }
-  check(!body_id.empty(), "body 新建歌单返回 Id");
-  if (!body_id.empty()) {
-    if (track_id > 0) {
-      const std::string guid = trackGuid(track_id);
-      r = httpRequest(host, jf_port, "POST", "/Playlists/" + body_id + "/Items",
-                      "{\"Ids\":[\"" + guid + "\"]}");
-      check(r.status == 204, "POST /Playlists/<id>/Items (body Ids) -> 204");
-      r = httpRequest(host, jf_port, "GET", "/Playlists/" + body_id);
-      auto j = json_util::parseOrNull(r.body);
-      check(!j.isNull() && j.isMember("ChildCount") && j["ChildCount"].asInt64() == 1,
-            "body 加歌后 ChildCount=1");
-    }
-    r = httpRequest(host, jf_port, "GET", "/Items/" + body_id);
-    check(r.status == 200, "GET /Items/<playlistId> -> 200");
-    r = httpRequest(host, jf_port, "GET",
-                    "/Users/0123456789abcdef0123456789abcdef/Items/" + body_id);
-    check(r.status == 200, "GET /Users/<uid>/Items/<playlistId> -> 200");
-    r = httpRequest(host, jf_port, "DELETE", "/Playlists/" + body_id);
-    check(r.status == 204, "DELETE body 歌单 -> 204");
+
+  r = test_http::httpRequest(host, jf_port, "GET", "/Items/" + pl_ref);
+  check(r.status == 200, "GET /Items/<playlistRef> -> 200");
+  r = test_http::httpRequest(
+      host, jf_port, "GET",
+      "/Users/0123456789abcdef0123456789abcdef/Items/" + pl_ref);
+  check(r.status == 200, "GET /Users/<uid>/Items/<playlistRef> -> 200");
+
+  r = test_http::httpRequest(host, jf_port, "POST",
+                             "/Playlists/" + pl_ref + "/Items?ids=" + track_ref);
+  check(r.status == 501, "POST /Playlists/<ref>/Items -> 501");
+  r = test_http::httpRequest(host, jf_port, "DELETE",
+                             "/Playlists/" + pl_ref + "/Items?entryIds=" +
+                                 track_ref);
+  check(r.status == 501, "DELETE /Playlists/<ref>/Items -> 501");
+  r = test_http::httpRequest(host, jf_port, "DELETE", "/Playlists/" + pl_ref);
+  check(r.status == 501, "DELETE /Playlists/<ref> -> 501");
+  if (!jf_read_id.empty()) {
+    r = test_http::httpRequest(host, port, "DELETE",
+                               "/api/playlists/" + jf_read_id);
+    check(r.status == 200, "清理 Jellyfin 读取用歌单");
   }
 
   std::cout << "\n== 专辑时长 ==\n";
-  const int album_id = findAlbumId(host, port);
-  if (album_id > 0) {
-    char abuf[64];
-    std::snprintf(abuf, sizeof(abuf), "%08x%024x", 2, album_id);
-    r = httpRequest(host, jf_port, "GET", std::string("/Items/") + abuf);
+  {
+    const std::string album_ref = fixtureEnv(fixture::kEnvAlbumRef);
+    r = test_http::httpRequest(host, jf_port, "GET", "/Items/" + album_ref);
     auto j = json_util::parseOrNull(r.body);
-    check(!j.isNull() && j.isMember("RunTimeTicks") && j["RunTimeTicks"].asInt64() > 0,
+    check(has(j, "RunTimeTicks") && j["RunTimeTicks"].asInt64() > 0,
           "专辑 RunTimeTicks>0（总时长）");
-  } else {
-    std::cout << "  SKIP  数据库无专辑，跳过时长测试\n";
-  }
-
-  std::cout << "\n== 批量 sync 多线程 ==\n";
-  std::vector<int> ids;
-  if (album_id > 0) {
-    r = httpRequest(host, port, "GET",
-                    "/api/album/" + std::to_string(album_id));
-    auto j = json_util::parseOrNull(r.body);
-    if (!j.isNull() && j.isMember("tracks") && j["tracks"].isArray()) {
-      for (const auto &t : j["tracks"]) {
-        ids.push_back(static_cast<int>(t["id"].asInt64()));
-        if (ids.size() >= 4) {
-          break;
-        }
-      }
-    }
-  }
-  if (ids.size() >= 2) {
-    std::string body = "[";
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-      if (i) {
-        body += ",";
-      }
-      body += "{\"action\":\"sync-from-file\",\"trackId\":" +
-              std::to_string(ids[i]) + "}";
-    }
-    body += "]";
-    r = httpRequest(host, port, "POST", "/api/fs/batch", body);
-    check(r.status == 200, "POST /api/fs/batch (sync x N) -> 200");
-    std::string job_id;
-    {
-      auto j = json_util::parseOrNull(r.body);
-      if (!j.isNull() && j.isArray() && j.size() > 0 &&
-          j[0].isMember("jobId")) {
-        job_id = std::to_string(j[0]["jobId"].asInt64());
-      }
-    }
-    check(!job_id.empty(), "批量 sync 返回 jobId");
-    if (!job_id.empty()) {
-      bool finished = false;
-      for (int k = 0; k < 120 && !finished; ++k) {
-        ::usleep(500000);
-        r = httpRequest(host, port, "GET", "/api/jobs/" + job_id);
-        auto j = json_util::parseOrNull(r.body);
-        if (!j.isNull() && j.isMember("state")) {
-          const std::string st = j["state"].asString();
-          if (st == "done" || st == "error") {
-            finished = true;
-            check(st == "done", "批量 sync job 完成 (state=done)");
-          }
-        }
-      }
-      if (!finished) {
-        check(false, "批量 sync job 在超时内完成");
-      }
-    }
-  } else {
-    std::cout << "  SKIP  曲目不足，跳过批量 sync 测试\n";
   }
 
   std::cout << "\n结果: PASS=" << g_pass << " FAIL=" << g_fail << "\n";

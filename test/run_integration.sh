@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# 存储代理与现有功能集成测试。
+#
+#   ./test/run_integration.sh [config.json]
+#
+# 前置：cmake --build build 已生成 ./musicd ./fake_storage ./test_fixture 等。
+# 使用独立端口，不干扰正在运行的 musicd：
+#   musicd 15667 / Jellyfin 19000 / Subsonic 14533 / fake_storage 15666
+#
+# 数据库来自传入的 config.json（默认 ./config.json），临时配置只改端口。
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+SOURCE_CONFIG="${1:-$ROOT/config.json}"
+if [[ ! -f "$SOURCE_CONFIG" ]]; then
+  echo "找不到配置: $SOURCE_CONFIG" >&2
+  exit 2
+fi
+
+MAIN_PORT=15667
+JF_PORT=19000
+STORAGE_PORT=15666
+
+for bin in musicd fake_storage test_fixture playlist_test lyrics_test artists_test storage_test amll_ttml_test; do
+  if [[ ! -x "$ROOT/$bin" ]]; then
+    echo "缺少可执行文件 $ROOT/$bin（先构建）" >&2
+    exit 2
+  fi
+done
+
+TMP_DIR="$(mktemp -d /tmp/opencode/musicd-it.XXXXXX)"
+TMP_CONFIG="$TMP_DIR/config.json"
+LOG_DIR="$TMP_DIR/logs"
+mkdir -p "$LOG_DIR"
+
+# 只替换端口与超时；数据库等其余配置原样保留。
+sed \
+  -e "s/\"main_port\":[[:space:]]*[0-9]\+/\"main_port\": $MAIN_PORT/" \
+  -e "s/\"port\":[[:space:]]*9000/\"port\": $JF_PORT/" \
+  -e "s/\"port\":[[:space:]]*4533/\"port\": 14533/" \
+  -e "s/\"storage_port\":[[:space:]]*[0-9]\+/\"storage_port\": $STORAGE_PORT/" \
+  -e "s/\"storage_timeout_ms\":[[:space:]]*[0-9]\+/\"storage_timeout_ms\": 1200/" \
+  "$SOURCE_CONFIG" > "$TMP_CONFIG"
+
+FAKE_PID=""
+MUSICD_PID=""
+
+cleanup() {
+  local code=$?
+  if [[ -n "$MUSICD_PID" ]] && kill -0 "$MUSICD_PID" 2>/dev/null; then
+    kill "$MUSICD_PID" 2>/dev/null
+    wait "$MUSICD_PID" 2>/dev/null
+  fi
+  if [[ -n "$FAKE_PID" ]] && kill -0 "$FAKE_PID" 2>/dev/null; then
+    kill "$FAKE_PID" 2>/dev/null
+    wait "$FAKE_PID" 2>/dev/null
+  fi
+  if [[ -x "$ROOT/test_fixture" ]]; then
+    "$ROOT/test_fixture" cleanup --config "$TMP_CONFIG" \
+      > "$LOG_DIR/cleanup.log" 2>&1 || true
+  fi
+  if [[ $code -eq 0 ]]; then
+    rm -rf "$TMP_DIR"
+  else
+    echo "日志保留在 $LOG_DIR" >&2
+  fi
+}
+trap cleanup EXIT
+
+port_ready() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+wait_http() {
+  local port="$1" url="$2" tries="${3:-100}"
+  for ((i = 0; i < tries; ++i)); do
+    if curl -fsS -o /dev/null "$url" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+echo "== 启动 fake_storage (:${STORAGE_PORT}) =="
+"$ROOT/fake_storage" "$STORAGE_PORT" > "$LOG_DIR/fake_storage.log" 2>&1 &
+FAKE_PID=$!
+if ! port_ready "$STORAGE_PORT"; then
+  for ((i = 0; i < 50; ++i)); do
+    port_ready "$STORAGE_PORT" && break
+    sleep 0.2
+  done
+fi
+if ! port_ready "$STORAGE_PORT"; then
+  echo "fake_storage 未启动" >&2
+  exit 1
+fi
+
+echo "== 写入夹具 =="
+set -a
+# shellcheck disable=SC1090
+eval "$("$ROOT/test_fixture" seed --config "$TMP_CONFIG")"
+set +a
+
+echo "== 启动 musicd (:${MAIN_PORT}) =="
+"$ROOT/musicd" --config "$TMP_CONFIG" > "$LOG_DIR/musicd.log" 2>&1 &
+MUSICD_PID=$!
+
+if ! wait_http "$MAIN_PORT" "http://127.0.0.1:${MAIN_PORT}/api/playlists"; then
+  echo "musicd 未就绪" >&2
+  tail -n 40 "$LOG_DIR/musicd.log" >&2
+  exit 1
+fi
+if ! wait_http "$JF_PORT" "http://127.0.0.1:${JF_PORT}/System/Info/Public"; then
+  echo "Jellyfin 端口未就绪" >&2
+  exit 1
+fi
+
+FAILED=0
+run() {
+  local name="$1"
+  shift
+  echo
+  echo "---- $name ----"
+  if ! "$@"; then
+    FAILED=1
+    echo "!! $name 失败" >&2
+  fi
+}
+
+run "AMLL TTML 单元测试" "$ROOT/amll_ttml_test"
+run "播放列表" "$ROOT/playlist_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
+run "歌词" "$ROOT/lyrics_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
+run "艺术家" "$ROOT/artists_test" 127.0.0.1 "$MAIN_PORT"
+run "存储代理" "$ROOT/storage_test" 127.0.0.1 "$MAIN_PORT" "$STORAGE_PORT"
+
+echo
+if [[ $FAILED -eq 0 ]]; then
+  echo "全部集成测试通过"
+else
+  echo "存在失败用例" >&2
+fi
+exit "$FAILED"

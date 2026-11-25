@@ -1,6 +1,6 @@
 #include "media_library/byte_stream.h"
 
-#include "api/webdav/webdav.h"
+#include "http_client.h"
 
 #include <algorithm>
 #include <fstream>
@@ -188,12 +188,18 @@ private:
     if (open_) {
       return true;
     }
-    const webdav::Url base = webdav::resolveCredentials(locator_);
+    http_client::Url base;
+    if (!http_client::parseUrl(locator_, base)) {
+      open_error_ = Error::make(ErrorCode::ProviderUnavailable,
+                               "cannot parse remote locator");
+      return false;
+    }
     std::vector<std::string> extra;
     if (info_.seekable) {
       extra.push_back("Range: bytes=" + std::to_string(offset_) + "-");
     }
-    webdav::Stream stream = webdav::openStream(base, base.path, extra);
+    http_client::Stream stream =
+        http_client::openStream(base, base.path, extra);
     if (stream.status != 200 && stream.status != 206) {
       if (stream.close) {
         stream.close();
@@ -241,7 +247,7 @@ private:
   std::string locator_;
   StreamInfo info_;
   std::int64_t offset_ = 0;
-  webdav::Stream handle_;
+  http_client::Stream handle_;
   bool open_ = false;
   Error open_error_;
 };

@@ -3,6 +3,8 @@
 
 #include "http_server.h"
 
+#include <functional>
+
 #include <string>
 
 // 原生统一读门面：直接依赖 MediaRouter + LibraryDirectory，
@@ -15,9 +17,11 @@ http_server::ResponsePtr provider_health(const http_server::RequestPtr &req);
 http_server::ResponsePtr search(const http_server::RequestPtr &req);
 
 http_server::ResponsePtr track(const http_server::RequestPtr &req, const std::string &ref);
-http_server::ResponsePtr track_stream(const http_server::RequestPtr &req, const std::string &ref);
+void track_stream(const http_server::RequestPtr &req, const std::string &ref,
+                  std::function<void(const http_server::ResponsePtr &)> callback);
 http_server::ResponsePtr track_lyrics(const http_server::RequestPtr &req, const std::string &ref);
-http_server::ResponsePtr track_artwork(const http_server::RequestPtr &req, const std::string &ref);
+void track_artwork(const http_server::RequestPtr &req, const std::string &ref,
+                   std::function<void(const http_server::ResponsePtr &)> callback);
 
 http_server::ResponsePtr album(const http_server::RequestPtr &req, const std::string &ref);
 http_server::ResponsePtr album_tracks(const http_server::RequestPtr &req, const std::string &ref);

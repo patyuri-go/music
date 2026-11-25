@@ -494,25 +494,31 @@ http_server::ResponsePtr handle_artist_info2(const http_server::RequestPtr &req)
 // 字节出口
 // ---------------------------------------------------------------------------
 
-http_server::ResponsePtr handle_stream(const http_server::RequestPtr &req) {
+void handle_stream(const http_server::RequestPtr &req,
+                   std::function<void(const http_server::ResponsePtr &)> callback) {
   const std::optional<std::string> raw = id_param(req);
   if (!raw.has_value()) {
-    return failure_response(Code::MissingParameter, "id is required");
+    callback(failure_response(Code::MissingParameter, "id is required"));
+    return;
   }
   const std::optional<SourceRef> ref = parse_id(*raw, EntityType::Track);
   if (!ref.has_value()) {
-    return failure_response(Code::NotFound, "song not found: " + *raw);
+    callback(failure_response(Code::NotFound, "song not found: " + *raw));
+    return;
   }
-  // 音频字节统一从播放会话出：选源交给 MediaRouter，locator 不外泄。
-  return stream_http::serve_track(
-      req, track_ref_of(*ref),
-      req->method() == drogon::Head);
+  // 音频字节：本地库按实体 id 直连存储服务，远端库沿用同步路径。
+  stream_http::serve_track_async(req, track_ref_of(*ref),
+                                 req->isHead(),
+                                 std::move(callback));
 }
 
-http_server::ResponsePtr handle_cover_art(const http_server::RequestPtr &req) {
+void handle_cover_art(const http_server::RequestPtr &req,
+                      std::function<void(const http_server::ResponsePtr &)>
+                          callback) {
   const std::optional<std::string> raw = id_param(req);
   if (!raw.has_value()) {
-    return failure_response(Code::MissingParameter, "id is required");
+    callback(failure_response(Code::MissingParameter, "id is required"));
+    return;
   }
   const std::optional<SourceRef> ref = media_library::parse_ref(*raw);
   if (!ref.has_value() ||
@@ -520,14 +526,16 @@ http_server::ResponsePtr handle_cover_art(const http_server::RequestPtr &req) {
        ref->entity_type != EntityType::Album &&
        ref->entity_type != EntityType::Artist &&
        ref->entity_type != EntityType::AlbumArtist)) {
-    return failure_response(Code::NotFound, "cover art not found");
+    callback(failure_response(Code::NotFound, "cover art not found"));
+    return;
   }
   media_library::ArtworkRef artwork;
   artwork.owner = ref->entity_type == EntityType::AlbumArtist
                       ? media_library::as_artist_ref(*ref)
                       : *ref;
-  return stream_http::serve_artwork(req, artwork,
-                                    req->method() == drogon::Head);
+  stream_http::serve_artwork_async(req, artwork,
+                                   req->isHead(),
+                                   std::move(callback));
 }
 
 // ---------------------------------------------------------------------------
@@ -971,6 +979,59 @@ void route(const char *method_name,
   http_server::onPort(g_session.port, drogon::Options, dotted, preflight);
 }
 
+// 异步版本：handler 自己决定何时回调。访问日志挂在回调的最后一步，保证
+// 「响应真正发出」之后才落行。
+using AsyncHandler = std::function<void(
+    const http_server::RequestPtr &,
+    std::function<void(const http_server::ResponsePtr &)>)>;
+
+void route_async(const char *method_name, AsyncHandler handler) {
+  const std::string base = std::string("/rest/") + method_name;
+  const std::string dotted = base + ".view";
+  const bool log = g_session.log_requests;
+
+  auto wrap = [method_name, handler, log](
+                  const http_server::RequestPtr &req,
+                  std::function<void(const http_server::ResponsePtr &)>
+                      callback) {
+    auto access = std::make_shared<AccessLog>(req, method_name, log);
+    const http_server::Query query(req);
+    if (const std::optional<std::string> id = id_param(req); id.has_value()) {
+      access->set_id(*id);
+    }
+    if (query.has("size") || query.has("offset")) {
+      access->set_paging(subsonic::paging(req, 0).log_text());
+    }
+    handler(req, [access, callback = std::move(callback)](
+                     const http_server::ResponsePtr &response) {
+      int code = 0;
+      const std::string body(response->body());
+      if (body.find("\"status\":\"failed\"") != std::string::npos) {
+        const std::size_t at = body.find("\"code\":");
+        if (at != std::string::npos) {
+          code = std::atoi(body.c_str() + at + 7);
+        }
+      }
+      access->done(code);
+      callback(response);
+    });
+  };
+
+  for (const drogon::HttpMethod method :
+       {drogon::Get, drogon::Post, drogon::Head}) {
+    http_server::onPortAsync(g_session.port, method, base, wrap);
+    http_server::onPortAsync(g_session.port, method, dotted, wrap);
+  }
+
+  auto preflight = [](const http_server::RequestPtr &) {
+    auto res = drogon::HttpResponse::newHttpResponse();
+    res->setStatusCode(drogon::k204NoContent);
+    return res;
+  };
+  http_server::onPort(g_session.port, drogon::Options, base, preflight);
+  http_server::onPort(g_session.port, drogon::Options, dotted, preflight);
+}
+
 void register_routes() {
   route("ping", handle_ping);
   route("getLicense", handle_license);
@@ -983,9 +1044,9 @@ void register_routes() {
   route("getArtist", handle_artist);
   route("getAlbumInfo2", handle_album_info2);
   route("getArtistInfo2", handle_artist_info2);
-  route("stream", handle_stream);
-  route("download", handle_stream);
-  route("getCoverArt", handle_cover_art);
+  route_async("stream", handle_stream);
+  route_async("download", handle_stream);
+  route_async("getCoverArt", handle_cover_art);
   route("search2",
         [](const http_server::RequestPtr &req) { return handle_search(req, false); });
   route("search3",

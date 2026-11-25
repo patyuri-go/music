@@ -260,6 +260,23 @@ std::optional<int> compat_internal_id_of(const SourceRef &ref) {
   return local->internal_id_of(ref);
 }
 
+std::optional<std::string> compat_entity_id(EntityType type,
+                                         int internal_id) {
+  std::shared_ptr<LocalLibrary> local = local_library_impl();
+  if (local == nullptr) {
+    return std::nullopt;
+  }
+  return local->entity_id_of(type, internal_id);
+}
+
+std::optional<std::string> compat_artwork_entity_id(const SourceRef &owner) {
+  std::shared_ptr<LocalLibrary> local = local_library_impl();
+  if (local == nullptr) {
+    return std::nullopt;
+  }
+  return local->artwork_entity_id(owner);
+}
+
 std::optional<TrackTransport> compat_track_transport(int internal_id) {
   std::shared_ptr<LocalLibrary> local = local_library_impl();
   if (local == nullptr) {

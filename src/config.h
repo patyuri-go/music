@@ -20,13 +20,23 @@ struct ImageCacheConfig {
 };
 
 // 本地媒体库：全局只允许一个，id 可配（默认 local-main）。
-// 扫描根（含 WebDAV 凭据）不进配置文件，存在数据库的 scan_roots 表里。
+// 音频与封面二进制统一由外部存储服务按实体 id 提供。
 struct LocalLibraryConfig {
   std::string id{"local-main"};
   bool follow_symlinks{true};
-  bool scan_on_start{true};
-  int scan_threads{4};
   fs::path playlist_dir{"./playlists"};
+
+  // 存储服务地址。host 只能是主机名/IP，不带 scheme、端口、路径。
+  std::string storage_host{"127.0.0.1"};
+  int storage_port{5666};
+  std::string storage_scheme{"http"};
+  // 非空时附加 `Authorization: Bearer <token>`。
+  std::string storage_token;
+  int storage_timeout_ms{5000};
+  // 同时在途的存储流上限。
+  int storage_max_concurrent{32};
+  // 执行阻塞上游读取的线程数。
+  int storage_workers{8};
 };
 
 // 网易云音乐（经 api-enhanced 适配）。
@@ -112,13 +122,9 @@ struct Config {
   fs::path db_path{"./music.db"};
   // 新的后端配置；未配置 database 段时 sqlite_path 继承 db_path。
   DatabaseConfig database;
-  // 云端实体库（库名 entity）：track/album 的 entity_id 在此库中查文件位置。
-  // url 为空表示不启用，播放仍按本地扫描根解析。
-  DatabasePostgresConfig entity_db{
-      "", "musicd", "", "entity", "MUSICD_ENTITY_DB_PASSWORD", "", 5};
   fs::path static_dir{"web"};
   // 主服务端口（配置文件键名 main_port）。
-  int port{5666};
+  int port{5667};
   int page_size{50};
   bool transcode_enabled{false};
   bool jellyfin_enabled{true};

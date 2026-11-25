@@ -96,6 +96,13 @@ public:
   // 兼容层把 SourceRef 映射成对外 ID 时需要反查库内部 ID。
   std::optional<int> internal_id_of(const SourceRef &ref) const;
 
+  // 本地行 id -> 云端实体 id（UUID）。未回填时返回 nullopt。
+  std::optional<std::string> entity_id_of(EntityType type,
+                                          int internal_id) const;
+
+  // 封面内容的实体 id（album.entity_id）；未回填返回 nullopt。
+  std::optional<std::string> artwork_entity_id(const SourceRef &owner) const;
+
   // 一次性读出全库目录快照，供浏览列表和筛选选项使用。
   // 返回领域模型，不暴露数据库行结构。
   CatalogSnapshot snapshot();
@@ -123,7 +130,6 @@ private:
   };
   CoverSource cover_source_of(const SourceRef &owner) const;
   std::string cover_path_of(const SourceRef &owner) const;
-
   std::string library_id_;
   std::string display_name_;
   // 每次取当前线程的主库会话；不能缓存引用，session 是 thread_local。

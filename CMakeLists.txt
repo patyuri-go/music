@@ -46,9 +46,10 @@ add_executable(musicd
   ./src/database.cpp
   ./src/service.cpp
   ./src/metadata.cpp
-  ./src/scanner.cpp
+  ./src/http_client.cpp
   ./src/http_util.cpp
   ./src/http_server.cpp
+  ./src/storage_client.cpp
   ./src/musicd.cpp
   ./src/media_library/source_ref.cpp
   ./src/media_library/local_library.cpp
@@ -81,12 +82,9 @@ add_executable(musicd
   ./src/api/jellyfin/dto.cpp
   ./src/api/jellyfin/jellyfin.cpp
   ./src/api/playlist/playlist.cpp
-  ./src/api/webdav/webdav.cpp
-  ./src/api/webdav/webdav_stream.cpp
 )
 
 # 全部依赖来自 vcpkg manifest（见 vcpkg.json）。
-find_package(asio CONFIG REQUIRED)
 find_package(SOCI CONFIG REQUIRED COMPONENTS Core PostgreSQL SQLite3)
 # Drogon 必须放在 SOCI 之后：它的 DrogonConfig.cmake 会把自带 FindSQLite3.cmake
 # 塞进 CMAKE_MODULE_PATH，遮住 CMake 内置模块，导致 SQLite3::SQLite3 目标缺失。
@@ -96,6 +94,7 @@ find_package(pugixml CONFIG REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(PostgreSQL REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
 
 set_target_properties(musicd PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
@@ -103,15 +102,10 @@ set_target_properties(musicd PROPERTIES
 
 target_compile_options(musicd PRIVATE -g)
 
-# asio 以 standalone 方式使用（不依赖 Boost）。ASIO_NO_DEPRECATED 显式保留，
-# 避免弃用接口被重新启用。
-target_compile_definitions(musicd PRIVATE ASIO_STANDALONE ASIO_NO_DEPRECATED)
-
 # sqlite3 直接用于 src/db/soci_session.cpp（#include <sqlite3.h>），
 # 除 SOCI 的后端传递外再显式链接一次，保证头文件路径可用。
 target_link_libraries(musicd PRIVATE
   Drogon::Drogon
-  asio::asio
   SOCI::SOCI
   unofficial::sqlite3::sqlite3
   TagLib::tag
@@ -119,49 +113,108 @@ target_link_libraries(musicd PRIVATE
   PostgreSQL::PostgreSQL
   OpenSSL::SSL
   OpenSSL::Crypto
+  CURL::libcurl
 )
 
 target_include_directories(musicd PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/jellyfin
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/playlist
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/api/webdav
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/api-enhanced
 )
 
 # 测试程序（C++）：test/ 目录。均为独立可执行文件，手工运行。
+# 集成测试由 test/run_integration.sh 串联：fake_storage + test_fixture + musicd。
+
 add_executable(playlist_test
   ./test/playlist_test.cpp
   ./src/json_util.cpp
 )
-target_link_libraries(playlist_test PRIVATE asio::asio Drogon::Drogon)
-target_compile_definitions(playlist_test PRIVATE ASIO_STANDALONE ASIO_NO_DEPRECATED)
-target_include_directories(playlist_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(playlist_test PRIVATE Drogon::Drogon)
+target_include_directories(playlist_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
 set_target_properties(playlist_test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 
-# 歌词测试：需要 TagLib 写入内嵌歌词。
 add_executable(lyrics_test
   ./test/lyrics_test.cpp
   ./src/json_util.cpp
 )
-target_link_libraries(lyrics_test PRIVATE asio::asio TagLib::tag Drogon::Drogon)
-target_compile_definitions(lyrics_test PRIVATE ASIO_STANDALONE)
-target_include_directories(lyrics_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(lyrics_test PRIVATE Drogon::Drogon)
+target_include_directories(lyrics_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
 set_target_properties(lyrics_test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 
-# 艺术家解析测试：需要 TagLib 写入 ARTIST 标签。
 add_executable(artists_test
   ./test/artists_test.cpp
   ./src/json_util.cpp
 )
-target_link_libraries(artists_test PRIVATE asio::asio TagLib::tag Drogon::Drogon)
-target_compile_definitions(artists_test PRIVATE ASIO_STANDALONE)
-target_include_directories(artists_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(artists_test PRIVATE Drogon::Drogon)
+target_include_directories(artists_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
 set_target_properties(artists_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
+)
+
+add_executable(storage_test
+  ./test/storage_test.cpp
+  ./src/json_util.cpp
+)
+target_link_libraries(storage_test PRIVATE Drogon::Drogon)
+target_include_directories(storage_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
+set_target_properties(storage_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
+)
+
+# 假存储服务：按实体 id 返回确定字节，并带控制端点。
+add_executable(fake_storage
+  ./test/fake_storage.cpp
+)
+target_link_libraries(fake_storage PRIVATE Drogon::Drogon)
+target_include_directories(fake_storage PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
+set_target_properties(fake_storage PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
+)
+
+# 夹具写入/清理：直接连中央库，复用 config/db/schema/storage。
+add_executable(test_fixture
+  ./test/test_fixture.cpp
+  ./src/config.cpp
+  ./src/json_util.cpp
+  ./src/db.cpp
+  ./src/db/session.cpp
+  ./src/db/soci_session.cpp
+  ./src/schema.cpp
+  ./src/schema_pg.cpp
+  ./src/database.cpp
+  ./src/storage.cpp
+)
+target_link_libraries(test_fixture PRIVATE
+  Drogon::Drogon
+  SOCI::SOCI
+  unofficial::sqlite3::sqlite3
+  PostgreSQL::PostgreSQL
+)
+target_include_directories(test_fixture PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
+set_target_properties(test_fixture PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 

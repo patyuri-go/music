@@ -3,7 +3,6 @@
 #include <filesystem>
 #include <system_error>
 
-#include "api/webdav/webdav.h"
 #include "config.h"
 #include "db.h"
 
@@ -20,55 +19,8 @@ std::string rstripSlash(std::string s) {
   return s;
 }
 
-int hexValue(char c) {
-  if (c >= '0' && c <= '9') {
-    return c - '0';
-  }
-  if (c >= 'a' && c <= 'f') {
-    return c - 'a' + 10;
-  }
-  if (c >= 'A' && c <= 'F') {
-    return c - 'A' + 10;
-  }
-  return -1;
-}
-
-std::string percentDecode(const std::string &s) {
-  std::string out;
-  for (std::size_t i = 0; i < s.size(); ++i) {
-    if (s[i] == '%' && i + 2 < s.size()) {
-      const int hi = hexValue(s[i + 1]);
-      const int lo = hexValue(s[i + 2]);
-      if (hi >= 0 && lo >= 0) {
-        out.push_back(static_cast<char>(hi * 16 + lo));
-        i += 2;
-        continue;
-      }
-    }
-    out.push_back(s[i]);
-  }
-  return out;
-}
-
-std::string encodePath(const std::string &p) {
-  std::string out;
-  std::string seg;
-  for (std::size_t i = 0; i <= p.size(); ++i) {
-    if (i == p.size() || p[i] == '/') {
-      out += webdav::encodePathSegment(seg);
-      if (i < p.size()) {
-        out += '/';
-      }
-      seg.clear();
-    } else {
-      seg.push_back(p[i]);
-    }
-  }
-  return out;
-}
-
-bool isWebdavRoot(const repo::ScanRoot &root) {
-  return root.type == "webdav" || webdav::isWebdavUrl(root.path);
+bool isHttpPath(const std::string &path) {
+  return path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0;
 }
 
 } // namespace
@@ -96,20 +48,6 @@ std::string toReal(const repo::ScanRoot &root,
     return virtual_path;
   }
 
-  if (isWebdavRoot(root)) {
-    webdav::Url u;
-    if (!webdav::parseUrl(root.path, u)) {
-      return virtual_path;
-    }
-    std::string full = percentDecode(u.path);
-    if (!rel.empty()) {
-      full += "/" + rel;
-    }
-    const std::string encoded = encodePath(full);
-    return (u.https ? "https://" : "http://") + u.host +
-           (u.port.empty() ? std::string() : ":" + u.port) + encoded;
-  }
-
   std::string base = rstripSlash(root.path);
   if (rel.empty()) {
     return base;
@@ -119,29 +57,6 @@ std::string toReal(const repo::ScanRoot &root,
 
 std::string toVirtual(const repo::ScanRoot &root,
                       const std::string &real_path) {
-  if (isWebdavRoot(root)) {
-    webdav::Url ru;
-    webdav::Url bu;
-    if (!webdav::parseUrl(real_path, ru) ||
-        !webdav::parseUrl(root.path, bu)) {
-      return real_path;
-    }
-    if (ru.host != bu.host || ru.port != bu.port) {
-      return real_path;
-    }
-    const std::string rp = percentDecode(ru.path);
-    const std::string bp = rstripSlash(percentDecode(bu.path));
-    std::string rel;
-    if (rp == bp) {
-      rel.clear();
-    } else if (rp.rfind(bp + "/", 0) == 0) {
-      rel = rp.substr(bp.size() + 1);
-    } else {
-      return real_path;
-    }
-    return rel.empty() ? root.name : root.name + "/" + rel;
-  }
-
   std::error_code ec;
   std::string base = rstripSlash(root.path);
   const std::string cb = fs::weakly_canonical(base, ec).string();
@@ -183,6 +98,10 @@ bool isUnderAnyRoot(const fs::path &target) {
   }
   repo::ScanRootRepo roots(db::mainSession());
   for (const auto &root : roots.list()) {
+    // WebDAV 扫描根已废弃；残留行不参与本地路径判定。
+    if (isHttpPath(root.path)) {
+      continue;
+    }
     fs::path base = fs::weakly_canonical(root.path, ec);
     if (ec) {
       continue;

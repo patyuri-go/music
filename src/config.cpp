@@ -196,33 +196,6 @@ const Config &load(const std::string &file) {
         }
       }
     }
-    // 云端实体库（entity）：字段与主库 PostgreSQL 段一致。
-    if (json.isMember("entity_db")) {
-      const auto &edc = json["entity_db"];
-      auto &entity = loaded.entity_db;
-      if (edc.isMember("url")) {
-        entity.url = edc["url"].asString();
-      }
-      if (edc.isMember("user")) {
-        entity.user = edc["user"].asString();
-      }
-      if (edc.isMember("password")) {
-        entity.password = edc["password"].asString();
-      }
-      if (edc.isMember("dbname")) {
-        entity.dbname = edc["dbname"].asString();
-      }
-      if (edc.isMember("password_env")) {
-        entity.password_env = edc["password_env"].asString();
-      }
-      if (edc.isMember("sslmode")) {
-        entity.sslmode = edc["sslmode"].asString();
-      }
-      if (edc.isMember("connect_timeout_seconds")) {
-        entity.connect_timeout_seconds =
-            static_cast<int>(edc["connect_timeout_seconds"].asInt64());
-      }
-    }
     // db_path 与 db.sql.path 始终同源，旧调用点无需改动。
     loaded.db_path = loaded.database.sql.path;
     if (json.isMember("static_dir")) {
@@ -336,12 +309,30 @@ const Config &load(const std::string &file) {
           if (item.isMember("follow_symlinks")) {
             loaded.local.follow_symlinks = item["follow_symlinks"].asBool();
           }
-          if (item.isMember("scan_on_start")) {
-            loaded.local.scan_on_start = item["scan_on_start"].asBool();
+          if (item.isMember("storage_host")) {
+            loaded.local.storage_host = item["storage_host"].asString();
           }
-          if (item.isMember("scan_threads")) {
-            loaded.local.scan_threads =
-                static_cast<int>(item["scan_threads"].asInt64());
+          if (item.isMember("storage_port")) {
+            loaded.local.storage_port =
+                static_cast<int>(item["storage_port"].asInt64());
+          }
+          if (item.isMember("storage_scheme")) {
+            loaded.local.storage_scheme = item["storage_scheme"].asString();
+          }
+          if (item.isMember("storage_token")) {
+            loaded.local.storage_token = item["storage_token"].asString();
+          }
+          if (item.isMember("storage_timeout_ms")) {
+            loaded.local.storage_timeout_ms =
+                static_cast<int>(item["storage_timeout_ms"].asInt64());
+          }
+          if (item.isMember("storage_max_concurrent")) {
+            loaded.local.storage_max_concurrent =
+                static_cast<int>(item["storage_max_concurrent"].asInt64());
+          }
+          if (item.isMember("storage_workers")) {
+            loaded.local.storage_workers =
+                static_cast<int>(item["storage_workers"].asInt64());
           }
           if (item.isMember("playlist_dir")) {
             loaded.local.playlist_dir = item["playlist_dir"].asString();
@@ -463,14 +454,6 @@ const Config &load(const std::string &file) {
   if (!follow.empty()) {
     loaded.local.follow_symlinks = toBool(follow, "MUSIC_FOLLOW_SYMLINKS");
   }
-  const std::string scanOnStart = envValue("MUSIC_SCAN_ON_START");
-  if (!scanOnStart.empty()) {
-    loaded.local.scan_on_start = toBool(scanOnStart, "MUSIC_SCAN_ON_START");
-  }
-  const std::string scanThreads = envValue("MUSIC_SCAN_THREADS");
-  if (!scanThreads.empty()) {
-    loaded.local.scan_threads = toInt(scanThreads, "MUSIC_SCAN_THREADS");
-  }
   const std::string transcode = envValue("MUSIC_TRANSCODE");
   if (!transcode.empty()) {
     loaded.transcode_enabled = toBool(transcode, "MUSIC_TRANSCODE");
@@ -540,9 +523,36 @@ const Config &load(const std::string &file) {
                              std::to_string(loaded.page_size));
   }
   check_library_id(loaded.local.id, "本地库");
-  if (loaded.local.scan_threads < 1 || loaded.local.scan_threads > 256) {
-    throw std::runtime_error("本地库 scan_threads 超出范围 (1-256): " +
-                             std::to_string(loaded.local.scan_threads));
+  if (loaded.local.storage_host.empty() ||
+      loaded.local.storage_host.find('/') != std::string::npos ||
+      loaded.local.storage_host.find(':') != std::string::npos) {
+    throw std::runtime_error(
+        "本地库 storage_host 必须是裸主机名/IP（不带 scheme、端口、路径）: " +
+        loaded.local.storage_host);
+  }
+  if (loaded.local.storage_port <= 0 || loaded.local.storage_port > 65535) {
+    throw std::runtime_error("本地库 storage_port 超出范围 (1-65535): " +
+                             std::to_string(loaded.local.storage_port));
+  }
+  if (loaded.local.storage_scheme != "http" &&
+      loaded.local.storage_scheme != "https") {
+    throw std::runtime_error("本地库 storage_scheme 只能是 http 或 https: " +
+                             loaded.local.storage_scheme);
+  }
+  if (loaded.local.storage_timeout_ms <= 0) {
+    throw std::runtime_error("本地库 storage_timeout_ms 必须为正数: " +
+                             std::to_string(loaded.local.storage_timeout_ms));
+  }
+  if (loaded.local.storage_max_concurrent < 1 ||
+      loaded.local.storage_max_concurrent > 128) {
+    throw std::runtime_error(
+        "本地库 storage_max_concurrent 超出范围 (1-128): " +
+        std::to_string(loaded.local.storage_max_concurrent));
+  }
+  if (loaded.local.storage_workers < 1 ||
+      loaded.local.storage_workers > 64) {
+    throw std::runtime_error("本地库 storage_workers 超出范围 (1-64): " +
+                             std::to_string(loaded.local.storage_workers));
   }
   if (loaded.image_cache.dir.empty()) {
     throw std::runtime_error("image_cache.dir 不能为空");

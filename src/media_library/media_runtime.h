@@ -81,6 +81,8 @@ ArtworkService &artwork_service();
 // 组合根：内部 dynamic_cast 到本地库实现，找不到就返回失败/空。
 std::optional<SourceRef> compat_ref_for(EntityType type, int internal_id);
 std::optional<int> compat_internal_id_of(const SourceRef &ref);
+std::optional<std::string> compat_entity_id(EntityType type, int internal_id);
+std::optional<std::string> compat_artwork_entity_id(const SourceRef &owner);
 std::optional<TrackTransport> compat_track_transport(int internal_id);
 bool compat_snapshot(CatalogSnapshot &out);
 

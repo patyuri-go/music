@@ -8,6 +8,7 @@
 #include "media_library/error.h"
 #include "media_library/playback.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -48,6 +49,19 @@ ResponsePtr serve_track(const RequestPtr &req,
 ResponsePtr serve_artwork(const RequestPtr &req,
                           const media_library::ArtworkRef &artwork,
                           bool head_only);
+
+// 异步版本：本地库按实体 id 直接向存储服务取字节（不占用 Drogon 的 IO
+// 线程）；远端库回到同步路径，在工作线程上算完后回调。callback 可能在工作
+// 线程上被调用。
+using AsyncCallback = std::function<void(const ResponsePtr &)>;
+
+void serve_track_async(const RequestPtr &req,
+                       const media_library::TrackRef &track, bool head_only,
+                       AsyncCallback callback);
+
+void serve_artwork_async(const RequestPtr &req,
+                         const media_library::ArtworkRef &artwork,
+                         bool head_only, AsyncCallback callback);
 
 } // namespace stream_http
 

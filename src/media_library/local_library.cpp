@@ -3,11 +3,11 @@
 #include "config.h"
 #include "db.h"
 #include "http_util.h"
+#include "storage_client.h"
 #include "schema.h"
 #include "storage.h"
 
 #include "api/playlist/playlist.h"
-#include "api/webdav/webdav.h"
 #include "json_util.h"
 #include "media_library/lyric_parser.h"
 
@@ -25,6 +25,11 @@
 
 namespace media_library {
 namespace {
+
+// 封面缓存标签：优先沿用历史虚拟路径哈希，保证已缓存结果不因回填实体 id 失效。
+std::string cover_tag(const std::string &path, const std::string &entity_id) {
+  return path.empty() ? entity_id : path;
+}
 
 // 搜索游标就是聚合流里的十进制偏移，与网易云库同一约定；空/非法一律当 0。
 int search_offset(const std::optional<std::string> &cursor) {
@@ -126,123 +131,6 @@ std::string text_at(const db::Row &row, std::size_t index) {
   return {};
 }
 
-// 云端实体库会话：每线程惰性建一条，配置为空或连接失败时降级。
-db::Session *entity_session() {
-  static thread_local std::unique_ptr<db::Session> session;
-  static thread_local bool initialized = false;
-  if (!initialized) {
-    initialized = true;
-    const auto &cfg = config::get().entity_db;
-    if (!cfg.url.empty()) {
-      try {
-        session = db::openPostgresSession(cfg);
-      } catch (const std::exception &) {
-        session.reset();
-      }
-    }
-  }
-  return session.get();
-}
-
-// 把路径按 '/' 分段做百分号编码，保留分隔符；raw 可带前导/结尾 '/'。
-void append_encoded_path(std::string &out, const std::string &raw) {
-  std::size_t start = 0;
-  while (start < raw.size()) {
-    const std::size_t slash = raw.find('/', start);
-    const std::size_t end = slash == std::string::npos ? raw.size() : slash;
-    if (end > start) {
-      if (out.empty() || out.back() != '/') {
-        out.push_back('/');
-      }
-      out += webdav::encodePathSegment(raw.substr(start, end - start));
-    }
-    if (slash == std::string::npos) {
-      break;
-    }
-    start = slash + 1;
-  }
-}
-
-// 用实体库的 location + 存储节点配置拼出可播放的 WebDAV URL。
-// entity_id 为空、查不到 location、节点不是 WebDAV 时返回 nullopt。
-std::optional<std::string> entity_locator(const std::string &entity_id) {
-  db::Session *session = entity_session();
-  if (session == nullptr || entity_id.empty()) {
-    return std::nullopt;
-  }
-
-  db::ResultSet result;
-  try {
-    result = session->query(
-        "SELECT l.key, s.endpoint, s.type, s.config::text "
-        "FROM entity_locations l "
-        "JOIN storage_nodes s ON s.storage_id = l.storage_id "
-        "WHERE l.entity_id = ? "
-        "ORDER BY (l.state = 'available') DESC, s.name, l.key LIMIT 1",
-        {entity_id});
-  } catch (const std::exception &) {
-    return std::nullopt;
-  }
-  if (result.empty()) {
-    return std::nullopt;
-  }
-
-  const db::Row &row = result.rows.front();
-  const std::string key = text_at(row, 0);
-  std::string endpoint = text_at(row, 1);
-  const std::string storage_type = lower(text_at(row, 2));
-  if (key.empty() || endpoint.empty() || storage_type != "webdav") {
-    return std::nullopt;
-  }
-
-  std::string base_path;
-  std::string user;
-  std::string password;
-  const Json::Value config_json = json_util::parseOrNull(text_at(row, 3));
-  if (!config_json.isNull()) {
-    if (config_json.isMember("base_path")) {
-      base_path = config_json["base_path"].asString();
-    }
-    if (config_json.isMember("username")) {
-      user = config_json["username"].asString();
-    }
-    if (config_json.isMember("password")) {
-      password = config_json["password"].asString();
-    }
-  }
-
-  // storage_nodes.endpoint 不带 scheme，默认 http。
-  std::string scheme = "http://";
-  for (const char *prefix : {"http://", "https://"}) {
-    const std::string candidate(prefix);
-    if (endpoint.rfind(candidate, 0) == 0) {
-      scheme = candidate;
-      endpoint = endpoint.substr(candidate.size());
-      break;
-    }
-  }
-  while (!endpoint.empty() && endpoint.back() == '/') {
-    endpoint.pop_back();
-  }
-  if (endpoint.empty()) {
-    return std::nullopt;
-  }
-
-  std::string url = scheme;
-  if (!user.empty()) {
-    url += webdav::encodePathSegment(user);
-    if (!password.empty()) {
-      url.push_back(':');
-      url += webdav::encodePathSegment(password);
-    }
-    url.push_back('@');
-  }
-  url += endpoint;
-  append_encoded_path(url, base_path);
-  append_encoded_path(url, key);
-  return url;
-}
-
 } // namespace
 
 LocalLibrary::LocalLibrary(std::string library_id, std::string display_name)
@@ -301,6 +189,22 @@ std::optional<SourceRef> LocalLibrary::ref_for_compat(EntityType type,
     return std::nullopt;
   }
   return ref_for(type, internal_id);
+}
+
+std::optional<std::string>
+LocalLibrary::entity_id_of(EntityType type, int internal_id) const {
+  if (type == EntityType::Track) {
+    const auto row = repo::TrackRepo(db()).byId(internal_id);
+    if (row && !row->entity_id.empty()) {
+      return row->entity_id;
+    }
+  } else if (type == EntityType::Album) {
+    const auto row = repo::AlbumRepo(db()).byId(internal_id);
+    if (row && !row->entity_id.empty()) {
+      return row->entity_id;
+    }
+  }
+  return std::nullopt;
 }
 
 std::optional<int> LocalLibrary::internal_id_of(const SourceRef &ref) const {
@@ -385,11 +289,11 @@ Track LocalLibrary::build_track(const repo::Track &row) {
             ref_for(EntityType::AlbumArtist, artist_id), artist->name});
       }
     }
-    const std::string cover = cover_path_of(track.ref);
-    if (!cover.empty()) {
+    const std::string tag = cover_tag(album->cover_path, album->entity_id);
+    if (!tag.empty()) {
       track.artwork = ArtworkRef{
           ref_for(EntityType::Album, album->id), "primary", std::nullopt,
-          std::to_string(std::hash<std::string>{}(cover))};
+          std::to_string(std::hash<std::string>{}(tag))};
     }
   }
 
@@ -416,10 +320,11 @@ Album LocalLibrary::build_album(const repo::Album &row) {
     }
   }
 
-  if (!row.cover_path.empty()) {
+  const std::string tag = cover_tag(row.cover_path, row.entity_id);
+  if (!tag.empty()) {
     album.artwork =
         ArtworkRef{album.ref, "primary", std::nullopt,
-                   std::to_string(std::hash<std::string>{}(row.cover_path))};
+                   std::to_string(std::hash<std::string>{}(tag))};
   }
   return album;
 }
@@ -429,11 +334,12 @@ Artist LocalLibrary::build_artist(const repo::Artist &row) {
   artist.ref = ref_for(EntityType::Artist, row.id);
   artist.name = row.name;
   artist.sort_name = row.sort_name;
-  const std::string cover = cover_path_of(artist.ref);
-  if (!cover.empty()) {
+  const CoverSource cover = cover_source_of(artist.ref);
+  const std::string tag = cover_tag(cover.path, cover.entity_id);
+  if (!tag.empty()) {
     artist.artwork =
         ArtworkRef{artist.ref, "primary", std::nullopt,
-                   std::to_string(std::hash<std::string>{}(cover))};
+                   std::to_string(std::hash<std::string>{}(tag))};
   }
   return artist;
 }
@@ -554,10 +460,11 @@ LocalLibrary::build_tracks(const std::vector<repo::Track> &rows) {
       if (album_artist_it != album_artists.end()) {
         track.album_artists = album_artist_it->second;
       }
-      if (!album.cover_path.empty()) {
+      const std::string tag = cover_tag(album.cover_path, album.entity_id);
+      if (!tag.empty()) {
         track.artwork = ArtworkRef{
             ref_for(EntityType::Album, album.id), "primary", std::nullopt,
-            std::to_string(std::hash<std::string>{}(album.cover_path))};
+            std::to_string(std::hash<std::string>{}(tag))};
       }
     }
 
@@ -604,10 +511,11 @@ LocalLibrary::build_albums(const std::vector<repo::Album> &rows) {
     if (artist_it != album_artists.end()) {
       album.artists = artist_it->second;
     }
-    if (!row.cover_path.empty()) {
+    const std::string tag = cover_tag(row.cover_path, row.entity_id);
+    if (!tag.empty()) {
       album.artwork =
           ArtworkRef{album.ref, "primary", std::nullopt,
-                     std::to_string(std::hash<std::string>{}(row.cover_path))};
+                     std::to_string(std::hash<std::string>{}(tag))};
     }
     out.push_back(std::move(album));
   }
@@ -632,15 +540,17 @@ LocalLibrary::build_artists(const std::vector<repo::Artist> &rows) {
   // 批量路径固定取 album id 最小的一张，避免结果随扫描顺序变化。
   std::unordered_map<int, std::string> covers;
   for (const db::Row &row :
-       db().query("SELECT aa.artist_id, al.cover_path FROM album_artist aa "
-                  "JOIN album al ON al.id = aa.album_id WHERE aa.artist_id "
-                  "IN (" +
+       db().query("SELECT aa.artist_id, al.cover_path, al.entity_id FROM "
+                  "album_artist aa JOIN album al ON al.id = aa.album_id WHERE "
+                  "aa.artist_id IN (" +
                       schema::sql::placeholders(rows.size()) +
-                      ") AND al.cover_path IS NOT NULL AND al.cover_path <> '' "
+                      ") AND ((al.entity_id IS NOT NULL AND al.entity_id <> '') "
+                      "OR (al.cover_path IS NOT NULL AND al.cover_path <> '')) "
                       "ORDER BY aa.artist_id, al.id",
                   artist_params)
            .rows) {
-    covers.emplace(static_cast<int>(int_at(row, 0)), text_at(row, 1));
+    covers.emplace(static_cast<int>(int_at(row, 0)),
+                   cover_tag(text_at(row, 1), text_at(row, 2)));
   }
 
   for (const repo::Artist &row : rows) {
@@ -909,25 +819,16 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
         Error::make(ErrorCode::NotFound, "track not found"));
   }
 
+  if (row->entity_id.empty()) {
+    return Result<PlaybackSource>::failure(
+        Error::make(ErrorCode::NotFound, "track has no entity id"));
+  }
+
   PlaybackSource source;
   source.track = ref;
-  // 优先按云端实体库的位置播放：track.entity_id 指向 entity_locations 中的
-  // 文件，再结合 storage_nodes 的地址与凭据拼成 WebDAV URL。任何一步不满足
-  // （未回填 / 查询失败 / 节点不是 WebDAV）都回退到本地扫描根解析。
-  const auto locator = entity_locator(row->entity_id);
-  if (locator.has_value()) {
-    std::cout << "LocalLibrary::resolve_playback 实体查询成功 "
-              << row->entity_id << std::endl;
-    source.internal_locator = *locator;
-    source.kind = PlaybackKind::WebDav;
-  } else {
-    // 本地库的扫描根可以包含 WebDAV 根：kind 必须描述真实字节来源，
-    // 否则下游会把远端 URL 当成本地文件去打开。
-    source.internal_locator = storage::resolve(row->path);
-    source.kind = webdav::isWebdavUrl(source.internal_locator)
-                      ? PlaybackKind::WebDav
-                      : PlaybackKind::LocalFile;
-  }
+  // 本地库不再读本地文件/WebDAV：字节统一由存储服务按实体 id 提供。
+  source.internal_locator = storage_client::content_url(row->entity_id);
+  source.kind = PlaybackKind::RemoteStream;
   source.mime_type = mime_for(row->format);
   source.content_length = row->size_bytes;
   source.range_supported = true;
@@ -1000,8 +901,10 @@ LocalLibrary::cover_source_of(const SourceRef &owner) const {
       owner.entity_type == EntityType::AlbumArtist) {
     const auto result = db().query(
         "SELECT al.cover_path, al.entity_id FROM album al JOIN album_artist aa "
-        "ON aa.album_id = al.id WHERE aa.artist_id = ? AND al.cover_path IS "
-        "NOT NULL AND al.cover_path <> '' LIMIT 1",
+        "ON aa.album_id = al.id WHERE aa.artist_id = ? AND "
+        "((al.entity_id IS NOT NULL AND al.entity_id <> '') OR "
+        "(al.cover_path IS NOT NULL AND al.cover_path <> '')) "
+        "ORDER BY al.id LIMIT 1",
         {static_cast<std::int64_t>(*internal_id)});
     if (!result.rows.empty()) {
       return {text_at(result.rows.front(), 0), text_at(result.rows.front(), 1)};
@@ -1012,6 +915,15 @@ LocalLibrary::cover_source_of(const SourceRef &owner) const {
 
 std::string LocalLibrary::cover_path_of(const SourceRef &owner) const {
   return cover_source_of(owner).path;
+}
+
+std::optional<std::string>
+LocalLibrary::artwork_entity_id(const SourceRef &owner) const {
+  const CoverSource cover = cover_source_of(owner);
+  if (cover.entity_id.empty()) {
+    return std::nullopt;
+  }
+  return cover.entity_id;
 }
 
 std::optional<std::string>
@@ -1048,25 +960,13 @@ Result<ArtworkLocation> LocalLibrary::artwork_location(const ArtworkRef &ref,
         Error::make(ErrorCode::NotFound, "artwork not found"));
   }
 
-  ArtworkLocation location;
-  // 虚拟路径原样带出：ArtworkService 用它命中 image_cache。
-  if (!cover.path.empty()) {
-    location.mime_type = http_util::mimeType(std::filesystem::path(cover.path));
-    location.cache_virtual_path = cover.path;
-  }
-  // 与 LocalLibrary::resolve_playback 相同：优先按云端实体库的位置取封面，
-  // 未回填、查询失败或节点不是 WebDAV 时回退到本地扫描根。
-  const auto locator = entity_locator(cover.entity_id);
-  if (locator.has_value()) {
-    std::cout << "实体查询成功 " << *locator << ' ' << cover.entity_id
-              << std::endl;
-    location.locator = *locator;
-  } else if (!cover.path.empty()) {
-    location.locator = storage::resolve(cover.path);
-  } else {
+  if (cover.entity_id.empty()) {
     return Result<ArtworkLocation>::failure(
-        Error::make(ErrorCode::NotFound, "artwork locator not found"));
+        Error::make(ErrorCode::NotFound, "album has no entity id"));
   }
+
+  ArtworkLocation location;
+  location.locator = storage_client::content_url(cover.entity_id);
   return Result<ArtworkLocation>::success(std::move(location));
 }
 

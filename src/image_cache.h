@@ -105,10 +105,6 @@ private:
                      const std::string &source_sig,
                      std::int64_t next_at);
 
-  bool downloadToTemp(const std::string &resolved_location,
-                      const std::filesystem::path &tmp_path,
-                      std::string &image_id, std::uintmax_t &bytes,
-                      std::string &error);
   bool hashLocalFile(const std::filesystem::path &path, std::string &image_id,
                      std::uintmax_t &bytes, std::string &error);
   std::optional<std::filesystem::path>

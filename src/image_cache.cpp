@@ -1,6 +1,5 @@
 #include "image_cache.h"
 
-#include "api/webdav/webdav.h"
 #include "config.h"
 #include "database.h"
 #include "db.h"
@@ -393,13 +392,11 @@ ImageCache::ensure(const std::string &virtual_path, const std::string &variant,
 }
 
 bool ImageCache::isLocalSource(const std::string &resolved_location) const {
-  return !webdav::isWebdavUrl(resolved_location);
+  (void)resolved_location;
+  return true;
 }
 
 bool ImageCache::isCacheable(const std::string &resolved_location) const {
-  if (webdav::isWebdavUrl(resolved_location)) {
-    return true;
-  }
   std::error_code ec;
   const fs::path path(resolved_location);
   if (!fs::is_regular_file(path, ec) || ec) {
@@ -411,42 +408,6 @@ bool ImageCache::isCacheable(const std::string &resolved_location) const {
 std::optional<ImageCache::SourceInfo>
 ImageCache::computeSourceSig(const std::string &virtual_path,
                              const std::string &resolved_location) {
-  if (webdav::isWebdavUrl(resolved_location)) {
-    const webdav::Url url = webdav::resolveCredentials(resolved_location);
-    if (url.host.empty()) {
-      return std::nullopt;
-    }
-    webdav::Client client(url);
-    const auto metadata = client.probe(url.path);
-    if (!metadata) {
-      return std::nullopt;
-    }
-    const std::string length = metadata->length >= 0
-                                   ? std::to_string(metadata->length)
-                                   : std::string("-1");
-    const std::string last_modified = metadata->last_modified;
-    const std::string content_type = metadata->content_type;
-    std::string ext = extensionOfContentType(content_type);
-    if (ext.empty()) {
-      ext = extensionOf(fs::path(url.path));
-    }
-    if (ext.empty()) {
-      ext = "img";
-    }
-
-    SourceInfo info;
-    info.source_sig = "v1|webdav|" + virtual_path + "|" + length + "|" +
-                      last_modified + "|" + content_type;
-    info.ext = ext;
-    try {
-      info.size = static_cast<std::uintmax_t>(std::stoull(length));
-    } catch (const std::exception &) {
-      info.size = 0;
-    }
-    info.is_local = false;
-    return info;
-  }
-
   struct stat statbuf {};
   if (::stat(resolved_location.c_str(), &statbuf) != 0 ||
       !S_ISREG(statbuf.st_mode)) {
@@ -579,92 +540,6 @@ void ImageCache::markValidated(const std::string &virtual_path,
                    {next_at, virtual_path, variant, image_id, source_sig});
 }
 
-bool ImageCache::downloadToTemp(const std::string &resolved_location,
-                                const fs::path &tmp_path,
-                                std::string &image_id, std::uintmax_t &bytes,
-                                std::string &error) {
-  const webdav::Url url = webdav::resolveCredentials(resolved_location);
-  if (url.host.empty()) {
-    error = "invalid webdav url";
-    return false;
-  }
-  std::cerr << "[image_cache] webdav fetch " << resolved_location << '\n';
-  webdav::Stream stream = webdav::openStream(url, url.path, {});
-  if (stream.status != 200 && stream.status != 206) {
-    stream.close();
-    error = "webdav image request failed: " + std::to_string(stream.status);
-    return false;
-  }
-  if (stream.length >= 0 &&
-      static_cast<std::uintmax_t>(stream.length) > opt_.max_file_bytes) {
-    stream.close();
-    error = "image exceeds max_file_bytes";
-    return false;
-  }
-
-  std::ofstream output(tmp_path, std::ios::binary | std::ios::trunc);
-  if (!output) {
-    stream.close();
-    error = "cannot create temporary cache file";
-    return false;
-  }
-
-  ContentHasher hasher;
-  std::array<char, 64 * 1024> buffer{};
-  std::uintmax_t total = 0;
-  bool ok = true;
-  while (true) {
-    if (stream.length >= 0 &&
-        total >= static_cast<std::uintmax_t>(stream.length)) {
-      break;
-    }
-    const long long count = stream.read(buffer.data(), buffer.size());
-    if (count < 0) {
-      if (stream.length >= 0 &&
-          total == static_cast<std::uintmax_t>(stream.length)) {
-        break;
-      }
-      ok = false;
-      error = "webdav image read failed";
-      break;
-    }
-    if (count == 0) {
-      break;
-    }
-    total += static_cast<std::uintmax_t>(count);
-    if (opt_.max_file_bytes > 0 && total > opt_.max_file_bytes) {
-      ok = false;
-      error = "image exceeds max_file_bytes";
-      break;
-    }
-    output.write(buffer.data(), static_cast<std::streamsize>(count));
-    if (!output) {
-      ok = false;
-      error = "cannot write temporary cache file";
-      break;
-    }
-    hasher.update(buffer.data(), static_cast<std::size_t>(count));
-  }
-  stream.close();
-  output.close();
-
-  if (!ok) {
-    std::error_code ec;
-    fs::remove(tmp_path, ec);
-    return false;
-  }
-  const std::optional<std::string> digest = hasher.finalHex();
-  if (!digest) {
-    std::error_code ec;
-    fs::remove(tmp_path, ec);
-    error = "cannot hash downloaded image";
-    return false;
-  }
-  image_id = *digest;
-  bytes = total;
-  return true;
-}
-
 bool ImageCache::hashLocalFile(const fs::path &path, std::string &image_id,
                                std::uintmax_t &bytes, std::string &error) {
   std::ifstream input(path, std::ios::binary);
@@ -742,51 +617,9 @@ ImageCache::fetchAndStore(const std::string &virtual_path,
     return source_path;
   }
 
-  if (opt_.max_file_bytes > 0 && source->size > opt_.max_file_bytes) {
-    error = "image exceeds max_file_bytes";
-    return std::nullopt;
-  }
-
-  const fs::path tmp_path = opt_.dir / "tmp" / (randomTempName() + ".part");
-  std::string image_id;
-  std::uintmax_t bytes = 0;
-  if (!downloadToTemp(resolved_location, tmp_path, image_id, bytes, error)) {
-    return std::nullopt;
-  }
-
-  std::lock_guard<std::mutex> commit_lock(commit_mu_);
-  const fs::path target = cachePath(image_id, source->ext);
-  std::error_code ec;
-  fs::create_directories(target.parent_path(), ec);
-  if (ec) {
-    fs::remove(tmp_path, ec);
-    error = "cannot create image cache shard directory";
-    return std::nullopt;
-  }
-
-  if (fs::exists(target, ec)) {
-    fs::remove(tmp_path, ec);
-  } else {
-    fs::rename(tmp_path, target, ec);
-    if (ec) {
-      fs::remove(tmp_path, ec);
-      error = "cannot move temporary image into cache";
-      return std::nullopt;
-    }
-  }
-
-  std::error_code relative_ec;
-  const fs::path relative = fs::relative(target, opt_.dir, relative_ec);
-  const std::string cache_file =
-      relative_ec ? target.string() : relative.generic_string();
-  try {
-    upsert(virtual_path, variant, image_id, source->source_sig, cache_file,
-           false, bytes, next_validate_at);
-  } catch (const std::exception &ex) {
-    std::cerr << "[image_cache] failed to write index row: " << ex.what()
-              << '\n';
-  }
-  return target;
+  // 非本地来源（WebDAV）已删除；这里不应到达。
+  error = "image source is not local";
+  return std::nullopt;
 }
 
 void ImageCache::scheduleRevalidation(const Row &row,
@@ -886,18 +719,12 @@ bool ImageCache::revalidateOne(const RevalTask &task) {
     return true;
   }
   const std::string resolved = storage::resolve(task.virtual_path);
-  const bool local = !webdav::isWebdavUrl(resolved);
-  if (local && !underAnyRoot(fs::path(resolved))) {
+  if (!underAnyRoot(fs::path(resolved))) {
     deleteIfMatches(task.virtual_path, task.variant, task.image_id,
                     task.source_sig);
     return true;
   }
   if (task.is_local) {
-    if (!local) {
-      deleteIfMatches(task.virtual_path, task.variant, task.image_id,
-                      task.source_sig);
-      return true;
-    }
     std::error_code ec1;
     std::error_code ec2;
     const fs::path current = fs::weakly_canonical(resolved, ec1);
