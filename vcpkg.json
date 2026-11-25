@@ -1,0 +1,24 @@
+{
+  "name": "musicd",
+  "version": "0.1.0",
+  "description": "本地优先的音乐库服务",
+  "dependencies": [
+    "asio",
+    "crow",
+    "fmt",
+    "libpq",
+    "openssl",
+    "pugixml",
+    "sqlite3",
+    {
+      "name": "soci",
+      "features": [
+        "sqlite3",
+        "postgresql"
+      ]
+    },
+    "taglib",
+    "zlib"
+  ],
+  "builtin-baseline": "320fc5d9fb666ebb1e76a08e63870e87a2063fe9"
+}

@@ -5,7 +5,33 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Release)
 
-add_subdirectory(./third_party/)
+# ---------------------------------------------------------------------------
+# vcpkg manifest 模式
+#
+# 依赖版本由 vcpkg.json 的 builtin-baseline 决定；外部 checkout 必须包含该
+# commit，否则 registry 里的 versions 与实际可安装的 port 不一致，问题会推迟
+# 到构建期才暴露。这里在 configure 阶段做一次廉价的预检。
+# ---------------------------------------------------------------------------
+if(NOT DEFINED ENV{VCPKG_ROOT})
+  message(FATAL_ERROR "未设置 VCPKG_ROOT（例如 export VCPKG_ROOT=/opt/vcpkg）")
+endif()
+set(MUSICD_VCPKG_ROOT "$ENV{VCPKG_ROOT}")
+
+if(NOT EXISTS "${MUSICD_VCPKG_ROOT}/vcpkg")
+  message(FATAL_ERROR "VCPKG_ROOT=${MUSICD_VCPKG_ROOT} 下找不到 vcpkg 可执行文件")
+endif()
+
+set(MUSICD_VCPKG_BASELINE "320fc5d9fb666ebb1e76a08e63870e87a2063fe9")
+execute_process(
+  COMMAND git -C "${MUSICD_VCPKG_ROOT}" cat-file -e "${MUSICD_VCPKG_BASELINE}^{commit}"
+  RESULT_VARIABLE MUSICD_BASELINE_CHECK
+  OUTPUT_QUIET ERROR_QUIET
+)
+if(MUSICD_BASELINE_CHECK)
+  message(FATAL_ERROR
+    "vcpkg checkout 缺少 baseline ${MUSICD_VCPKG_BASELINE}；"
+    "更新 ${MUSICD_VCPKG_ROOT}，或同步调整 vcpkg.json 的 builtin-baseline")
+endif()
 
 add_executable(musicd
   ./src/config.cpp
@@ -57,6 +83,14 @@ add_executable(musicd
   ./src/api/webdav/webdav_stream.cpp
 )
 
+# 全部依赖来自 vcpkg manifest（见 vcpkg.json）。
+find_package(asio CONFIG REQUIRED)
+find_package(Crow CONFIG REQUIRED)
+find_package(SOCI CONFIG REQUIRED COMPONENTS Core PostgreSQL SQLite3)
+find_package(TagLib CONFIG REQUIRED)
+find_package(pugixml CONFIG REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
+find_package(PostgreSQL REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 set_target_properties(musicd PROPERTIES
@@ -65,34 +99,37 @@ set_target_properties(musicd PROPERTIES
 
 target_compile_options(musicd PRIVATE -g)
 
-target_link_libraries(musicd PRIVATE Crow SQLiteCpp SOCI::SOCI tag pugixml OpenSSL::SSL OpenSSL::Crypto)
+# asio 以 standalone 方式使用（不依赖 Boost）。ASIO_NO_DEPRECATED 由
+# Crow::Crow 的 INTERFACE 定义带出。
+target_compile_definitions(musicd PRIVATE ASIO_STANDALONE)
 
-# TagLib 的 CMake 目标只导出 INSTALL_INTERFACE 路径，不传播 build-tree include。
-# 需手动补充三层：
-#   1) taglib-2.3.2          → 让 #include <taglib/fileref.h> 解析到 taglib/ 子目录
-#   2) taglib/toolkit        → 让 toolkit/ 内 #include "tfile.h" 等相对包含生效
-#   3) taglib/mpeg           → 让 mpeg 子目录头文件可被找到
+# sqlite3 直接用于 src/db/soci_session.cpp（#include <sqlite3.h>），
+# 除 SOCI 的后端传递外再显式链接一次，保证头文件路径可用。
+target_link_libraries(musicd PRIVATE
+  Crow::Crow
+  asio::asio
+  SOCI::SOCI
+  unofficial::sqlite3::sqlite3
+  TagLib::tag
+  pugixml::pugixml
+  PostgreSQL::PostgreSQL
+  OpenSSL::SSL
+  OpenSSL::Crypto
+)
+
 target_include_directories(musicd PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/jellyfin
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/playlist
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/webdav
   ${CMAKE_CURRENT_SOURCE_DIR}/src/api/api-enhanced
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio-asio-1-36-0/asio/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib/toolkit
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib/mpeg
 )
 
-# 测试程序（C++）：test/ 目录。
+# 测试程序（C++）：test/ 目录。均为独立可执行文件，手工运行。
 add_executable(playlist_test
   ./test/playlist_test.cpp
 )
-target_include_directories(playlist_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/Crow-1.3.1/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio-asio-1-36-0/asio/include
-)
+target_link_libraries(playlist_test PRIVATE Crow::Crow asio::asio)
 target_compile_definitions(playlist_test PRIVATE ASIO_STANDALONE)
 set_target_properties(playlist_test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
@@ -102,16 +139,8 @@ set_target_properties(playlist_test PROPERTIES
 add_executable(lyrics_test
   ./test/lyrics_test.cpp
 )
-target_include_directories(lyrics_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/Crow-1.3.1/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio-asio-1-36-0/asio/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib/toolkit
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib/mpeg
-)
+target_link_libraries(lyrics_test PRIVATE Crow::Crow asio::asio TagLib::tag)
 target_compile_definitions(lyrics_test PRIVATE ASIO_STANDALONE)
-target_link_libraries(lyrics_test PRIVATE tag)
 set_target_properties(lyrics_test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
@@ -120,16 +149,8 @@ set_target_properties(lyrics_test PROPERTIES
 add_executable(artists_test
   ./test/artists_test.cpp
 )
-target_include_directories(artists_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/Crow-1.3.1/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio-asio-1-36-0/asio/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib/toolkit
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/taglib-2.3.2/taglib/mpeg
-)
+target_link_libraries(artists_test PRIVATE Crow::Crow asio::asio TagLib::tag)
 target_compile_definitions(artists_test PRIVATE ASIO_STANDALONE)
-target_link_libraries(artists_test PRIVATE tag)
 set_target_properties(artists_test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
@@ -142,7 +163,7 @@ add_executable(amll_ttml_test
 target_include_directories(amll_ttml_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(amll_ttml_test PRIVATE pugixml)
+target_link_libraries(amll_ttml_test PRIVATE pugixml::pugixml)
 set_target_properties(amll_ttml_test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )

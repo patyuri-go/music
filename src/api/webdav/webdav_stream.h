@@ -1,6 +1,6 @@
 #pragma once
 
-#include <taglib/toolkit/tiostream.h>
+#include <taglib/tiostream.h>
 
 #include <memory>
 #include <string>

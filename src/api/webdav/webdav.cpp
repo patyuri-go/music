@@ -1,5 +1,3 @@
-#define ASIO_STANDALONE
-
 #include "webdav.h"
 
 #include "config.h"

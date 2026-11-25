@@ -23,7 +23,7 @@
 
 #include <taglib/fileref.h>
 #include <taglib/tag.h>
-#include <taglib/toolkit/tpropertymap.h>
+#include <taglib/tpropertymap.h>
 
 #include "crow/json.h"
 
