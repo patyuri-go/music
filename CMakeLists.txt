@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.23)
 project(musicd)
 
+enable_testing()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Release)
@@ -89,6 +91,7 @@ find_package(SOCI CONFIG REQUIRED COMPONENTS Core PostgreSQL SQLite3)
 # Drogon 必须放在 SOCI 之后：它的 DrogonConfig.cmake 会把自带 FindSQLite3.cmake
 # 塞进 CMAKE_MODULE_PATH，遮住 CMake 内置模块，导致 SQLite3::SQLite3 目标缺失。
 find_package(Drogon CONFIG REQUIRED)
+find_package(GTest CONFIG REQUIRED)
 find_package(TagLib CONFIG REQUIRED)
 find_package(pugixml CONFIG REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
@@ -230,3 +233,9 @@ target_link_libraries(amll_ttml_test PRIVATE pugixml::pugixml)
 set_target_properties(amll_ttml_test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
+
+# 现有独立测试注册进 CTest；集成测试仍由 test/run_integration.sh 负责。
+add_test(NAME amll_ttml COMMAND $<TARGET_FILE:amll_ttml_test>)
+
+# 单元测试（GTest）独立目录，后续测试直接加源文件。
+add_subdirectory(test/unit)

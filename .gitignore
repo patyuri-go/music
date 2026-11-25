@@ -30,6 +30,7 @@ config.json
 /storage_test
 /fake_storage
 /test_fixture
+/unit_tests
 
 /third_party/*/tests/
 /third_party/*/test/
