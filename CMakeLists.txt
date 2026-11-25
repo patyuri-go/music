@@ -221,21 +221,7 @@ set_target_properties(test_fixture PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 
-# AMLL TTML 正反解析测试：只依赖 pugixml，不需要 TagLib。
-add_executable(amll_ttml_test
-  ./test/amll_ttml_test.cpp
-  ./src/tools/amll_ttml.cpp
-)
-target_include_directories(amll_ttml_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-target_link_libraries(amll_ttml_test PRIVATE pugixml::pugixml)
-set_target_properties(amll_ttml_test PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
-
-# 现有独立测试注册进 CTest；集成测试仍由 test/run_integration.sh 负责。
-add_test(NAME amll_ttml COMMAND $<TARGET_FILE:amll_ttml_test>)
+# AMLL TTML 单测已并入 unit_tests（见 test/unit/CMakeLists.txt）。
 
 # 单元测试（GTest）独立目录，后续测试直接加源文件。
 add_subdirectory(test/unit)

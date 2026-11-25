@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # 存储代理与现有功能集成测试。
 #
+# 单元测试（GTest）由 ctest 运行；本脚本只跑需要数据库/外部进程的集成测试。
+#
 #   ./test/run_integration.sh [config.json]
 #
 # 前置：cmake --build build 已生成 ./musicd ./fake_storage ./test_fixture 等。
@@ -24,7 +26,7 @@ MAIN_PORT=15667
 JF_PORT=19000
 STORAGE_PORT=15666
 
-for bin in musicd fake_storage test_fixture playlist_test lyrics_test artists_test storage_test amll_ttml_test; do
+for bin in musicd fake_storage test_fixture playlist_test lyrics_test artists_test storage_test; do
   if [[ ! -x "$ROOT/$bin" ]]; then
     echo "缺少可执行文件 $ROOT/$bin（先构建）" >&2
     exit 2
@@ -131,7 +133,6 @@ run() {
   fi
 }
 
-run "AMLL TTML 单元测试" "$ROOT/amll_ttml_test"
 run "播放列表" "$ROOT/playlist_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
 run "歌词" "$ROOT/lyrics_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
 run "艺术家" "$ROOT/artists_test" 127.0.0.1 "$MAIN_PORT"

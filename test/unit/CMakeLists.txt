@@ -5,14 +5,19 @@
 
 add_executable(unit_tests
   ./source_ref_test.cpp
+  ./amll_ttml_test.cpp
   ${PROJECT_SOURCE_DIR}/src/media_library/source_ref.cpp
+  ${PROJECT_SOURCE_DIR}/src/tools/amll_ttml.cpp
 )
 
 target_include_directories(unit_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/src
 )
 
-target_link_libraries(unit_tests PRIVATE GTest::gtest_main)
+target_link_libraries(unit_tests PRIVATE
+  GTest::gtest_main
+  pugixml::pugixml
+)
 
 set_target_properties(unit_tests PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
