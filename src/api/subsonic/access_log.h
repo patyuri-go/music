@@ -1,7 +1,7 @@
 #ifndef SUBSONIC_ACCESS_LOG_H
 #define SUBSONIC_ACCESS_LOG_H
 
-#include "crow/http_request.h"
+#include "http_server.h"
 
 #include <chrono>
 #include <string>
@@ -22,7 +22,7 @@ namespace subsonic {
 // 永不打印 u / t / s / p（Subsonic 的凭据就在 query 里）。
 class AccessLog {
 public:
-  AccessLog(const crow::request &req, std::string method, bool enabled);
+  AccessLog(const http_server::RequestPtr &req, std::string method, bool enabled);
   ~AccessLog();
 
   AccessLog(const AccessLog &) = delete;

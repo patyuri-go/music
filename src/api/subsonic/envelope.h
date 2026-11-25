@@ -1,10 +1,10 @@
 #ifndef SUBSONIC_ENVELOPE_H
 #define SUBSONIC_ENVELOPE_H
 
-#include "crow/http_response.h"
-#include "crow/json.h"
+#include "http_server.h"
 #include "media_library/error.h"
 
+#include <json/json.h>
 #include <string>
 
 namespace subsonic {
@@ -31,16 +31,16 @@ Code code_of(media_library::ErrorCode code) noexcept;
 std::string error_name(media_library::ErrorCode code);
 
 // 构造一条错误响应：status=failed + error{code,message}。
-crow::response failure_response(Code code, const std::string &message);
+http_server::ResponsePtr failure_response(Code code, const std::string &message);
 
 // 构造一条成功响应：把 payload 塞进 subsonic-response 信封。
 // payload 为空对象时只输出 ping 那种最小信封。
-crow::response ok_response(crow::json::wvalue payload,
+http_server::ResponsePtr ok_response(Json::Value payload,
                            const std::string &server_name,
                            const std::string &server_version);
 
 // 统一的 JSON 出口（Content-Type: application/json; charset=utf-8）。
-crow::response json_response(const crow::json::wvalue &body);
+http_server::ResponsePtr json_response(const Json::Value &body);
 
 } // namespace subsonic
 

@@ -34,7 +34,7 @@ public:
   // 在真正读字节之前把元信息确定下来。
   //
   // 远端流是惰性连接的：info().size_bytes 在第一次 read 之前可能是 -1。
-  // 而 HTTP 层必须先有长度才能给出正确的 Content-Length，否则 crow 会按
+  // 而 HTTP 层必须先有长度才能给出正确的 Content-Length，否则会按
   // 空 body 补一个 "Content-Length: 0"，客户端因此认为响应体为空。
   // 默认实现什么都不做（本地文件、已知长度的流无需探测）。
   virtual Status prepare() { return Status::success(); }

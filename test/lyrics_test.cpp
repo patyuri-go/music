@@ -25,7 +25,9 @@
 #include <taglib/tag.h>
 #include <taglib/tpropertymap.h>
 
-#include "crow/json.h"
+#include <json/json.h>
+
+#include "json_util.h"
 
 namespace fs = std::filesystem;
 
@@ -122,14 +124,14 @@ int findTrackIdByName(const std::string &host, int port, int root_id,
                       const std::string &name) {
   HttpResponse r = httpRequest(host, port, "GET",
                                "/api/fs/browse/" + std::to_string(root_id));
-  auto items = crow::json::load(r.body);
-  if (!items || items.t() != crow::json::type::List) {
+  auto items = json_util::parseOrNull(r.body);
+  if (items.isNull() || !items.isArray()) {
     return 0;
   }
   for (const auto &it : items) {
-    if (it.has("name") && it.has("trackId") &&
-        std::string(it["name"].s()) == name) {
-      return static_cast<int>(it["trackId"].i());
+    if (it.isMember("name") && it.isMember("trackId") &&
+        std::string(it["name"].asString()) == name) {
+      return static_cast<int>(it["trackId"].asInt64());
     }
   }
   return 0;
@@ -180,9 +182,9 @@ int main(int argc, char **argv) {
   check(r.status == 200, "POST /api/roots -> 200");
   int root_id = 0;
   {
-    auto j = crow::json::load(r.body);
-    if (j && j.has("id")) {
-      root_id = static_cast<int>(j["id"].i());
+    auto j = json_util::parseOrNull(r.body);
+    if (!j.isNull() && j.isMember("id")) {
+      root_id = static_cast<int>(j["id"].asInt64());
     }
   }
   check(root_id > 0, "注册根返回 id");
@@ -198,10 +200,10 @@ int main(int argc, char **argv) {
   check(r.status == 200, "POST /api/fs/batch scan -> 200");
   std::string job_id;
   {
-    auto j = crow::json::load(r.body);
-    if (j && j.t() == crow::json::type::List && j.size() > 0 &&
-        j[0].has("jobId")) {
-      job_id = std::to_string(j[0]["jobId"].i());
+    auto j = json_util::parseOrNull(r.body);
+    if (!j.isNull() && j.isArray() && j.size() > 0 &&
+        j[0].isMember("jobId")) {
+      job_id = std::to_string(j[0]["jobId"].asInt64());
     }
   }
   check(!job_id.empty(), "扫描返回 jobId");
@@ -210,9 +212,9 @@ int main(int argc, char **argv) {
     for (int k = 0; k < 120 && !finished; ++k) {
       ::usleep(500000);
       r = httpRequest(host, port, "GET", "/api/jobs/" + job_id);
-      auto j = crow::json::load(r.body);
-      if (j && j.has("state")) {
-        const std::string st = j["state"].s();
+      auto j = json_util::parseOrNull(r.body);
+      if (!j.isNull() && j.isMember("state")) {
+        const std::string st = j["state"].asString();
         if (st == "done" || st == "error") {
           finished = true;
           check(st == "done", "扫描 job 完成 (state=done)");
@@ -232,19 +234,19 @@ int main(int argc, char **argv) {
     r = httpRequest(host, jf_port, "GET",
                     "/Audio/" + trackGuid(embedded_id) + "/Lyrics");
     check(r.status == 200, "GET /Audio/<id>/Lyrics (内嵌) -> 200");
-    auto j = crow::json::load(r.body);
-    check(j && j.has("Lyrics") && j["Lyrics"].size() >= 2,
+    auto j = json_util::parseOrNull(r.body);
+    check(!j.isNull() && j.isMember("Lyrics") && j["Lyrics"].size() >= 2,
           "内嵌歌词 Lyrics 行数 >= 2");
-    check(j && j.has("Metadata") && j["Metadata"].has("IsSynced") &&
-              j["Metadata"]["IsSynced"].b(),
+    check(!j.isNull() && j.isMember("Metadata") && j["Metadata"].isMember("IsSynced") &&
+              j["Metadata"]["IsSynced"].asBool(),
           "内嵌歌词 IsSynced=true");
-    if (j && j.has("Lyrics") && j["Lyrics"].size() > 0) {
-      check(j["Lyrics"][0].has("Start") && j["Lyrics"][0]["Start"].i() == 15000000,
+    if (!j.isNull() && j.isMember("Lyrics") && j["Lyrics"].size() > 0) {
+      check(j["Lyrics"][0].isMember("Start") && j["Lyrics"][0]["Start"].asInt64() == 15000000,
             "内嵌首行 Start=15000000 ticks");
     }
     r = httpRequest(host, jf_port, "GET", "/Items/" + trackGuid(embedded_id));
-    auto it = crow::json::load(r.body);
-    check(it && it.has("HasLyrics") && it["HasLyrics"].b(),
+    auto it = json_util::parseOrNull(r.body);
+    check(!it.isNull() && it.isMember("HasLyrics") && it["HasLyrics"].asBool(),
           "内嵌曲目 DTO HasLyrics=true");
   }
 
@@ -256,8 +258,8 @@ int main(int argc, char **argv) {
     r = httpRequest(host, jf_port, "GET",
                     "/Audio/" + trackGuid(sibling_id) + "/Lyrics");
     check(r.status == 200, "GET /Audio/<id>/Lyrics (同名 lrc) -> 200");
-    auto j = crow::json::load(r.body);
-    check(j && j.has("Lyrics") && j["Lyrics"].size() >= 2,
+    auto j = json_util::parseOrNull(r.body);
+    check(!j.isNull() && j.isMember("Lyrics") && j["Lyrics"].size() >= 2,
           "同名 lrc 歌词 Lyrics 行数 >= 2");
   }
 

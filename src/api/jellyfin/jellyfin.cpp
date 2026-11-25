@@ -7,10 +7,10 @@
 #include "media_library/media_runtime.h"
 #include "stream_http.h"
 
-#include "crow/app.h"
-#include "crow/http_request.h"
-#include "crow/http_response.h"
-#include "crow/json.h"
+#include "http_server.h"
+#include <json/json.h>
+
+#include "json_util.h"
 
 #include <algorithm>
 #include <cctype>
@@ -59,7 +59,7 @@ std::vector<IdPair> album_artist_pairs_of(
   return out;
 }
 
-// 路径参数由 Crow 原样给出（未解码），解析前先做百分号解码。
+// Drogon 的路径参数保持原样（未解码），解析前先做百分号解码。
 std::optional<media_library::SourceRef>
 parse_path_ref(const std::string &text) {
   return parseItemId(http_util::urlDecode(text));
@@ -71,40 +71,61 @@ std::string lower(std::string s) {
   return s;
 }
 
-// 同时按原样与全小写注册路由，兼容 ASP.NET 的大小写不敏感路由。
-struct RouteReg {
-  crow::SimpleApp &app;
+// 声明式路径（/Items/<string>/Images/<string>）→ Drogon 占位符。
+std::string drogonPath(const std::string &raw_path) {
+  std::string out;
+  int index = 0;
+  for (std::size_t i = 0; i < raw_path.size();) {
+    if (raw_path[i] == '<') {
+      const std::size_t close = raw_path.find('>', i);
+      if (close == std::string::npos) {
+        out.append(raw_path.substr(i));
+        break;
+      }
+      ++index;
+      out.push_back('{');
+      out += std::to_string(index);
+      out.push_back('}');
+      i = close + 1;
+      continue;
+    }
+    out.push_back(raw_path[i]);
+    ++i;
+  }
+  return out;
+}
+
+// Jellyfin 路由声明助手：保留「路径 + .methods(...) + lambda」的写法，
+// 内部翻译成 Drogon 注册。Drogon 的路径正则本身 icase，
+// 所以不需要再额外注册小写形态（参数值也不会被改写）。
+struct RouteBuilder {
+  int port;
   std::string path;
-  std::function<void(crow::DynamicRule &)> apply_methods;
-  RouteReg(crow::SimpleApp &a, std::string p) : app(a), path(std::move(p)) {}
-  template <typename... M> RouteReg &methods(M... m) {
-    apply_methods = [m...](crow::DynamicRule &r) { r.methods(m...); };
+  std::vector<drogon::HttpMethod> verbs{drogon::Get};
+
+  RouteBuilder(int p, std::string raw) : port(p), path(drogonPath(raw)) {}
+
+  template <typename... M> RouteBuilder &methods(M... m) {
+    verbs = {m...};
     return *this;
   }
-  template <typename F> void operator()(F f) {
-    // 路由匹配已由 crow::case_insensitive_routing() 全局开启大小写不敏感，
-    // 这里只需按原样注册一次。
-    auto &r = app.route_dynamic(path);
-    if (apply_methods)
-      apply_methods(r);
-    r(f);
+
+  template <typename F> void operator()(F f) const {
+    for (const drogon::HttpMethod method : verbs) {
+      http_server::onPort(port, method, path, f);
+    }
   }
 };
 
 // 查询参数读取：Jellyfin 客户端使用 PascalCase（如 ParentId），
-// 而 Crow 的 url_params.get() 大小写敏感，这里统一做大小写不敏感匹配。
-std::string qs(const crow::request &req, const char *key) {
-  const std::string want = lower(std::string(key));
-  for (const auto &k : req.url_params.keys()) {
-    if (lower(k) == want) {
-      const char *v = req.url_params.get(k);
-      return v ? std::string(v) : std::string();
-    }
-  }
-  return std::string();
+// 客户端大小写混用，这里统一做大小写不敏感匹配。
+std::string qs(const http_server::RequestPtr &req, const char *key) {
+  const std::optional<std::string> value =
+      http_server::Query(req).get(std::string(key));
+  return value.has_value() ? *value : std::string();
 }
 
-int qsInt(const crow::request &req, const char *key, int def) {
+int qsInt(const http_server::RequestPtr &req, const char *key, int def) {
   const std::string v = qs(req, key);
   if (v.empty()) {
     return def;
@@ -116,7 +137,7 @@ int qsInt(const crow::request &req, const char *key, int def) {
   }
 }
 
-bool qsBool(const crow::request &req, const char *key, bool def) {
+bool qsBool(const http_server::RequestPtr &req, const char *key, bool def) {
   const std::string v = qs(req, key);
   if (v.empty()) {
     return def;
@@ -146,13 +167,13 @@ bool listHas(const std::string &csv, const std::string &needle) {
   return false;
 }
 
-crow::response json(int code, const crow::json::wvalue &v) {
-  return http_util::jsonResponse(code, v.dump());
+http_server::ResponsePtr json(int code, const Json::Value &v) {
+  return http_util::jsonResponse(code, json_util::dump(v));
 }
 
-crow::response emptyList() {
-  crow::json::wvalue arr;
-  arr = crow::json::wvalue::list{};
+http_server::ResponsePtr emptyList() {
+  Json::Value arr;
+  arr = Json::Value(Json::arrayValue);
   return json(200, arr);
 }
 
@@ -162,7 +183,7 @@ crow::response emptyList() {
 // library_priority 分层，单库结果用该库自己的自然顺序）。客户端传来的
 // sortBy / sortOrder 被忽略——门面重排会打散聚合 tier，且远端库没有
 // 全量数据，无法给出「全局有序」的保证。
-crow::response respondItems(std::vector<crow::json::wvalue> &items,
+http_server::ResponsePtr respondItems(std::vector<Json::Value> &items,
                             int startIndex, int limit) {
   const int total = static_cast<int>(items.size());
   int from = startIndex < 0 ? 0 : startIndex;
@@ -173,7 +194,7 @@ crow::response respondItems(std::vector<crow::json::wvalue> &items,
   if (limit > 0 && from + limit < total) {
     to = from + limit;
   }
-  std::vector<crow::json::wvalue> out;
+  std::vector<Json::Value> out;
   for (int i = from; i < to; ++i) {
     out.push_back(std::move(items[i]));
   }
@@ -185,8 +206,8 @@ crow::response respondItems(std::vector<crow::json::wvalue> &items,
 // 快照只携带统一领域模型；兼容层负责把 SourceRef 映射成对外 ID。
 // ---------------------------------------------------------------- 视图/系统
 
-crow::json::wvalue musicView() {
-  crow::json::wvalue v;
+Json::Value musicView() {
+  Json::Value v;
   v["Name"] = "Music";
   v["ServerId"] = serverId();
   v["Id"] = musicViewId();
@@ -196,8 +217,8 @@ crow::json::wvalue musicView() {
   return v;
 }
 
-crow::json::wvalue playlistsView() {
-  crow::json::wvalue v;
+Json::Value playlistsView() {
+  Json::Value v;
   v["Name"] = "Playlists";
   v["ServerId"] = serverId();
   v["Id"] = playlistsViewId();
@@ -207,15 +228,15 @@ crow::json::wvalue playlistsView() {
   return v;
 }
 
-crow::response userViews() {
-  std::vector<crow::json::wvalue> items;
+http_server::ResponsePtr userViews() {
+  std::vector<Json::Value> items;
   items.push_back(musicView());
   items.push_back(playlistsView());
   return json(200, queryResult(std::move(items), 2, 0));
 }
 
-crow::json::wvalue publicSystemInfo() {
-  crow::json::wvalue r;
+Json::Value publicSystemInfo() {
+  Json::Value r;
   r["LocalAddress"] = "127.0.0.1";
   r["ServerName"] = serverName();
   r["Version"] = kVersion;
@@ -226,8 +247,8 @@ crow::json::wvalue publicSystemInfo() {
   return r;
 }
 
-crow::json::wvalue systemInfo() {
-  crow::json::wvalue r = publicSystemInfo();
+Json::Value systemInfo() {
+  Json::Value r = publicSystemInfo();
   r["OperatingSystemDisplayName"] = "Linux";
   r["PackageName"] = "";
   r["HasPendingRestart"] = false;
@@ -246,22 +267,22 @@ crow::json::wvalue systemInfo() {
   r["HasUpdateAvailable"] = false;
   r["EncoderLocation"] = "";
   r["SystemArchitecture"] = "X64";
-  r["CompletedInstallations"] = crow::json::wvalue(crow::json::wvalue::list{});
+  r["CompletedInstallations"] = Json::Value(Json::Value(Json::arrayValue));
   r["CastReceiverApplications"] =
-      crow::json::wvalue(crow::json::wvalue::list{});
+      Json::Value(Json::Value(Json::arrayValue));
   return r;
 }
 
-crow::json::wvalue brandingOptions() {
-  crow::json::wvalue r;
+Json::Value brandingOptions() {
+  Json::Value r;
   r["LoginDisclaimer"] = "";
   r["CustomCss"] = "";
   r["SplashscreenEnabled"] = false;
   return r;
 }
 
-crow::json::wvalue displayPreferences(const std::string &id) {
-  crow::json::wvalue r;
+Json::Value displayPreferences(const std::string &id) {
+  Json::Value r;
   r["Id"] = id;
   r["ViewType"] = "";
   r["SortBy"] = "";
@@ -269,7 +290,7 @@ crow::json::wvalue displayPreferences(const std::string &id) {
   r["RememberIndexing"] = false;
   r["PrimaryImageHeight"] = 250;
   r["PrimaryImageWidth"] = 250;
-  crow::json::wvalue prefs;
+  Json::Value prefs;
   prefs["client"] = "emby";
   r["CustomPrefs"] = std::move(prefs);
   r["ScrollDirection"] = "Horizontal";
@@ -300,7 +321,7 @@ std::vector<std::string> splitCsv(const std::string &s) {
   return out;
 }
 
-crow::json::wvalue remoteTrackItem(const media_library::Track &track) {
+Json::Value remoteTrackItem(const media_library::Track &track) {
   const std::string album_key =
       track.album.has_value() ? track.album->title : std::string();
   std::vector<std::pair<std::string, int>> genres;
@@ -316,14 +337,14 @@ crow::json::wvalue remoteTrackItem(const media_library::Track &track) {
                    album_artist_pairs_of(track.album_artists), genres);
 }
 
-crow::json::wvalue remoteAlbumItem(const media_library::Album &album) {
+Json::Value remoteAlbumItem(const media_library::Album &album) {
   return albumItem(album, itemId(album.ref),
                    album_artist_pairs_of(album.artists), 0,
                    album.artwork.has_value() ? "1" : "", 0);
 }
 
 // 搜索命中 → 列表条目。SearchHit 只带描述字段，够造列表 DTO。
-crow::json::wvalue searchHitItem(const media_library::SearchHit &hit) {
+Json::Value searchHitItem(const media_library::SearchHit &hit) {
   const std::string id = itemId(hit.ref);
   if (hit.kind == media_library::EntityType::Track) {
     media_library::Track track;
@@ -369,7 +390,7 @@ crow::json::wvalue searchHitItem(const media_library::SearchHit &hit) {
 // 歌单列表：只经播放列表总管（跨库汇总）。门面不排序、不遍历库、不换源。
 // Jellyfin 客户端用 startIndex/limit 翻页，总管用不透明游标，因此每次向总管
 // 取「startIndex + limit」条再切片——门面不持有游标，也不做缓存。
-crow::response playlistListPage(int startIndex, int limit) {
+http_server::ResponsePtr playlistListPage(int startIndex, int limit) {
   const std::shared_ptr<media_library::PlaylistDirectory> directory =
       media_library::playlist_directory_ptr();
   if (directory == nullptr) {
@@ -384,7 +405,7 @@ crow::response playlistListPage(int startIndex, int limit) {
     return emptyList();
   }
 
-  std::vector<crow::json::wvalue> items;
+  std::vector<Json::Value> items;
   int index = 0;
   for (const auto &sourced : result.value().items) {
     if (index++ < from) {
@@ -412,7 +433,7 @@ crow::response playlistListPage(int startIndex, int limit) {
                                from + static_cast<int>(items.size()), from));
 }
 
-crow::response handleItems(const crow::request &req) {
+http_server::ResponsePtr handleItems(const http_server::RequestPtr &req) {
   const std::string parent = qs(req, "parentId");
   const std::string include = qs(req, "includeItemTypes");
   const std::string search = qs(req, "searchTerm");
@@ -441,7 +462,7 @@ crow::response handleItems(const crow::request &req) {
     return playlistListPage(startIndex, limit);
   }
 
-  std::vector<crow::json::wvalue> items;
+  std::vector<Json::Value> items;
 
   if (!search.empty()) {
     media_library::SearchQuery query;
@@ -541,13 +562,13 @@ crow::response handleItems(const crow::request &req) {
   return emptyList();
 }
 
-crow::response handleLatest(const crow::request &req) {
+http_server::ResponsePtr handleLatest(const http_server::RequestPtr &req) {
   // 「最近添加」需要按 added_at 跨库排序，路由器没有该能力，不做本地特例。
   (void)req;
   return emptyList();
 }
 
-crow::response handleItem(const std::string &idstr) {
+http_server::ResponsePtr handleItem(const std::string &idstr) {
   const std::string decoded = http_util::urlDecode(idstr);
   if (decoded == musicViewId() || decoded == playlistsViewId()) {
     return json(200, musicView());
@@ -630,8 +651,8 @@ crow::response handleItem(const std::string &idstr) {
 }
 
 // 封面字节统一从 ArtworkService 出：选源交给 MediaRouter，locator 不外泄。
-crow::response handleImage(const crow::request &req, const std::string &idstr) {
-  const bool head_only = req.method == crow::HTTPMethod::HEAD;
+http_server::ResponsePtr handleImage(const http_server::RequestPtr &req, const std::string &idstr) {
+  const bool head_only = req->method() == drogon::Head;
 
   // 歌单没有独立的封面实体（封面属于专辑），路由器不提供该能力：歌单 id 走到
   // 下面的 parse_path_ref 后自然 404，不做本地特例实现。
@@ -650,7 +671,7 @@ crow::response handleImage(const crow::request &req, const std::string &idstr) {
   return stream_http::serve_artwork(req, artwork, head_only);
 }
 
-crow::response handleStream(const crow::request &req,
+http_server::ResponsePtr handleStream(const http_server::RequestPtr &req,
                             const std::string &idstr) {
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
@@ -659,7 +680,7 @@ crow::response handleStream(const crow::request &req,
   }
   // 音频字节统一从播放会话出：选源交给 MediaRouter，locator 不外泄。
   return stream_http::serve_track(req, *ref,
-                                  req.method == crow::HTTPMethod::HEAD);
+                                  req->method() == drogon::Head);
 }
 
 // 字符个数（按码点计）。Jellyfin 的 Cue.Position 是 Text 里的下标，
@@ -679,8 +700,8 @@ std::size_t utf8_length(const std::string &text) {
 //
 // 词文本必须正好拼成整行，否则下标无从对齐 —— 这种情况宁可不给逐字轨，
 // 也不出半截 Cue 让客户端高亮错位。
-crow::json::wvalue::list buildCues(const media_library::LyricLine &line) {
-  crow::json::wvalue::list cues;
+Json::Value buildCues(const media_library::LyricLine &line) {
+  Json::Value cues(Json::arrayValue);
   const std::vector<media_library::LyricWord> words =
       media_library::line_words(line);
   if (words.empty()) {
@@ -709,12 +730,12 @@ crow::json::wvalue::list buildCues(const media_library::LyricLine &line) {
     } else if (line.end_ms.has_value()) {
       end_ms = *line.end_ms;
     }
-    crow::json::wvalue cue;
+    Json::Value cue;
     cue["Position"] = static_cast<int>(pos);
     cue["EndPosition"] = static_cast<int>(pos + length - 1);
-    cue["Start"] = word.start_ms * 10000LL;
-    cue["End"] = end_ms * 10000LL;
-    cues.push_back(std::move(cue));
+    cue["Start"] = static_cast<Json::Int64>(word.start_ms * 10000LL);
+    cue["End"] = static_cast<Json::Int64>(end_ms * 10000LL);
+    cues.append(std::move(cue));
     pos += length;
   }
   return cues;
@@ -723,15 +744,15 @@ crow::json::wvalue::list buildCues(const media_library::LyricLine &line) {
 // 领域模型 → Jellyfin LyricDto。直接读结构，不再二次解析纯文本：
 // 之前按纯文本解析，正文里带 `[..]` 会被当成时间标签吞掉（实测 78 行
 // 的 Start 全丢）。逐字轨出 Cues；aux（译文/注音）不进 DTO。
-crow::json::wvalue buildLyricDto(const media_library::Lyrics &lyrics,
+Json::Value buildLyricDto(const media_library::Lyrics &lyrics,
                                  long long duration_ms,
                                  const std::string &title,
                                  const std::string &artist,
                                  const std::string &album) {
-  crow::json::wvalue r;
-  crow::json::wvalue::list lines;
+  Json::Value r;
+  Json::Value lines(Json::arrayValue);
   for (const media_library::LyricLine &line : lyrics.lines) {
-    crow::json::wvalue node;
+    Json::Value node;
     // 副字幕：LyricDto 没有独立的译文字段，客户端只渲染 `Text`。
     // 用 `_BREAK_` 把原文与译文串在同一行（与 `?format=lrc` 的正文写法一致），
     // 换行会占掉一行显示空间，也不便客户端自行拆成双行。
@@ -745,13 +766,13 @@ crow::json::wvalue buildLyricDto(const media_library::Lyrics &lyrics,
     }
     node["Text"] = text;
     if (line.start_ms.has_value()) {
-      node["Start"] = *line.start_ms * 10000LL;
+      node["Start"] = static_cast<Json::Int64>(*line.start_ms * 10000LL);
     }
-    node["Cues"] = crow::json::wvalue(buildCues(line));
-    lines.push_back(std::move(node));
+    node["Cues"] = Json::Value(buildCues(line));
+    lines.append(std::move(node));
   }
 
-  crow::json::wvalue meta;
+  Json::Value meta;
   meta["Title"] = title;
   if (!artist.empty()) {
     meta["Artist"] = artist;
@@ -759,10 +780,10 @@ crow::json::wvalue buildLyricDto(const media_library::Lyrics &lyrics,
   if (!album.empty()) {
     meta["Album"] = album;
   }
-  meta["Length"] = duration_ms * 10000LL;
+  meta["Length"] = static_cast<Json::Int64>(duration_ms * 10000LL);
   meta["IsSynced"] = media_library::is_synced(lyrics);
   r["Metadata"] = std::move(meta);
-  r["Lyrics"] = crow::json::wvalue(lines);
+  r["Lyrics"] = lines;
   return r;
 }
 
@@ -812,14 +833,13 @@ std::string buildLrcText(const media_library::Lyrics &lyrics,
   return out;
 }
 
-crow::response plainTextResponse(int code, std::string body) {
-  crow::response res(code, std::move(body));
-  res.set_header("Content-Type", "text/plain; charset=utf-8");
-  return res;
+http_server::ResponsePtr plainTextResponse(int code, std::string body) {
+  return http_server::textResponse(code, std::move(body),
+                                   "text/plain; charset=utf-8");
 }
 
-crow::response handleLyrics(const std::string &idstr,
-                            const crow::request &req) {
+http_server::ResponsePtr handleLyrics(const std::string &idstr,
+                            const http_server::RequestPtr &req) {
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
       ref->entity_type != media_library::EntityType::Track) {
@@ -850,7 +870,7 @@ crow::response handleLyrics(const std::string &idstr,
                                   track.title, artist, album));
 }
 
-crow::response handleArtists(const crow::request &req,
+http_server::ResponsePtr handleArtists(const http_server::RequestPtr &req,
                              bool album_only = false) {
   // 艺术家列表需要全库列举，路由器没有聚合 list_artists。
   (void)req;
@@ -858,13 +878,13 @@ crow::response handleArtists(const crow::request &req,
   return emptyList();
 }
 
-crow::response handleGenres(const crow::request &req) {
+http_server::ResponsePtr handleGenres(const http_server::RequestPtr &req) {
   // 路由器没有流派枚举能力：流派的 int id 是本地库内部概念，远端无对应。
   // 按「不能靠路由器实现的不要实现」直接返回空列表。
   return emptyList();
 }
 
-crow::response handleMusicGenreByName(const std::string &name) {
+http_server::ResponsePtr handleMusicGenreByName(const std::string &name) {
   // 同上：按名字取流派依赖本地流派的 int id，路由器不提供。
   (void)name;
   return http_util::jsonResponse(404, "{}");
@@ -873,7 +893,7 @@ crow::response handleMusicGenreByName(const std::string &name) {
 // ------------------------------------------------------------ 只读扩展接口
 
 // 播放信息：返回单个 MediaSource，供客户端直接播放原始文件。
-crow::response handlePlaybackInfo(const crow::request &,
+http_server::ResponsePtr handlePlaybackInfo(const http_server::RequestPtr &,
                                   const std::string &idstr) {
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
@@ -901,15 +921,15 @@ crow::response handlePlaybackInfo(const crow::request &,
   const std::string url =
       "/Audio/" + idstr + "/stream?static=true&mediaSourceId=" + idstr;
   const long long bitrate_bps = static_cast<long long>(bitrateKbps) * 1000LL;
-  crow::json::wvalue src;
+  Json::Value src;
   src["Id"] = idstr;
   src["Name"] = t.title;
   // locator 是进程内定位符，绝不能出现在响应里（5.4.4）。Path 用相对播放地址。
   src["Path"] = url;
   src["Container"] = t.audio.format;
   src["Size"] = t.audio.size_bytes.value_or(0);
-  src["Bitrate"] = bitrate_bps;
-  src["RunTimeTicks"] = durationMs * 10000LL;
+  src["Bitrate"] = static_cast<Json::Int64>(bitrate_bps);
+  src["RunTimeTicks"] = static_cast<Json::Int64>(durationMs * 10000LL);
   src["SupportsDirectPlay"] = true;
   src["SupportsDirectStream"] = true;
   src["SupportsTranscoding"] = false;
@@ -918,28 +938,28 @@ crow::response handlePlaybackInfo(const crow::request &,
   src["DirectStreamUrl"] = url;
   src["TranscodingUrl"] = url;
 
-  crow::json::wvalue stream;
+  Json::Value stream;
   stream["Type"] = "Audio";
   stream["Codec"] = t.audio.format;
   stream["Index"] = 0;
   stream["IsDefault"] = true;
   stream["Channels"] = t.audio.channels.value_or(0);
   stream["SampleRate"] = t.audio.sample_rate.value_or(0);
-  stream["BitRate"] = bitrate_bps;
-  crow::json::wvalue::list streams;
-  streams.emplace_back(std::move(stream));
-  src["MediaStreams"] = crow::json::wvalue(streams);
+  stream["BitRate"] = static_cast<Json::Int64>(bitrate_bps);
+  Json::Value streams(Json::arrayValue);
+  streams.append(std::move(stream));
+  src["MediaStreams"] = streams;
 
-  crow::json::wvalue::list sources;
-  sources.emplace_back(std::move(src));
-  crow::json::wvalue r;
-  r["MediaSources"] = crow::json::wvalue(sources);
+  Json::Value sources(Json::arrayValue);
+  sources.append(std::move(src));
+  Json::Value r;
+  r["MediaSources"] = sources;
   r["PlaySessionId"] = "musicd-session";
   return json(200, r);
 }
 
 // 仅支持 Primary 图片，其它图片类型返回 404。
-crow::response handleImageType(const crow::request &req,
+http_server::ResponsePtr handleImageType(const http_server::RequestPtr &req,
                                const std::string &idstr,
                                const std::string &imageType,
                                const std::string &) {
@@ -950,14 +970,14 @@ crow::response handleImageType(const crow::request &req,
 }
 
 // 相似条目：同专辑 + 同流派的其它曲目。
-crow::response handleSimilar(const std::string &idstr) {
+http_server::ResponsePtr handleSimilar(const std::string &idstr) {
   // 路由器没有「相似曲目」能力，不做本地特例实现。
   (void)idstr;
   return emptyList();
 }
 
 // 下载原始文件（与 /Items/<id>/File 同义）。
-crow::response handleDownload(const crow::request &req,
+http_server::ResponsePtr handleDownload(const http_server::RequestPtr &req,
                               const std::string &idstr) {
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
@@ -966,37 +986,37 @@ crow::response handleDownload(const crow::request &req,
   }
   // 下载与在线播放走同一条会话路径：字节来源一致，Range 语义一致。
   return stream_http::serve_track(req, *ref,
-                                  req.method == crow::HTTPMethod::HEAD);
+                                  req->method() == drogon::Head);
 }
 
 // 搜索建议：曲目 / 专辑 / 艺术家。
-crow::response handleSearchHints(const crow::request &req) {
+http_server::ResponsePtr handleSearchHints(const http_server::RequestPtr &req) {
   // typeahead 是前缀匹配，SearchQuery 只有包含匹配；语义不等价，不实现。
   (void)req;
   return emptyList();
 }
 
 // 过滤选项：真实流派与年份。
-crow::response handleFilters(const crow::request &) {
+http_server::ResponsePtr handleFilters(const http_server::RequestPtr &) {
   // 流派枚举无路由器能力；年份需要遍历全部曲目，同样没有聚合入口。
   // 保留响应形状，内容为空。
-  crow::json::wvalue r;
-  r["Genres"] = crow::json::wvalue(crow::json::wvalue::list{});
-  r["Tags"] = crow::json::wvalue(crow::json::wvalue::list{});
-  r["OfficialRatings"] = crow::json::wvalue(crow::json::wvalue::list{});
-  r["Years"] = crow::json::wvalue(crow::json::wvalue::list{});
+  Json::Value r;
+  r["Genres"] = Json::Value(Json::Value(Json::arrayValue));
+  r["Tags"] = Json::Value(Json::Value(Json::arrayValue));
+  r["OfficialRatings"] = Json::Value(Json::Value(Json::arrayValue));
+  r["Years"] = Json::Value(Json::Value(Json::arrayValue));
   return json(200, r);
 }
 
 // 按稳定 id（或名字）取单个艺术家。
-crow::response handleArtistByName(const std::string &raw) {
+http_server::ResponsePtr handleArtistByName(const std::string &raw) {
   // 按名字精确取艺术家不是路由器能力（SearchQuery 只有包含匹配）。
   (void)raw;
   return http_util::jsonResponse(404, "{}");
 }
 
 // 相似艺术家：与本艺术家共享流派的其它艺术家。
-crow::response handleArtistSimilar(const std::string &raw) {
+http_server::ResponsePtr handleArtistSimilar(const std::string &raw) {
   // 路由器没有「相似艺术家」能力。
   (void)raw;
   return emptyList();
@@ -1020,29 +1040,13 @@ std::vector<int> parseTrackIds(const std::string &csv) {
 }
 
 // 大小写不敏感地收集某 query 参数的全部出现（支持重复键）。
-std::vector<std::string> qsList(const crow::request &req, const char *key) {
-  std::vector<std::string> out;
-  const std::string want = lower(std::string(key));
-  for (const auto &k : req.url_params.keys()) {
-    if (lower(k) != want) {
-      continue;
-    }
-    for (char *v : req.url_params.get_list(k, false)) {
-      if (v != nullptr) {
-        out.emplace_back(v);
-      }
-    }
-    for (char *v : req.url_params.get_list(k, true)) {
-      if (v != nullptr) {
-        out.emplace_back(v);
-      }
-    }
-  }
-  return out;
+std::vector<std::string> qsList(const http_server::RequestPtr &req,
+                                const char *key) {
+  return http_server::Query(req).list(std::string(key));
 }
 
 // 合并某 query 参数的全部出现（逗号连接）。
-std::string qsJoined(const crow::request &req, const char *key) {
+std::string qsJoined(const http_server::RequestPtr &req, const char *key) {
   std::string joined;
   for (const auto &v : qsList(req, key)) {
     if (!joined.empty()) {
@@ -1054,16 +1058,16 @@ std::string qsJoined(const crow::request &req, const char *key) {
 }
 
 // 从 JSON body 的某个稳定 id 数组字段追加 track id。
-void appendBodyIds(const crow::json::rvalue &body, const char *name,
+void appendBodyIds(const Json::Value &body, const char *name,
                    std::vector<int> &out) {
-  if (!body || !body.has(name) || body[name].t() != crow::json::type::List) {
+  if (body.isNull() || !body.isMember(name) || !body[name].isArray()) {
     return;
   }
   for (const auto &x : body[name]) {
-    if (x.t() != crow::json::type::String) {
+    if (!x.isString()) {
       continue;
     }
-    const auto ref = parseItemId(std::string(x.s()));
+    const auto ref = parseItemId(std::string(x.asString()));
     if (!ref.has_value() ||
         ref->entity_type != media_library::EntityType::Track) {
       continue;
@@ -1076,13 +1080,13 @@ void appendBodyIds(const crow::json::rvalue &body, const char *name,
 }
 
 // 歌单列表（跨库汇总，只经播放列表总管）。
-crow::response handlePlaylists(const crow::request &req) {
+http_server::ResponsePtr handlePlaylists(const http_server::RequestPtr &req) {
   return playlistListPage(qsInt(req, "startIndex", 0), qsInt(req, "limit", 0));
 }
 
 // 歌单详情。歌单 id 就是 SourceRef 的规范字符串，直接解析后交给总管；
 // 不遍历库、不回退、不换源。
-crow::response handlePlaylistById(const std::string &idstr) {
+http_server::ResponsePtr handlePlaylistById(const std::string &idstr) {
   const std::shared_ptr<media_library::PlaylistDirectory> directory =
       media_library::playlist_directory_ptr();
   const auto ref = parse_path_ref(idstr);
@@ -1099,7 +1103,7 @@ crow::response handlePlaylistById(const std::string &idstr) {
 
 // 歌单内的曲目。曲目随歌单一起返回（Playlist.tracks 是完整领域模型），
 // 不再逐条回查。
-crow::response handlePlaylistItems(const std::string &idstr) {
+http_server::ResponsePtr handlePlaylistItems(const std::string &idstr) {
   const std::shared_ptr<media_library::PlaylistDirectory> directory =
       media_library::playlist_directory_ptr();
   const auto ref = parse_path_ref(idstr);
@@ -1111,7 +1115,7 @@ crow::response handlePlaylistItems(const std::string &idstr) {
   if (!result.ok()) {
     return emptyList();
   }
-  std::vector<crow::json::wvalue> items;
+  std::vector<Json::Value> items;
   items.reserve(result.value().value.tracks.size());
   for (const auto &track : result.value().value.tracks) {
     items.push_back(remoteTrackItem(track));
@@ -1121,7 +1125,7 @@ crow::response handlePlaylistItems(const std::string &idstr) {
 }
 
 // 新建歌单（name/ids 可来自 query 或 JSON body）。
-crow::response handleCreatePlaylist(const crow::request &req) {
+http_server::ResponsePtr handleCreatePlaylist(const http_server::RequestPtr &req) {
   // 歌单写入没有路由器能力（PlaylistWriter 不存在，PlaylistWrite
   // 能力从未注册）。
   (void)req;
@@ -1129,7 +1133,7 @@ crow::response handleCreatePlaylist(const crow::request &req) {
 }
 
 // 向歌单添加曲目（ids 可来自 query 或 JSON body）。
-crow::response handleAddToPlaylist(const crow::request &req,
+http_server::ResponsePtr handleAddToPlaylist(const http_server::RequestPtr &req,
                                    const std::string &idstr) {
   (void)req;
   (void)idstr;
@@ -1137,7 +1141,7 @@ crow::response handleAddToPlaylist(const crow::request &req,
 }
 
 // 从歌单移除曲目（entryIds / ids 均按曲目 GUID 处理，可来自 query 或 body）。
-crow::response handleRemoveFromPlaylist(const crow::request &req,
+http_server::ResponsePtr handleRemoveFromPlaylist(const http_server::RequestPtr &req,
                                         const std::string &idstr) {
   (void)req;
   (void)idstr;
@@ -1145,7 +1149,7 @@ crow::response handleRemoveFromPlaylist(const crow::request &req,
 }
 
 // 更新歌单：改名与/或替换曲目（name/ids 可来自 query 或 body）。
-crow::response handleUpdatePlaylist(const crow::request &req,
+http_server::ResponsePtr handleUpdatePlaylist(const http_server::RequestPtr &req,
                                     const std::string &idstr) {
   (void)req;
   (void)idstr;
@@ -1153,189 +1157,190 @@ crow::response handleUpdatePlaylist(const crow::request &req,
 }
 
 // 删除歌单。
-crow::response handleDeletePlaylist(const std::string &idstr) {
+http_server::ResponsePtr handleDeletePlaylist(const std::string &idstr) {
   (void)idstr;
   return http_util::jsonResponse(501, "{}");
 }
 
 } // namespace
 
-#define JF_ROUTE(app, url) RouteReg((app), (url))
+#define JF_ROUTE(app, url) RouteBuilder((cfg.jellyfin_port), (url))
 
-void run(const config::Config &cfg) {
+void mount(const config::Config &cfg) {
   setServerName(cfg.jellyfin_server_name);
 
-  crow::SimpleApp app;
 
   // 系统
   JF_ROUTE(app, "/System/Info/Public")
   ([] { return json(200, publicSystemInfo()); });
-  JF_ROUTE(app, "/System/Info")([] { return json(200, systemInfo()); });
+  JF_ROUTE(app, "/System/Info")([](const http_server::RequestPtr &) { return json(200, systemInfo()); });
   JF_ROUTE(app, "/System/Ping")
-  ([] { return crow::response(200, "Jellyfin Server"); });
+  ([] { return http_server::textResponse(200, "Jellyfin Server"); });
   JF_ROUTE(app, "/System/Ping")
-      .methods(crow::HTTPMethod::Post)([](const crow::request &) {
-        return crow::response(200, "Jellyfin Server");
+      .methods(drogon::Post)([](const http_server::RequestPtr &) {
+        return http_server::textResponse(200, "Jellyfin Server");
       });
-  JF_ROUTE(app, "/System/Endpoint")([] {
-    crow::json::wvalue r;
+  JF_ROUTE(app, "/System/Endpoint")([](const http_server::RequestPtr &) {
+    Json::Value r;
     r["IsLocal"] = true;
     r["IsInNetwork"] = true;
     return json(200, r);
   });
 
   // 用户/鉴权
-  JF_ROUTE(app, "/Users/Public")([] {
-    std::vector<crow::json::wvalue> items;
+  JF_ROUTE(app, "/Users/Public")([](const http_server::RequestPtr &) {
+    std::vector<Json::Value> items;
     items.push_back(userDto());
-    crow::json::wvalue arr;
-    arr = std::move(items);
+    Json::Value arr(Json::arrayValue);
+    for (Json::Value &item : items) {
+      arr.append(std::move(item));
+    }
     return json(200, arr);
   });
   JF_ROUTE(app, "/Users/AuthenticateByName")
-      .methods(crow::HTTPMethod::Post)([](const crow::request &req) {
+      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
         std::string client;
-        auto body = crow::json::load(req.body);
-        if (body && body.has("Username")) {
-          client = body["Username"].s();
+        const Json::Value body = json_util::parseOrNull(req->body());
+        if (!body.isNull() && body.isMember("Username")) {
+          client = body["Username"].asString();
         }
-        crow::json::wvalue r;
+        Json::Value r;
         r["User"] = userDto();
         r["SessionInfo"] = sessionInfo(client, "");
         r["AccessToken"] = "musicd-token";
         r["ServerId"] = serverId();
         return json(200, r);
       });
-  JF_ROUTE(app, "/Users/Me")([] { return json(200, userDto()); });
+  JF_ROUTE(app, "/Users/Me")([](const http_server::RequestPtr &) { return json(200, userDto()); });
   JF_ROUTE(app, "/Users/<string>")
-  ([](const crow::request &, std::string) { return json(200, userDto()); });
+  ([](const http_server::RequestPtr &, std::string) { return json(200, userDto()); });
 
   // 视图
-  JF_ROUTE(app, "/UserViews")([] { return userViews(); });
+  JF_ROUTE(app, "/UserViews")([](const http_server::RequestPtr &) { return userViews(); });
   JF_ROUTE(app, "/Users/<string>/Views")
-  ([](const crow::request &, std::string) { return userViews(); });
+  ([](const http_server::RequestPtr &, std::string) { return userViews(); });
 
   // 条目
   JF_ROUTE(app, "/Items/Latest")
-  ([](const crow::request &req) { return handleLatest(req); });
+  ([](const http_server::RequestPtr &req) { return handleLatest(req); });
   JF_ROUTE(app, "/Items/Filters")
-  ([](const crow::request &req) { return handleFilters(req); });
+  ([](const http_server::RequestPtr &req) { return handleFilters(req); });
   JF_ROUTE(app, "/Users/<string>/Items/Latest")
-  ([](const crow::request &req, std::string) { return handleLatest(req); });
+  ([](const http_server::RequestPtr &req, std::string) { return handleLatest(req); });
   JF_ROUTE(app, "/Items")
-  ([](const crow::request &req) { return handleItems(req); });
+  ([](const http_server::RequestPtr &req) { return handleItems(req); });
   JF_ROUTE(app, "/Users/<string>/Items")
-  ([](const crow::request &req, std::string) { return handleItems(req); });
+  ([](const http_server::RequestPtr &req, std::string) { return handleItems(req); });
   JF_ROUTE(app, "/Users/<string>/Items/<string>")
-  ([](const crow::request &, std::string, std::string itemId) {
+  ([](const http_server::RequestPtr &, std::string, std::string itemId) {
     return handleItem(itemId);
   });
   JF_ROUTE(app, "/Items/<string>/PlaybackInfo")
-      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Post)(
-          [](const crow::request &req, std::string itemId) {
+      .methods(drogon::Get, drogon::Post)(
+          [](const http_server::RequestPtr &req, std::string itemId) {
             return handlePlaybackInfo(req, itemId);
           });
   JF_ROUTE(app, "/Items/<string>/Images/<string>/<string>")
-  ([](const crow::request &req, std::string itemId, std::string imageType,
+  ([](const http_server::RequestPtr &req, std::string itemId, std::string imageType,
       std::string imageIndex) {
     return handleImageType(req, itemId, imageType, imageIndex);
   });
   JF_ROUTE(app, "/Items/<string>/Images/<string>")
-  ([](const crow::request &req, std::string itemId, std::string imageType) {
+  ([](const http_server::RequestPtr &req, std::string itemId, std::string imageType) {
     return handleImageType(req, itemId, imageType, "");
   });
   JF_ROUTE(app, "/Items/<string>/Download")
-      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
-          [](const crow::request &req, std::string itemId) {
+      .methods(drogon::Get, drogon::Head)(
+          [](const http_server::RequestPtr &req, std::string itemId) {
             return handleDownload(req, itemId);
           });
   JF_ROUTE(app, "/Items/<string>/File")
-      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
-          [](const crow::request &req, std::string itemId) {
+      .methods(drogon::Get, drogon::Head)(
+          [](const http_server::RequestPtr &req, std::string itemId) {
             return handleDownload(req, itemId);
           });
   JF_ROUTE(app, "/Items/<string>/Similar")
-  ([](const crow::request &, std::string itemId) {
+  ([](const http_server::RequestPtr &, std::string itemId) {
     return handleSimilar(itemId);
   });
   JF_ROUTE(app, "/Items/<string>")
-  ([](const crow::request &, std::string itemId) {
+  ([](const http_server::RequestPtr &, std::string itemId) {
     return handleItem(itemId);
   });
   // 通用删除项（官方 DeleteItem）：目前仅支持删除歌单，其他类型返回 404。
   JF_ROUTE(app, "/Items/<string>")
-      .methods(crow::HTTPMethod::Delete)(
-          [](const crow::request &, std::string itemId) {
+      .methods(drogon::Delete)(
+          [](const http_server::RequestPtr &, std::string itemId) {
             return handleDeletePlaylist(itemId);
           });
 
   // 流媒体
   JF_ROUTE(app, "/Audio/<string>/Lyrics")
-  ([](const crow::request &req, std::string itemId) {
+  ([](const http_server::RequestPtr &req, std::string itemId) {
     return handleLyrics(itemId, req);
   });
   JF_ROUTE(app, "/Audio/<string>/<string>")
-      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
-          [](const crow::request &req, std::string itemId, std::string) {
+      .methods(drogon::Get, drogon::Head)(
+          [](const http_server::RequestPtr &req, std::string itemId, std::string) {
             return handleStream(req, itemId);
           });
 
   // 艺术家/流派
   JF_ROUTE(app, "/Artists")
-  ([](const crow::request &req) { return handleArtists(req); });
+  ([](const http_server::RequestPtr &req) { return handleArtists(req); });
   JF_ROUTE(app, "/Artists/AlbumArtists")
-  ([](const crow::request &req) { return handleArtists(req, true); });
+  ([](const http_server::RequestPtr &req) { return handleArtists(req, true); });
   JF_ROUTE(app, "/Artists/<string>/Images/<string>")
-  ([](const crow::request &req, std::string name, std::string imageType) {
+  ([](const http_server::RequestPtr &req, std::string name, std::string imageType) {
     return handleImageType(req, name, imageType, "");
   });
   JF_ROUTE(app, "/Artists/<string>/Similar")
-  ([](const crow::request &, std::string name) {
+  ([](const http_server::RequestPtr &, std::string name) {
     return handleArtistSimilar(name);
   });
   JF_ROUTE(app, "/Artists/<string>")
-  ([](const crow::request &, std::string name) {
+  ([](const http_server::RequestPtr &, std::string name) {
     return handleArtistByName(name);
   });
   JF_ROUTE(app, "/MusicGenres")
-  ([](const crow::request &req) { return handleGenres(req); });
+  ([](const http_server::RequestPtr &req) { return handleGenres(req); });
   JF_ROUTE(app, "/MusicGenres/<string>")
-  ([](const crow::request &, std::string name) {
+  ([](const http_server::RequestPtr &, std::string name) {
     return handleMusicGenreByName(http_util::urlDecode(name));
   });
   JF_ROUTE(app, "/Genres")
-  ([](const crow::request &req) { return handleGenres(req); });
+  ([](const http_server::RequestPtr &req) { return handleGenres(req); });
   JF_ROUTE(app, "/Genres/<string>")
-  ([](const crow::request &, std::string name) {
+  ([](const http_server::RequestPtr &, std::string name) {
     return handleMusicGenreByName(http_util::urlDecode(name));
   });
   JF_ROUTE(app, "/Studios")
-  ([](const crow::request &) {
-    std::vector<crow::json::wvalue> empty;
+  ([](const http_server::RequestPtr &) {
+    std::vector<Json::Value> empty;
     return json(200, queryResult(std::move(empty), 0, 0));
   });
   JF_ROUTE(app, "/Studios/<string>")
-  ([](const crow::request &, std::string) {
-    std::vector<crow::json::wvalue> empty;
+  ([](const http_server::RequestPtr &, std::string) {
+    std::vector<Json::Value> empty;
     return json(200, queryResult(std::move(empty), 0, 0));
   });
 
   // 播放会话
-  JF_ROUTE(app, "/Sessions")([] { return emptyList(); });
+  JF_ROUTE(app, "/Sessions")([](const http_server::RequestPtr &) { return emptyList(); });
   JF_ROUTE(app, "/Sessions/Playing")
-      .methods(crow::HTTPMethod::Post)(
-          [](const crow::request &) { return crow::response(204); });
+      .methods(drogon::Post)(
+          [](const http_server::RequestPtr &) { return http_server::textResponse(204, ""); });
   JF_ROUTE(app, "/Sessions/Playing/Progress")
-      .methods(crow::HTTPMethod::Post)(
-          [](const crow::request &) { return crow::response(204); });
+      .methods(drogon::Post)(
+          [](const http_server::RequestPtr &) { return http_server::textResponse(204, ""); });
   JF_ROUTE(app, "/Sessions/Playing/Stopped")
-      .methods(crow::HTTPMethod::Post)(
-          [](const crow::request &) { return crow::response(204); });
+      .methods(drogon::Post)(
+          [](const http_server::RequestPtr &) { return http_server::textResponse(204, ""); });
 
   // 收藏
   JF_ROUTE(app, "/UserFavoriteItems/<string>")
-      .methods(crow::HTTPMethod::Post)([](const crow::request &, std::string) {
-        crow::json::wvalue r;
+      .methods(drogon::Post)([](const http_server::RequestPtr &, std::string) {
+        Json::Value r;
         r["IsFavorite"] = true;
         r["PlayCount"] = 0;
         r["Played"] = false;
@@ -1343,9 +1348,9 @@ void run(const config::Config &cfg) {
         return json(200, r);
       });
   JF_ROUTE(app, "/UserFavoriteItems/<string>")
-      .methods(crow::HTTPMethod::Delete)(
-          [](const crow::request &, std::string) {
-            crow::json::wvalue r;
+      .methods(drogon::Delete)(
+          [](const http_server::RequestPtr &, std::string) {
+            Json::Value r;
             r["IsFavorite"] = false;
             r["PlayCount"] = 0;
             r["Played"] = false;
@@ -1357,91 +1362,88 @@ void run(const config::Config &cfg) {
   JF_ROUTE(app, "/Branding/Configuration")
   ([] { return json(200, brandingOptions()); });
   JF_ROUTE(app, "/DisplayPreferences/<string>")
-  ([](const crow::request &, std::string id) {
+  ([](const http_server::RequestPtr &, std::string id) {
     return json(200, displayPreferences(id));
   });
   JF_ROUTE(app, "/DisplayPreferences/<string>")
-      .methods(crow::HTTPMethod::Post)([](const crow::request &, std::string) {
-        return crow::response(204);
+      .methods(drogon::Post)([](const http_server::RequestPtr &, std::string) {
+        return http_server::textResponse(204, "");
       });
-  JF_ROUTE(app, "/ScheduledTasks")([] { return emptyList(); });
-  JF_ROUTE(app, "/Plugins")([] { return emptyList(); });
+  JF_ROUTE(app, "/ScheduledTasks")([](const http_server::RequestPtr &) { return emptyList(); });
+  JF_ROUTE(app, "/Plugins")([](const http_server::RequestPtr &) { return emptyList(); });
   JF_ROUTE(app, "/Search/Hints")
-  ([](const crow::request &req) { return handleSearchHints(req); });
-  JF_ROUTE(app, "/Shows/NextUp")([] {
-    std::vector<crow::json::wvalue> empty;
+  ([](const http_server::RequestPtr &req) { return handleSearchHints(req); });
+  JF_ROUTE(app, "/Shows/NextUp")([](const http_server::RequestPtr &) {
+    std::vector<Json::Value> empty;
     return json(200, queryResult(std::move(empty), 0, 0));
   });
-  JF_ROUTE(app, "/UserItems/Resume")([] {
-    std::vector<crow::json::wvalue> empty;
+  JF_ROUTE(app, "/UserItems/Resume")([](const http_server::RequestPtr &) {
+    std::vector<Json::Value> empty;
     return json(200, queryResult(std::move(empty), 0, 0));
   });
-  JF_ROUTE(app, "/Playlists")([](const crow::request &req) {
+  JF_ROUTE(app, "/Playlists")([](const http_server::RequestPtr &req) {
     return handlePlaylists(req);
   });
   JF_ROUTE(app, "/Playlists")
-      .methods(crow::HTTPMethod::Post)(
-          [](const crow::request &req) { return handleCreatePlaylist(req); });
+      .methods(drogon::Post)(
+          [](const http_server::RequestPtr &req) { return handleCreatePlaylist(req); });
   JF_ROUTE(app, "/Playlists/<string>")
-  ([](const crow::request &, std::string id) {
+  ([](const http_server::RequestPtr &, std::string id) {
     return handlePlaylistById(id);
   });
   JF_ROUTE(app, "/Playlists/<string>")
-      .methods(crow::HTTPMethod::Post)(
-          [](const crow::request &req, std::string id) {
+      .methods(drogon::Post)(
+          [](const http_server::RequestPtr &req, std::string id) {
             return handleUpdatePlaylist(req, id);
           });
   JF_ROUTE(app, "/Playlists/<string>")
-      .methods(crow::HTTPMethod::Delete)(
-          [](const crow::request &, std::string id) {
+      .methods(drogon::Delete)(
+          [](const http_server::RequestPtr &, std::string id) {
             return handleDeletePlaylist(id);
           });
   JF_ROUTE(app, "/Playlists/<string>/Items")
-  ([](const crow::request &, std::string id) {
+  ([](const http_server::RequestPtr &, std::string id) {
     return handlePlaylistItems(id);
   });
   JF_ROUTE(app, "/Playlists/<string>/Items")
-      .methods(crow::HTTPMethod::Post)(
-          [](const crow::request &req, std::string id) {
+      .methods(drogon::Post)(
+          [](const http_server::RequestPtr &req, std::string id) {
             return handleAddToPlaylist(req, id);
           });
   JF_ROUTE(app, "/Playlists/<string>/Items")
-      .methods(crow::HTTPMethod::Delete)(
-          [](const crow::request &req, std::string id) {
+      .methods(drogon::Delete)(
+          [](const http_server::RequestPtr &req, std::string id) {
             return handleRemoveFromPlaylist(req, id);
           });
-  JF_ROUTE(app, "/Localization/Options")([] {
-    crow::json::wvalue arr;
-    arr = crow::json::wvalue::list{};
+  JF_ROUTE(app, "/Localization/Options")([](const http_server::RequestPtr &) {
+    Json::Value arr;
+    arr = Json::Value(Json::arrayValue);
     return json(200, arr);
   });
   JF_ROUTE(app, "/Users/<string>/GroupingOptions")
-  ([](const crow::request &, std::string) {
-    crow::json::wvalue r;
-    r["GroupingOptions"] = crow::json::wvalue::list{};
+  ([](const http_server::RequestPtr &, std::string) {
+    Json::Value r;
+    r["GroupingOptions"] = Json::Value(Json::arrayValue);
     return json(200, r);
   });
-  JF_ROUTE(app, "/QuickConnect/Enabled")([] {
-    crow::json::wvalue r;
+  JF_ROUTE(app, "/QuickConnect/Enabled")([](const http_server::RequestPtr &) {
+    Json::Value r;
     r = false;
     return json(200, r);
   });
-  JF_ROUTE(app, "/System/Configuration")([] {
-    crow::json::wvalue r;
+  JF_ROUTE(app, "/System/Configuration")([](const http_server::RequestPtr &) {
+    Json::Value r;
     return json(200, r);
   });
   JF_ROUTE(app, "/Users/<string>/Configuration")
-  ([](const crow::request &, std::string) {
-    crow::json::wvalue r;
+  ([](const http_server::RequestPtr &, std::string) {
+    Json::Value r;
     return json(200, r);
   });
 
-  // 路由大小写不敏感：Crow 的字面量路由默认大小写敏感，这里开启全局开关，
-  // 使路由匹配忽略大小写（参数值保持原样）。Jellyfin 客户端会以各种大小写请求。
-  crow::case_insensitive_routing() = true;
-
-  app.loglevel(crow::LogLevel::Info);
-  app.port(cfg.jellyfin_port).multithreaded().concurrency(20).run();
+  // Drogon 的路径匹配本身大小写不敏感（正则 icase），
+  // 参数值保持原样——Jellyfin 客户端会以各种大小写请求路径。
+  http_server::setQuietLogging();
 }
 
 } // namespace jellyfin

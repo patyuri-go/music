@@ -1,15 +1,13 @@
 #include "http_util.h"
 
-#include "crow/logging.h"
-
 #include <algorithm>
-#include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <system_error>
 
 #include "api/webdav/webdav.h"
-#include "crow/stream_response.h"
 #include "image_cache.h"
 #include "storage.h"
 
@@ -39,6 +37,24 @@ std::string mimeType(const fs::path &p) {
     return "image/png";
   if (ext == ".webp")
     return "image/webp";
+  if (ext == ".html" || ext == ".htm")
+    return "text/html";
+  if (ext == ".css")
+    return "text/css";
+  if (ext == ".js" || ext == ".mjs")
+    return "application/javascript";
+  if (ext == ".json")
+    return "application/json";
+  if (ext == ".svg")
+    return "image/svg+xml";
+  if (ext == ".woff2")
+    return "font/woff2";
+  if (ext == ".woff")
+    return "font/woff";
+  if (ext == ".ttf")
+    return "font/ttf";
+  if (ext == ".ico")
+    return "image/x-icon";
   return "application/octet-stream";
 }
 
@@ -69,10 +85,9 @@ std::string urlDecode(const std::string &in) {
   return out;
 }
 
-crow::response jsonResponse(int code, std::string body) {
-  crow::response res(code, std::move(body));
-  res.set_header("Content-Type", "application/json; charset=utf-8");
-  return res;
+ResponsePtr jsonResponse(int code, std::string body) {
+  return http_server::textResponse(code, std::move(body),
+                                   "application/json; charset=utf-8");
 }
 
 std::pair<std::streamoff, std::streamoff>
@@ -114,59 +129,40 @@ parseRange(const std::string &range_header, std::streamoff file_size) {
   return {start, end};
 }
 
-crow::response serveFile(const fs::path &path, const std::string &req_range) {
-  if (!fs::exists(path)) {
+ResponsePtr serveFile(const fs::path &path, const std::string &req_range) {
+  std::error_code ec;
+  if (!fs::exists(path, ec) || ec) {
     return jsonResponse(404, "{\"erro\":true}");
   }
-
-  auto file = std::make_shared<std::ifstream>(path, std::ios::binary);
-  if (!*file) {
-    return crow::response(500, "cannot open file");
+  const std::streamoff file_size =
+      static_cast<std::streamoff>(fs::file_size(path, ec));
+  if (ec) {
+    return jsonResponse(404, "{\"erro\":true}");
   }
-
-  file->seekg(0, std::ios::end);
-  const std::streamoff file_size = file->tellg();
-  file->seekg(0, std::ios::beg);
 
   auto [start, end] = parseRange(req_range, file_size);
 
   if (start == -1) {
-    crow::response res(416, "range not satisfiable");
-    res.add_header("Content-Range", "bytes */" + std::to_string(file_size));
+    ResponsePtr res = http_server::textResponse(416, "range not satisfiable");
+    res->addHeader("Content-Range", "bytes */" + std::to_string(file_size));
     return res;
   }
 
   const std::streamoff length = end - start + 1;
-  file->seekg(start, std::ios::beg);
+  const bool partial = !(start == 0 && end == file_size - 1);
 
-  auto remaining = std::make_shared<std::streamoff>(length);
-  crow::response res = crow::streamedResponse(
-      (start != 0 || end != file_size - 1) ? 206 : 200, mimeType(path), length,
-      [file, remaining](std::string &out) -> bool {
-        if (*remaining <= 0) {
-          return false;
-        }
-        const std::streamoff want = std::min<std::streamoff>(
-            *remaining, static_cast<std::streamoff>(65536));
-        out.resize(static_cast<std::size_t>(want));
-        file->read(&out[0], static_cast<std::streamsize>(want));
-        const std::streamsize got = file->gcount();
-        if (got <= 0) {
-          return false;
-        }
-        *remaining -= got;
-        out.resize(static_cast<std::size_t>(got));
-        return true;
-      });
-  res.add_header("Accept-Ranges", "bytes");
-  res.add_header("Content-Range", "bytes " + std::to_string(start) + "-" +
-                                      std::to_string(end) + "/" +
-                                      std::to_string(file_size));
+  // Drogon 的区间文件响应：内部按 offset/length 读，越界自动 416。
+  ResponsePtr res = drogon::HttpResponse::newFileResponse(
+      path.string(), static_cast<std::size_t>(start),
+      static_cast<std::size_t>(length), /*setContentRange=*/true, "",
+      drogon::CT_NONE, mimeType(path), nullptr);
+  res->setStatusCode(static_cast<drogon::HttpStatusCode>(partial ? 206 : 200));
+  res->addHeader("Accept-Ranges", "bytes");
   return res;
 }
 
-crow::response serveResource(const std::string &location,
-                             const std::string &req_range) {
+ResponsePtr serveResource(const std::string &location,
+                          const std::string &req_range) {
   if (!webdav::isWebdavUrl(location)) {
     return serveFile(fs::path(location), req_range);
   }
@@ -204,51 +200,59 @@ crow::response serveResource(const std::string &location,
     std::cerr << "[res] buffered url=" << location << " bytes=" << body.size()
               << std::endl;
 
-    crow::response res;
-    res.code = s.status;
-    res.add_header("Content-Type", mimeType(fs::path(u.path)));
-    res.add_header("Accept-Ranges", "bytes");
+    ResponsePtr res = drogon::HttpResponse::newHttpResponse();
+    res->setStatusCode(static_cast<drogon::HttpStatusCode>(s.status));
+    res->setContentTypeString(mimeType(fs::path(u.path)));
+    res->addHeader("Accept-Ranges", "bytes");
     if (!cr.empty()) {
-      res.add_header("Content-Range", cr);
+      res->addHeader("Content-Range", cr);
     }
-    res.add_header("Content-Length", std::to_string(body.size()));
-    res.body = std::move(body);
+    res->addHeader("Content-Length", std::to_string(body.size()));
+    res->setBody(std::move(body));
     return res;
   }
 
   auto stream = std::make_shared<webdav::Stream>(std::move(s));
   auto sent = std::make_shared<long long>(0);
-  crow::response res = crow::streamedResponse(
-      stream->status, mimeType(fs::path(u.path)), stream->length,
-      [stream, sent, location](std::string &out) -> bool {
-        out.resize(65536);
-        const long long n = stream->read(out.data(), out.size());
+  const long long declared_length = stream->length;
+
+  ResponsePtr res = drogon::HttpResponse::newStreamResponse(
+      [stream, sent, location](char *buf, std::size_t len) -> std::size_t {
+        // buf == nullptr 表示响应已完成或连接中断：关闭远端流。
+        if (buf == nullptr) {
+          stream->close();
+          return 0;
+        }
+        const long long n = stream->read(buf, len);
         if (n <= 0) {
           std::cerr << "[res] done url=" << location << " sent=" << *sent
                     << std::endl;
-          return false;
+          return 0;
         }
         *sent += n;
-        out.resize(static_cast<std::size_t>(n));
-        return true;
+        return static_cast<std::size_t>(n);
       },
-      [stream]() { stream->close(); });
-  res.add_header("Accept-Ranges", "bytes");
+      "", drogon::CT_NONE, mimeType(fs::path(u.path)));
+  res->setStatusCode(static_cast<drogon::HttpStatusCode>(stream->status));
+  if (declared_length > 0) {
+    res->addHeader("Content-Length", std::to_string(declared_length));
+  }
+  res->addHeader("Accept-Ranges", "bytes");
   if (!cr.empty()) {
-    res.add_header("Content-Range", cr);
+    res->addHeader("Content-Range", cr);
   }
   return res;
 }
 
-crow::response serveImage(const std::string &virtual_path,
-                          const std::string &variant) {
+ResponsePtr serveImage(const std::string &virtual_path,
+                       const std::string &variant) {
   if (auto cache = image_cache::get()) {
     std::string error;
     if (const auto hit = cache->ensure(virtual_path, variant, error)) {
       return serveFile(*hit, "");
     }
-    CROW_LOG_DEBUG << "[image_cache] ensure failed for " << virtual_path
-                   << ": " << error;
+    LOG_DEBUG << "[image_cache] ensure failed for " << virtual_path << ": "
+              << error;
   }
   const std::string location = storage::resolve(virtual_path);
   if (!webdav::isWebdavUrl(location) &&

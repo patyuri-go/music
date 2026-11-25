@@ -24,7 +24,9 @@
 #include <taglib/fileref.h>
 #include <taglib/tag.h>
 
-#include "crow/json.h"
+#include <json/json.h>
+
+#include "json_util.h"
 
 namespace fs = std::filesystem;
 
@@ -110,14 +112,14 @@ int findTrackIdByName(const std::string &host, int port, int root_id,
                       const std::string &name) {
   HttpResponse r = httpRequest(host, port, "GET",
                                "/api/fs/browse/" + std::to_string(root_id));
-  auto items = crow::json::load(r.body);
-  if (!items || items.t() != crow::json::type::List) {
+  auto items = json_util::parseOrNull(r.body);
+  if (items.isNull() || !items.isArray()) {
     return 0;
   }
   for (const auto &it : items) {
-    if (it.has("name") && it.has("trackId") &&
-        std::string(it["name"].s()) == name) {
-      return static_cast<int>(it["trackId"].i());
+    if (it.isMember("name") && it.isMember("trackId") &&
+        std::string(it["name"].asString()) == name) {
+      return static_cast<int>(it["trackId"].asInt64());
     }
   }
   return 0;
@@ -129,16 +131,16 @@ std::vector<std::string> artistNames(const std::string &host, int port,
   std::vector<std::string> names;
   HttpResponse r =
       httpRequest(host, port, "GET", "/api/track/" + std::to_string(track_id));
-  auto t = crow::json::load(r.body);
-  if (!t || !t.has("artist_ids")) {
+  auto t = json_util::parseOrNull(r.body);
+  if (t.isNull() || !t.isMember("artist_ids")) {
     return names;
   }
   for (const auto &id : t["artist_ids"]) {
     HttpResponse ar = httpRequest(
-        host, port, "GET", "/api/artist/" + std::to_string(id.i()));
-    auto a = crow::json::load(ar.body);
-    if (a && a.has("name")) {
-      names.push_back(std::string(a["name"].s()));
+        host, port, "GET", "/api/artist/" + std::to_string(id.asInt64()));
+    auto a = json_util::parseOrNull(ar.body);
+    if (!a.isNull() && a.isMember("name")) {
+      names.push_back(std::string(a["name"].asString()));
     }
   }
   return names;
@@ -192,9 +194,9 @@ int main(int argc, char **argv) {
   check(r.status == 200, "POST /api/roots -> 200");
   int root_id = 0;
   {
-    auto j = crow::json::load(r.body);
-    if (j && j.has("id")) {
-      root_id = static_cast<int>(j["id"].i());
+    auto j = json_util::parseOrNull(r.body);
+    if (!j.isNull() && j.isMember("id")) {
+      root_id = static_cast<int>(j["id"].asInt64());
     }
   }
   check(root_id > 0, "注册根返回 id");
@@ -209,10 +211,10 @@ int main(int argc, char **argv) {
   check(r.status == 200, "POST /api/fs/batch scan -> 200");
   std::string job_id;
   {
-    auto j = crow::json::load(r.body);
-    if (j && j.t() == crow::json::type::List && j.size() > 0 &&
-        j[0].has("jobId")) {
-      job_id = std::to_string(j[0]["jobId"].i());
+    auto j = json_util::parseOrNull(r.body);
+    if (!j.isNull() && j.isArray() && j.size() > 0 &&
+        j[0].isMember("jobId")) {
+      job_id = std::to_string(j[0]["jobId"].asInt64());
     }
   }
   check(!job_id.empty(), "扫描返回 jobId");
@@ -221,9 +223,9 @@ int main(int argc, char **argv) {
     for (int k = 0; k < 120 && !finished; ++k) {
       ::usleep(500000);
       r = httpRequest(host, port, "GET", "/api/jobs/" + job_id);
-      auto j = crow::json::load(r.body);
-      if (j && j.has("state")) {
-        const std::string st = j["state"].s();
+      auto j = json_util::parseOrNull(r.body);
+      if (!j.isNull() && j.isMember("state")) {
+        const std::string st = j["state"].asString();
         if (st == "done" || st == "error") {
           finished = true;
           check(st == "done", "扫描 job 完成 (state=done)");

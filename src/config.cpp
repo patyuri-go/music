@@ -1,6 +1,8 @@
 #include "config.h"
 
-#include "crow/json.h"
+#include <json/json.h>
+
+#include "json_util.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -141,188 +143,189 @@ const Config &load(const std::string &file) {
   if (input.is_open()) {
     std::stringstream buffer;
     buffer << input.rdbuf();
-    auto json = crow::json::load(buffer.str());
-    if (!json) {
+    auto parsed = json_util::parse(buffer.str());
+    if (!parsed) {
       throw std::runtime_error("配置文件不是合法 JSON: " + file);
     }
-    if (json.has("db_path")) {
-      loaded.db_path = json["db_path"].s();
+    const Json::Value &json = *parsed;
+    if (json.isMember("db_path")) {
+      loaded.db_path = json["db_path"].asString();
     }
     // 未配置 db 段时，sqlite 路径继续跟随旧键 db_path。
     loaded.database.sql.path = loaded.db_path;
-    if (json.has("db")) {
+    if (json.isMember("db")) {
       const auto &dbc = json["db"];
-      if (dbc.has("sql")) {
+      if (dbc.isMember("sql")) {
         const auto &sqc = dbc["sql"];
-        if (sqc.has("path")) {
-          loaded.database.sql.path = sqc["path"].s();
+        if (sqc.isMember("path")) {
+          loaded.database.sql.path = sqc["path"].asString();
         }
       }
       // 段名大小写不敏感：PostgreSQL / postgresql / postgres 都接受。
       const char *pgKey = nullptr;
-      if (dbc.has("PostgreSQL")) {
+      if (dbc.isMember("PostgreSQL")) {
         pgKey = "PostgreSQL";
-      } else if (dbc.has("postgresql")) {
+      } else if (dbc.isMember("postgresql")) {
         pgKey = "postgresql";
-      } else if (dbc.has("postgres")) {
+      } else if (dbc.isMember("postgres")) {
         pgKey = "postgres";
       }
       if (pgKey != nullptr) {
         const auto &pgc = dbc[pgKey];
-        if (pgc.has("url")) {
-          loaded.database.postgres.url = pgc["url"].s();
+        if (pgc.isMember("url")) {
+          loaded.database.postgres.url = pgc["url"].asString();
         }
-        if (pgc.has("user")) {
-          loaded.database.postgres.user = pgc["user"].s();
+        if (pgc.isMember("user")) {
+          loaded.database.postgres.user = pgc["user"].asString();
         }
-        if (pgc.has("password")) {
-          loaded.database.postgres.password = pgc["password"].s();
+        if (pgc.isMember("password")) {
+          loaded.database.postgres.password = pgc["password"].asString();
         }
-        if (pgc.has("dbname")) {
-          loaded.database.postgres.dbname = pgc["dbname"].s();
+        if (pgc.isMember("dbname")) {
+          loaded.database.postgres.dbname = pgc["dbname"].asString();
         }
-        if (pgc.has("password_env")) {
-          loaded.database.postgres.password_env = pgc["password_env"].s();
+        if (pgc.isMember("password_env")) {
+          loaded.database.postgres.password_env = pgc["password_env"].asString();
         }
-        if (pgc.has("sslmode")) {
-          loaded.database.postgres.sslmode = pgc["sslmode"].s();
+        if (pgc.isMember("sslmode")) {
+          loaded.database.postgres.sslmode = pgc["sslmode"].asString();
         }
-        if (pgc.has("connect_timeout_seconds")) {
+        if (pgc.isMember("connect_timeout_seconds")) {
           loaded.database.postgres.connect_timeout_seconds =
-              static_cast<int>(pgc["connect_timeout_seconds"].i());
+              static_cast<int>(pgc["connect_timeout_seconds"].asInt64());
         }
       }
     }
     // 云端实体库（entity）：字段与主库 PostgreSQL 段一致。
-    if (json.has("entity_db")) {
+    if (json.isMember("entity_db")) {
       const auto &edc = json["entity_db"];
       auto &entity = loaded.entity_db;
-      if (edc.has("url")) {
-        entity.url = edc["url"].s();
+      if (edc.isMember("url")) {
+        entity.url = edc["url"].asString();
       }
-      if (edc.has("user")) {
-        entity.user = edc["user"].s();
+      if (edc.isMember("user")) {
+        entity.user = edc["user"].asString();
       }
-      if (edc.has("password")) {
-        entity.password = edc["password"].s();
+      if (edc.isMember("password")) {
+        entity.password = edc["password"].asString();
       }
-      if (edc.has("dbname")) {
-        entity.dbname = edc["dbname"].s();
+      if (edc.isMember("dbname")) {
+        entity.dbname = edc["dbname"].asString();
       }
-      if (edc.has("password_env")) {
-        entity.password_env = edc["password_env"].s();
+      if (edc.isMember("password_env")) {
+        entity.password_env = edc["password_env"].asString();
       }
-      if (edc.has("sslmode")) {
-        entity.sslmode = edc["sslmode"].s();
+      if (edc.isMember("sslmode")) {
+        entity.sslmode = edc["sslmode"].asString();
       }
-      if (edc.has("connect_timeout_seconds")) {
+      if (edc.isMember("connect_timeout_seconds")) {
         entity.connect_timeout_seconds =
-            static_cast<int>(edc["connect_timeout_seconds"].i());
+            static_cast<int>(edc["connect_timeout_seconds"].asInt64());
       }
     }
     // db_path 与 db.sql.path 始终同源，旧调用点无需改动。
     loaded.db_path = loaded.database.sql.path;
-    if (json.has("static_dir")) {
-      loaded.static_dir = json["static_dir"].s();
+    if (json.isMember("static_dir")) {
+      loaded.static_dir = json["static_dir"].asString();
     }
-    if (json.has("main_port")) {
-      loaded.port = static_cast<int>(json["main_port"].i());
+    if (json.isMember("main_port")) {
+      loaded.port = static_cast<int>(json["main_port"].asInt64());
     }
-    if (json.has("page_size")) {
-      loaded.page_size = static_cast<int>(json["page_size"].i());
+    if (json.isMember("page_size")) {
+      loaded.page_size = static_cast<int>(json["page_size"].asInt64());
     }
-    if (json.has("transcode")) {
+    if (json.isMember("transcode")) {
       const auto &tc = json["transcode"];
-      if (tc.has("enabled")) {
-        loaded.transcode_enabled = tc["enabled"].b();
+      if (tc.isMember("enabled")) {
+        loaded.transcode_enabled = tc["enabled"].asBool();
       }
     }
-    if (json.has("jellyfin")) {
+    if (json.isMember("jellyfin")) {
       const auto &jf = json["jellyfin"];
-      if (jf.has("enabled")) {
-        loaded.jellyfin_enabled = jf["enabled"].b();
+      if (jf.isMember("enabled")) {
+        loaded.jellyfin_enabled = jf["enabled"].asBool();
       }
-      if (jf.has("port")) {
-        loaded.jellyfin_port = static_cast<int>(jf["port"].i());
+      if (jf.isMember("port")) {
+        loaded.jellyfin_port = static_cast<int>(jf["port"].asInt64());
       }
-      if (jf.has("server_name")) {
-        loaded.jellyfin_server_name = jf["server_name"].s();
+      if (jf.isMember("server_name")) {
+        loaded.jellyfin_server_name = jf["server_name"].asString();
       }
     }
-    if (json.has("subsonic")) {
+    if (json.isMember("subsonic")) {
       const auto &sc = json["subsonic"];
-      if (sc.has("enabled")) {
-        loaded.subsonic.enabled = sc["enabled"].b();
+      if (sc.isMember("enabled")) {
+        loaded.subsonic.enabled = sc["enabled"].asBool();
       }
-      if (sc.has("port")) {
-        loaded.subsonic.port = static_cast<int>(sc["port"].i());
+      if (sc.isMember("port")) {
+        loaded.subsonic.port = static_cast<int>(sc["port"].asInt64());
       }
-      if (sc.has("server_name")) {
-        loaded.subsonic.server_name = sc["server_name"].s();
+      if (sc.isMember("server_name")) {
+        loaded.subsonic.server_name = sc["server_name"].asString();
       }
-      if (sc.has("default_page_size")) {
+      if (sc.isMember("default_page_size")) {
         loaded.subsonic.default_page_size =
-            static_cast<int>(sc["default_page_size"].i());
+            static_cast<int>(sc["default_page_size"].asInt64());
       }
-      if (sc.has("log_requests")) {
-        loaded.subsonic.log_requests = sc["log_requests"].b();
+      if (sc.isMember("log_requests")) {
+        loaded.subsonic.log_requests = sc["log_requests"].asBool();
       }
-      if (sc.has("cors_allow_origin")) {
-        loaded.subsonic.cors_allow_origin = sc["cors_allow_origin"].s();
+      if (sc.isMember("cors_allow_origin")) {
+        loaded.subsonic.cors_allow_origin = sc["cors_allow_origin"].asString();
       }
     }
-    if (json.has("image_cache")) {
+    if (json.isMember("image_cache")) {
       const auto &cache = json["image_cache"];
-      if (cache.has("enabled")) {
-        loaded.image_cache.enabled = cache["enabled"].b();
+      if (cache.isMember("enabled")) {
+        loaded.image_cache.enabled = cache["enabled"].asBool();
       }
-      if (cache.has("dir")) {
-        loaded.image_cache.dir = cache["dir"].s();
+      if (cache.isMember("dir")) {
+        loaded.image_cache.dir = cache["dir"].asString();
       }
-      if (cache.has("max_bytes")) {
-        const long long value = cache["max_bytes"].i();
+      if (cache.isMember("max_bytes")) {
+        const long long value = cache["max_bytes"].asInt64();
         if (value >= 0) {
           loaded.image_cache.max_bytes =
               static_cast<std::uintmax_t>(value);
         }
       }
-      if (cache.has("max_file_bytes")) {
-        const long long value = cache["max_file_bytes"].i();
+      if (cache.isMember("max_file_bytes")) {
+        const long long value = cache["max_file_bytes"].asInt64();
         if (value >= 0) {
           loaded.image_cache.max_file_bytes =
               static_cast<std::uintmax_t>(value);
         }
       }
-      if (cache.has("ttl_days")) {
+      if (cache.isMember("ttl_days")) {
         loaded.image_cache.ttl_days =
-            static_cast<int>(cache["ttl_days"].i());
+            static_cast<int>(cache["ttl_days"].asInt64());
       }
-      if (cache.has("gc_interval_seconds")) {
+      if (cache.isMember("gc_interval_seconds")) {
         loaded.image_cache.gc_interval_seconds =
-            static_cast<int>(cache["gc_interval_seconds"].i());
+            static_cast<int>(cache["gc_interval_seconds"].asInt64());
       }
-      if (cache.has("revalidate_seconds")) {
+      if (cache.isMember("revalidate_seconds")) {
         loaded.image_cache.revalidate_seconds =
-            static_cast<int>(cache["revalidate_seconds"].i());
+            static_cast<int>(cache["revalidate_seconds"].asInt64());
       }
     }
 
     // 媒体库：本地库只允许一个；网易云库最多一个；出现未知 type 直接报错。
-    if (json.has("libraries")) {
+    if (json.isMember("libraries")) {
       const auto &libs = json["libraries"];
-      if (libs.t() != crow::json::type::List) {
+      if (!libs.isArray()) {
         throw std::runtime_error("libraries 必须是数组");
       }
       int local_count = 0;
       int netease_count = 0;
       for (const auto &item : libs) {
-        if (item.t() != crow::json::type::Object) {
+        if (!item.isObject()) {
           throw std::runtime_error("libraries 的每一项必须是对象");
         }
         const std::string type =
-            item.has("type") ? std::string(item["type"].s()) : std::string{};
+            item.isMember("type") ? std::string(item["type"].asString()) : std::string{};
         const std::string id =
-            item.has("id") ? std::string(item["id"].s()) : std::string{};
+            item.isMember("id") ? std::string(item["id"].asString()) : std::string{};
         if (type == "local") {
           if (++local_count > 1) {
             throw std::runtime_error("libraries 只允许一个 type=local 的本地库");
@@ -330,18 +333,18 @@ const Config &load(const std::string &file) {
           if (!id.empty()) {
             loaded.local.id = id;
           }
-          if (item.has("follow_symlinks")) {
-            loaded.local.follow_symlinks = item["follow_symlinks"].b();
+          if (item.isMember("follow_symlinks")) {
+            loaded.local.follow_symlinks = item["follow_symlinks"].asBool();
           }
-          if (item.has("scan_on_start")) {
-            loaded.local.scan_on_start = item["scan_on_start"].b();
+          if (item.isMember("scan_on_start")) {
+            loaded.local.scan_on_start = item["scan_on_start"].asBool();
           }
-          if (item.has("scan_threads")) {
+          if (item.isMember("scan_threads")) {
             loaded.local.scan_threads =
-                static_cast<int>(item["scan_threads"].i());
+                static_cast<int>(item["scan_threads"].asInt64());
           }
-          if (item.has("playlist_dir")) {
-            loaded.local.playlist_dir = item["playlist_dir"].s();
+          if (item.isMember("playlist_dir")) {
+            loaded.local.playlist_dir = item["playlist_dir"].asString();
           }
         } else if (type == "netease") {
           if (++netease_count > 1) {
@@ -352,45 +355,45 @@ const Config &load(const std::string &file) {
           if (!id.empty()) {
             loaded.netease.id = id;
           }
-          if (item.has("enabled")) {
-            loaded.netease.enabled = item["enabled"].b();
+          if (item.isMember("enabled")) {
+            loaded.netease.enabled = item["enabled"].asBool();
           }
-          if (item.has("api_base")) {
-            loaded.netease.api_base = item["api_base"].s();
+          if (item.isMember("api_base")) {
+            loaded.netease.api_base = item["api_base"].asString();
           }
-          if (item.has("cookie")) {
-            loaded.netease.cookie = item["cookie"].s();
+          if (item.isMember("cookie")) {
+            loaded.netease.cookie = item["cookie"].asString();
           }
-          if (item.has("default_level")) {
-            loaded.netease.default_level = item["default_level"].s();
+          if (item.isMember("default_level")) {
+            loaded.netease.default_level = item["default_level"].asString();
           }
-          if (item.has("uid")) {
+          if (item.isMember("uid")) {
             const auto &uid = item["uid"];
             // uid 在 JSON 里可能是数字或字符串，两种都接受。
-            if (uid.t() == crow::json::type::Number) {
-              loaded.netease.uid = std::to_string(uid.i());
-            } else if (uid.t() == crow::json::type::String) {
-              loaded.netease.uid = uid.s();
+            if (uid.isNumeric()) {
+              loaded.netease.uid = std::to_string(uid.asInt64());
+            } else if (uid.isString()) {
+              loaded.netease.uid = uid.asString();
             }
           }
-          if (item.has("timeout_ms")) {
+          if (item.isMember("timeout_ms")) {
             loaded.netease.timeout_ms =
-                static_cast<int>(item["timeout_ms"].i());
+                static_cast<int>(item["timeout_ms"].asInt64());
           }
-          if (item.has("metadata_ttl_ms")) {
+          if (item.isMember("metadata_ttl_ms")) {
             loaded.netease.metadata_ttl_ms =
-                static_cast<int>(item["metadata_ttl_ms"].i());
+                static_cast<int>(item["metadata_ttl_ms"].asInt64());
           }
-          if (item.has("max_concurrency")) {
+          if (item.isMember("max_concurrency")) {
             loaded.netease.max_concurrency =
-                static_cast<int>(item["max_concurrency"].i());
+                static_cast<int>(item["max_concurrency"].asInt64());
           }
-          if (item.has("min_request_interval_ms")) {
+          if (item.isMember("min_request_interval_ms")) {
             loaded.netease.min_request_interval_ms =
-                static_cast<int>(item["min_request_interval_ms"].i());
+                static_cast<int>(item["min_request_interval_ms"].asInt64());
           }
-          if (item.has("real_ip")) {
-            loaded.netease.real_ip = item["real_ip"].s();
+          if (item.isMember("real_ip")) {
+            loaded.netease.real_ip = item["real_ip"].asString();
           }
         } else {
           throw std::runtime_error("libraries 存在未知 type: " + type +
@@ -403,34 +406,34 @@ const Config &load(const std::string &file) {
     }
 
     // 方面优先级：[{ "aspect": "metadata", "priority": ["local-main", ...] }]
-    if (json.has("library_priority")) {
+    if (json.isMember("library_priority")) {
       const auto &lp = json["library_priority"];
-      if (lp.t() != crow::json::type::List) {
+      if (!lp.isArray()) {
         throw std::runtime_error("library_priority 必须是数组");
       }
       loaded.library_priority.clear();
       for (const auto &item : lp) {
-        if (item.t() != crow::json::type::Object) {
+        if (!item.isObject()) {
           throw std::runtime_error(
               "library_priority 的每一项必须是 {aspect, priority} 对象");
         }
         LibraryPriorityConfig entry;
-        if (item.has("aspect")) {
-          entry.aspect = item["aspect"].s();
+        if (item.isMember("aspect")) {
+          entry.aspect = item["aspect"].asString();
         }
         if (entry.aspect.empty()) {
           throw std::runtime_error("library_priority 项缺少 aspect");
         }
-        if (item.has("priority")) {
+        if (item.isMember("priority")) {
           const auto &ids = item["priority"];
-          if (ids.t() != crow::json::type::List) {
+          if (!ids.isArray()) {
             throw std::runtime_error("library_priority.priority 必须是数组: " +
                                      entry.aspect);
           }
           for (const auto &value : ids) {
-            if (value.t() == crow::json::type::String &&
-                !std::string(value.s()).empty()) {
-              entry.library_ids.push_back(std::string(value.s()));
+            if (value.isString() &&
+                !std::string(value.asString()).empty()) {
+              entry.library_ids.push_back(std::string(value.asString()));
             }
           }
         }

@@ -1,8 +1,7 @@
 #ifndef API_V1_V1_H
 #define API_V1_V1_H
 
-#include "crow/http_request.h"
-#include "crow/http_response.h"
+#include "http_server.h"
 
 #include <string>
 
@@ -10,49 +9,49 @@
 // 不做选源、不做组合、不做平台翻译；JSON 序列化只发生在这一层。
 namespace api_v1 {
 
-crow::response libraries(const crow::request &req);
-crow::response provider_health(const crow::request &req);
+http_server::ResponsePtr libraries(const http_server::RequestPtr &req);
+http_server::ResponsePtr provider_health(const http_server::RequestPtr &req);
 
-crow::response search(const crow::request &req);
+http_server::ResponsePtr search(const http_server::RequestPtr &req);
 
-crow::response track(const crow::request &req, const std::string &ref);
-crow::response track_stream(const crow::request &req, const std::string &ref);
-crow::response track_lyrics(const crow::request &req, const std::string &ref);
-crow::response track_artwork(const crow::request &req, const std::string &ref);
+http_server::ResponsePtr track(const http_server::RequestPtr &req, const std::string &ref);
+http_server::ResponsePtr track_stream(const http_server::RequestPtr &req, const std::string &ref);
+http_server::ResponsePtr track_lyrics(const http_server::RequestPtr &req, const std::string &ref);
+http_server::ResponsePtr track_artwork(const http_server::RequestPtr &req, const std::string &ref);
 
-crow::response album(const crow::request &req, const std::string &ref);
-crow::response album_tracks(const crow::request &req, const std::string &ref);
-crow::response artist(const crow::request &req, const std::string &ref);
-crow::response artist_albums(const crow::request &req, const std::string &ref);
+http_server::ResponsePtr album(const http_server::RequestPtr &req, const std::string &ref);
+http_server::ResponsePtr album_tracks(const http_server::RequestPtr &req, const std::string &ref);
+http_server::ResponsePtr artist(const http_server::RequestPtr &req, const std::string &ref);
+http_server::ResponsePtr artist_albums(const http_server::RequestPtr &req, const std::string &ref);
 
-crow::response playlists(const crow::request &req);
-crow::response playlist(const crow::request &req, const std::string &ref);
+http_server::ResponsePtr playlists(const http_server::RequestPtr &req);
+http_server::ResponsePtr playlist(const http_server::RequestPtr &req, const std::string &ref);
 
 // 实体链接：以 SourceRef 为句柄，内部 link_id 不出进程。
-crow::response entity_link(const crow::request &req, const std::string &ref);
-crow::response entity_link_order(const crow::request &req,
+http_server::ResponsePtr entity_link(const http_server::RequestPtr &req, const std::string &ref);
+http_server::ResponsePtr entity_link_order(const http_server::RequestPtr &req,
                                  const std::string &ref);
-crow::response entity_link_create(const crow::request &req);
-crow::response entity_link_delete(const crow::request &req,
+http_server::ResponsePtr entity_link_create(const http_server::RequestPtr &req);
+http_server::ResponsePtr entity_link_delete(const http_server::RequestPtr &req,
                                   const std::string &ref);
-crow::response entity_link_remove_member(const crow::request &req,
+http_server::ResponsePtr entity_link_remove_member(const http_server::RequestPtr &req,
                                          const std::string &anchor,
                                          const std::string &member);
-crow::response entity_link_set_overrides(const crow::request &req,
+http_server::ResponsePtr entity_link_set_overrides(const http_server::RequestPtr &req,
                                          const std::string &ref);
-crow::response entity_link_clear_override(const crow::request &req,
+http_server::ResponsePtr entity_link_clear_override(const http_server::RequestPtr &req,
                                           const std::string &ref,
                                           const std::string &aspect);
 
 // 播放会话（7.1–7.4）：字节只从会话出，locator 不出进程。
-crow::response playback_open(const crow::request &req, const std::string &ref);
-crow::response playback_session(const crow::request &req,
+http_server::ResponsePtr playback_open(const http_server::RequestPtr &req, const std::string &ref);
+http_server::ResponsePtr playback_session(const http_server::RequestPtr &req,
                                 const std::string &session_id);
-crow::response playback_refresh(const crow::request &req,
+http_server::ResponsePtr playback_refresh(const http_server::RequestPtr &req,
                                 const std::string &session_id);
-crow::response playback_close(const crow::request &req,
+http_server::ResponsePtr playback_close(const http_server::RequestPtr &req,
                               const std::string &session_id);
-crow::response playback_stream(const crow::request &req,
+http_server::ResponsePtr playback_stream(const http_server::RequestPtr &req,
                                const std::string &session_id);
 
 } // namespace api_v1

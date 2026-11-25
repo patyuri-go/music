@@ -17,7 +17,7 @@ std::string iso_time(const std::string &value) { return value; }
 
 // 封面 id：Subsonic 用 `getCoverArt?id=` 取图，这里给实体自身 ref。
 // 没有封面时不写 coverArt 字段（客户端会画占位图）。
-void attach_cover(crow::json::wvalue &node,
+void attach_cover(Json::Value &node,
                   const std::optional<media_library::ArtworkRef> &artwork) {
   if (!artwork.has_value()) {
     return;
@@ -51,8 +51,8 @@ std::string join_album_artist_names(
 // OpenSubsonic 的 ArtistID3 最小形态：id + name。
 // 多位艺术家必须是数组里的多个对象，不能塞进一个 id/name。
 template <typename Link>
-crow::json::wvalue artist_link_dto(const Link &link) {
-  crow::json::wvalue node;
+Json::Value artist_link_dto(const Link &link) {
+  Json::Value node;
   node["id"] = id_of(link.ref);
   node["name"] = link.name;
   return node;
@@ -67,8 +67,8 @@ int duration_seconds(const media_library::Track &track) {
   return static_cast<int>(*track.duration_ms / 1000);
 }
 
-crow::json::wvalue song_dto(const media_library::Track &track) {
-  crow::json::wvalue node;
+Json::Value song_dto(const media_library::Track &track) {
+  Json::Value node;
   node["id"] = id_of(track.ref);
   node["parent"] = track.album.has_value() ? id_of(track.album->ref)
                                            : id_of(track.ref);
@@ -81,9 +81,9 @@ crow::json::wvalue song_dto(const media_library::Track &track) {
   // OpenSubsonic：artists 是数组，客户端据此把每位艺术家渲染成独立链接。
   // 只给 artist 字符串时，多人合作会被当成一个合并后的艺术家。
   if (!track.artists.empty()) {
-    crow::json::wvalue::list artists;
+    Json::Value artists(Json::arrayValue);
     for (const auto &link : track.artists) {
-      artists.push_back(artist_link_dto(link));
+      artists.append(artist_link_dto(link));
     }
     node["artists"] = std::move(artists);
     node["displayArtist"] = artist;
@@ -92,9 +92,9 @@ crow::json::wvalue song_dto(const media_library::Track &track) {
   const std::string album_artist = join_album_artist_names(track.album_artists);
   if (!album_artist.empty()) {
     node["albumArtist"] = album_artist;
-    crow::json::wvalue::list album_artists;
+    Json::Value album_artists(Json::arrayValue);
     for (const auto &link : track.album_artists) {
-      album_artists.push_back(artist_link_dto(link));
+      album_artists.append(artist_link_dto(link));
     }
     node["albumArtists"] = std::move(album_artists);
     node["displayAlbumArtist"] = album_artist;
@@ -152,9 +152,9 @@ crow::json::wvalue song_dto(const media_library::Track &track) {
   return node;
 }
 
-crow::json::wvalue album_dto(const media_library::Album &album,
+Json::Value album_dto(const media_library::Album &album,
                              bool include_songs) {
-  crow::json::wvalue node;
+  Json::Value node;
   node["id"] = id_of(album.ref);
   node["name"] = album.title;
   // 专辑对象在 Subsonic 里叫 album，但 OpenSubsonic 示例里同时给 title；
@@ -168,9 +168,9 @@ crow::json::wvalue album_dto(const media_library::Album &album,
                          : id_of(album.artists.front().ref);
   // 专辑同样给 OpenSubsonic artists 数组，避免多人专辑只暴露合并后的字符串。
   if (!album.artists.empty()) {
-    crow::json::wvalue::list artists;
+    Json::Value artists(Json::arrayValue);
     for (const auto &link : album.artists) {
-      artists.push_back(artist_link_dto(link));
+      artists.append(artist_link_dto(link));
     }
     node["artists"] = std::move(artists);
     node["displayArtist"] = artist;
@@ -190,13 +190,13 @@ crow::json::wvalue album_dto(const media_library::Album &album,
   }
   // getAlbum 的 song[] 由调用方经 list_album_tracks 取到后再填，
   // 这里只建空数组占位，避免下游 has() 判断分叉。
-  node["song"] = crow::json::wvalue::list{};
+  node["song"] = Json::Value(Json::arrayValue);
   return node;
 }
 
-crow::json::wvalue artist_dto(const media_library::Artist &artist,
+Json::Value artist_dto(const media_library::Artist &artist,
                               int album_count) {
-  crow::json::wvalue node;
+  Json::Value node;
   node["id"] = id_of(artist.ref);
   node["name"] = artist.name;
   node["albumCount"] = album_count;
@@ -207,26 +207,26 @@ crow::json::wvalue artist_dto(const media_library::Artist &artist,
   return node;
 }
 
-crow::json::wvalue artist_info_dto(const media_library::ArtistInfo &info) {
-  crow::json::wvalue node;
+Json::Value artist_info_dto(const media_library::ArtistInfo &info) {
+  Json::Value node;
   if (!info.description.empty()) {
     node["biography"] = info.description;
   }
-  node["similarArtist"] = crow::json::wvalue::list{};
+  node["similarArtist"] = Json::Value(Json::arrayValue);
   return node;
 }
 
-crow::json::wvalue album_info_dto(const media_library::AlbumInfo &info) {
-  crow::json::wvalue node;
+Json::Value album_info_dto(const media_library::AlbumInfo &info) {
+  Json::Value node;
   if (!info.description.empty()) {
     node["notes"] = info.description;
   }
   return node;
 }
 
-crow::json::wvalue playlist_dto(const media_library::Playlist &playlist,
+Json::Value playlist_dto(const media_library::Playlist &playlist,
                                 bool include_entries) {
-  crow::json::wvalue node;
+  Json::Value node;
   node["id"] = id_of(playlist.ref);
   node["name"] = playlist.name;
   if (!playlist.description.empty()) {
@@ -245,25 +245,24 @@ crow::json::wvalue playlist_dto(const media_library::Playlist &playlist,
   if (!include_entries) {
     return node;
   }
-  crow::json::wvalue::list entries;
-  entries.reserve(playlist.tracks.size());
-  for (const auto &track : playlist.tracks) {
-    entries.push_back(song_dto(track));
+  Json::Value entries(Json::arrayValue);
+    for (const auto &track : playlist.tracks) {
+    entries.append(song_dto(track));
   }
-  node["entry"] = crow::json::wvalue(std::move(entries));
+  node["entry"] = std::move(entries);
   return node;
 }
 
-crow::json::wvalue music_folder_dto(const std::string &library_id,
+Json::Value music_folder_dto(const std::string &library_id,
                                     const std::string &name) {
-  crow::json::wvalue node;
+  Json::Value node;
   node["id"] = library_id;
   node["name"] = name.empty() ? library_id : name;
   return node;
 }
 
-crow::json::wvalue user_dto(const std::string &username) {
-  crow::json::wvalue node;
+Json::Value user_dto(const std::string &username) {
+  Json::Value node;
   node["username"] = username.empty() ? "admin" : username;
   node["email"] = "";
   node["scrobblingEnabled"] = false;
@@ -281,7 +280,7 @@ crow::json::wvalue user_dto(const std::string &username) {
   return node;
 }
 
-crow::json::wvalue search_hit_dto(const media_library::SearchHit &hit) {
+Json::Value search_hit_dto(const media_library::SearchHit &hit) {
   using media_library::EntityType;
   switch (hit.kind) {
   case EntityType::Track: {
@@ -313,7 +312,7 @@ crow::json::wvalue search_hit_dto(const media_library::SearchHit &hit) {
     return artist_dto(artist, 0);
   }
   default:
-    return crow::json::wvalue(nullptr);
+    return Json::Value(Json::nullValue);
   }
 }
 

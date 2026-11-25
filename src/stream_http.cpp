@@ -1,9 +1,10 @@
 #include "stream_http.h"
 
-#include "crow/json.h"
-#include "crow/stream_response.h"
 #include "http_util.h"
+#include "json_util.h"
 #include "media_library/media_runtime.h"
+
+#include <json/json.h>
 
 #include <algorithm>
 #include <cstring>
@@ -53,8 +54,8 @@ int status_for(ErrorCode code) noexcept {
   return 500;
 }
 
-crow::json::wvalue error_json(const Error &error) {
-  crow::json::wvalue detail;
+Json::Value error_json(const Error &error) {
+  Json::Value detail;
   detail["code"] = std::string(media_library::error_code_name(error.code));
   detail["message"] = error.message;
   if (!error.library_id.empty()) {
@@ -69,10 +70,10 @@ crow::json::wvalue error_json(const Error &error) {
   }
   detail["retryable"] = error.retryable;
   if (error.retry_after.has_value()) {
-    detail["retry_after"] = *error.retry_after;
+    detail["retry_after"] = static_cast<Json::Int64>(*error.retry_after);
   }
   // details 与 internal_cause 是诊断字段，绝不出现在响应里。
-  crow::json::wvalue body;
+  Json::Value body;
   body["error"] = std::move(detail);
   return body;
 }
@@ -81,22 +82,30 @@ std::shared_ptr<PlaybackService> playback() {
   return media_library::playback_service_ptr();
 }
 
-} // namespace
-
-int status_of(ErrorCode code) noexcept { return status_for(code); }
-
-crow::response error_response(const Error &error) {
-  crow::response res = http_util::jsonResponse(
-      status_for(error.code), error_json(error).dump());
-  if (error.retry_after.has_value()) {
-    res.add_header("Retry-After", std::to_string(*error.retry_after));
+ResponsePtr rangeNotSatisfiable(std::int64_t size) {
+  ResponsePtr res = http_server::textResponse(416, "range not satisfiable");
+  if (size >= 0) {
+    res->addHeader("Content-Range", "bytes */" + std::to_string(size));
   }
   return res;
 }
 
-crow::response serve(const crow::request &req,
-                     std::shared_ptr<media_library::ByteStream> stream,
-                     const std::string &library_id, bool head_only) {
+} // namespace
+
+int status_of(ErrorCode code) noexcept { return status_for(code); }
+
+ResponsePtr error_response(const Error &error) {
+  ResponsePtr res = http_util::jsonResponse(status_for(error.code),
+                                            json_util::dump(error_json(error)));
+  if (error.retry_after.has_value()) {
+    res->addHeader("Retry-After", std::to_string(*error.retry_after));
+  }
+  return res;
+}
+
+ResponsePtr serve(const RequestPtr &req,
+                  std::shared_ptr<media_library::ByteStream> stream,
+                  const std::string &library_id, bool head_only) {
   if (stream == nullptr) {
     return error_response(
         Error::make(ErrorCode::Internal, "audio stream is null"));
@@ -111,7 +120,7 @@ crow::response serve(const crow::request &req,
     }
     info = stream->info();
   }
-  const std::string range = req.get_header_value("Range");
+  const std::string range = req ? req->getHeader("Range") : std::string();
 
   std::int64_t size = info.size_bytes;
   std::int64_t start = 0;
@@ -120,9 +129,7 @@ crow::response serve(const crow::request &req,
   if (size >= 0 && !range.empty()) {
     const auto [s, e] = http_util::parseRange(range, size);
     if (s < 0) {
-      crow::response res(416, "range not satisfiable");
-      res.add_header("Content-Range", "bytes */" + std::to_string(size));
-      return res;
+      return rangeNotSatisfiable(size);
     }
     start = s;
     end = e;
@@ -130,11 +137,7 @@ crow::response serve(const crow::request &req,
 
   // 长度未知就不承诺 Range：忽略 Range 头，顺序输出整段。
   if (start > 0 && !info.seekable) {
-    crow::response res(416, "range not satisfiable");
-    if (size >= 0) {
-      res.add_header("Content-Range", "bytes */" + std::to_string(size));
-    }
-    return res;
+    return rangeNotSatisfiable(size);
   }
   if (start > 0) {
     media_library::Status seeked = stream->seek(start);
@@ -145,67 +148,76 @@ crow::response serve(const crow::request &req,
 
   const std::int64_t length = (size >= 0 && end >= 0) ? end - start + 1 : -1;
   const int code = (start != 0 || (size >= 0 && end != size - 1)) ? 206 : 200;
+  const std::string content_type =
+      info.mime_type.empty() ? std::string("application/octet-stream")
+                             : info.mime_type;
 
   if (head_only) {
-    crow::response res(code);
-    if (!info.mime_type.empty()) {
-      res.set_header("Content-Type", info.mime_type);
-    }
+    ResponsePtr res = drogon::HttpResponse::newHttpResponse();
+    res->setStatusCode(static_cast<drogon::HttpStatusCode>(code));
+    res->setContentTypeString(content_type);
     if (length >= 0) {
-      res.set_header("Content-Length", std::to_string(length));
-      res.manual_length_header = true;
+      res->addHeader("Content-Length", std::to_string(length));
     }
-    res.set_header("Accept-Ranges", info.seekable ? "bytes" : "none");
+    res->addHeader("Accept-Ranges", info.seekable ? "bytes" : "none");
     if (size >= 0) {
-      res.set_header("Content-Range",
-                     "bytes " + std::to_string(start) + "-" +
-                         std::to_string(end) + "/" + std::to_string(size));
+      res->addHeader("Content-Range", "bytes " + std::to_string(start) + "-" +
+                                          std::to_string(end) + "/" +
+                                          std::to_string(size));
     }
     if (!library_id.empty()) {
-      res.set_header("X-Musicd-Origin", library_id);
+      res->addHeader("X-Musicd-Origin", library_id);
     }
     return res;
   }
 
   auto remaining = std::make_shared<std::int64_t>(length);
-  crow::response res = crow::streamedResponse(
-      code, info.mime_type, length,
-      [stream, remaining](std::string &out) -> bool {
-        if (*remaining == 0) {
-          return false;
+  ResponsePtr res = drogon::HttpResponse::newStreamResponse(
+      [stream, remaining](char *buf, std::size_t len) -> std::size_t {
+        // buf == nullptr 表示响应结束/连接中断，无需额外清理（shared_ptr 释放）。
+        if (buf == nullptr || len == 0) {
+          return 0;
         }
-        std::size_t want = 65536;
+        if (*remaining == 0) {
+          return 0;
+        }
+        std::size_t want = len;
         if (*remaining > 0) {
           want = static_cast<std::size_t>(
-              std::min<std::int64_t>(*remaining, 65536));
+              std::min<std::int64_t>(*remaining, static_cast<std::int64_t>(len)));
         }
-        media_library::Result<std::vector<std::byte>> chunk =
-            stream->read(want);
+        media_library::Result<std::vector<std::byte>> chunk = stream->read(want);
         if (!chunk.ok() || chunk.value().empty()) {
-          return false;
+          return 0;
         }
-        const std::size_t got = chunk.value().size();
-        out.resize(got);
-        std::memcpy(out.data(), chunk.value().data(), got);
+        const std::size_t got =
+            std::min<std::size_t>(chunk.value().size(), len);
+        std::memcpy(buf, chunk.value().data(), got);
         if (*remaining > 0) {
           *remaining -= static_cast<std::int64_t>(got);
         }
-        return true;
-      });
-  res.add_header("Accept-Ranges", info.seekable ? "bytes" : "none");
+        return got;
+      },
+      "", drogon::CT_NONE, content_type);
+  res->setStatusCode(static_cast<drogon::HttpStatusCode>(code));
+  if (length >= 0) {
+    // 流式响应没有长度就是 chunked；这里显式声明长度。
+    res->addHeader("Content-Length", std::to_string(length));
+  }
+  res->addHeader("Accept-Ranges", info.seekable ? "bytes" : "none");
   if (size >= 0) {
-    res.add_header("Content-Range", "bytes " + std::to_string(start) + "-" +
+    res->addHeader("Content-Range", "bytes " + std::to_string(start) + "-" +
                                         std::to_string(end) + "/" +
                                         std::to_string(size));
   }
   if (!library_id.empty()) {
-    res.add_header("X-Musicd-Origin", library_id);
+    res->addHeader("X-Musicd-Origin", library_id);
   }
   return res;
 }
 
-crow::response serve_session(const crow::request &req,
-                             const std::string &session_id, bool head_only) {
+ResponsePtr serve_session(const RequestPtr &req, const std::string &session_id,
+                          bool head_only) {
   const std::shared_ptr<PlaybackService> service = playback();
   if (service == nullptr) {
     return error_response(Error::make(ErrorCode::ProviderUnavailable,
@@ -225,9 +237,8 @@ crow::response serve_session(const crow::request &req,
                head_only);
 }
 
-crow::response serve_track(const crow::request &req,
-                           const media_library::TrackRef &track,
-                           bool head_only) {
+ResponsePtr serve_track(const RequestPtr &req,
+                        const media_library::TrackRef &track, bool head_only) {
   const std::shared_ptr<PlaybackService> service = playback();
   if (service == nullptr) {
     return error_response(Error::make(ErrorCode::ProviderUnavailable,
@@ -245,16 +256,15 @@ crow::response serve_track(const crow::request &req,
     return error_response(opened.error());
   }
   std::shared_ptr<media_library::ByteStream> stream(std::move(opened).value());
-  crow::response res = serve(req, std::move(stream),
-                             session.value().stream.origin.library_id,
-                             head_only);
-  res.add_header("X-Playback-Session", session.value().session_id);
+  ResponsePtr res = serve(req, std::move(stream),
+                          session.value().stream.origin.library_id, head_only);
+  res->addHeader("X-Playback-Session", session.value().session_id);
   return res;
 }
 
-crow::response serve_artwork(const crow::request &req,
-                             const media_library::ArtworkRef &artwork,
-                             bool head_only) {
+ResponsePtr serve_artwork(const RequestPtr &req,
+                          const media_library::ArtworkRef &artwork,
+                          bool head_only) {
   const std::shared_ptr<media_library::ArtworkService> service =
       media_library::artwork_service_ptr();
   if (service == nullptr) {
@@ -269,12 +279,13 @@ crow::response serve_artwork(const crow::request &req,
   }
 
   const std::string &etag = info.value().etag;
-  if (!etag.empty()) {
-    const auto &request_etag = req.get_header_value("If-None-Match");
+  if (!etag.empty() && req) {
+    const std::string request_etag = req->getHeader("If-None-Match");
     if (!request_etag.empty() && request_etag == etag) {
-      crow::response not_modified(304);
-      not_modified.add_header("ETag", etag);
-      not_modified.add_header("Cache-Control", "public, max-age=3600");
+      ResponsePtr not_modified = drogon::HttpResponse::newHttpResponse();
+      not_modified->setStatusCode(drogon::k304NotModified);
+      not_modified->addHeader("ETag", etag);
+      not_modified->addHeader("Cache-Control", "public, max-age=3600");
       return not_modified;
     }
   }
@@ -286,12 +297,12 @@ crow::response serve_artwork(const crow::request &req,
   }
 
   std::shared_ptr<media_library::ByteStream> stream(std::move(opened).value());
-  crow::response res =
+  ResponsePtr res =
       serve(req, std::move(stream), info.value().library_id, head_only);
   if (!etag.empty()) {
-    res.add_header("ETag", etag);
+    res->addHeader("ETag", etag);
   }
-  res.add_header("Cache-Control", "public, max-age=3600");
+  res->addHeader("Cache-Control", "public, max-age=3600");
   return res;
 }
 

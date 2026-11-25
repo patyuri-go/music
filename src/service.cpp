@@ -5,7 +5,7 @@
 #include "media_library/library_runtime.h"
 #include "media_library/snapshot.h"
 
-#include "crow/json.h"
+#include <json/json.h>
 
 #include <algorithm>
 #include <cctype>
@@ -17,19 +17,19 @@
 
 namespace {
 
-crow::json::wvalue intList(const std::vector<int> &ids) {
-  crow::json::wvalue::list list;
+Json::Value intList(const std::vector<int> &ids) {
+  Json::Value list(Json::arrayValue);
   for (const int id : ids) {
-    list.emplace_back(id);
+    list.append(id);
   }
-  return crow::json::wvalue(list);
+  return list;
 }
 
 // 旧版 /api 响应需要路径、mtime、内部 ID 等传输细节；
 // 领域模型只提供语义字段，这里在兼容边界把它们拼回去。
-crow::json::wvalue trackToJson(int internal_id, const media_library::Track &t,
+Json::Value trackToJson(int internal_id, const media_library::Track &t,
                                const std::optional<media_library::TrackTransport> &transport) {
-  crow::json::wvalue out;
+  Json::Value out;
   out["id"] = internal_id;
   out["title"] = t.title;
   out["path"] = transport ? transport->path : std::string();
@@ -44,7 +44,8 @@ crow::json::wvalue trackToJson(int internal_id, const media_library::Track &t,
   out["channels"] = t.audio.channels.value_or(0);
   out["format"] = t.audio.format;
   out["size_bytes"] = t.audio.size_bytes.value_or(0);
-  out["mtime"] = transport ? transport->mtime : 0;
+  out["mtime"] =
+      static_cast<Json::Int64>(transport ? transport->mtime : 0);
   out["added_at"] = t.user_data.added_at;
   out["play_count"] = t.user_data.play_count;
   out["last_played"] = t.user_data.last_played;
@@ -53,7 +54,7 @@ crow::json::wvalue trackToJson(int internal_id, const media_library::Track &t,
 }
 
 // 按内部 ID 取单个曲目并转成旧版 JSON；不存在时返回空。
-std::optional<crow::json::wvalue> trackJson(int internal_id) {
+std::optional<Json::Value> trackJson(int internal_id) {
   auto &library = media_library::library();
   const auto ref = library.ref_for_compat(media_library::EntityType::Track, internal_id);
   if (!ref) {
@@ -67,8 +68,8 @@ std::optional<crow::json::wvalue> trackJson(int internal_id) {
                      library.track_transport(internal_id));
 }
 
-crow::json::wvalue tracksToList(const std::vector<int> &internal_ids) {
-  crow::json::wvalue out(crow::json::type::List);
+Json::Value tracksToList(const std::vector<int> &internal_ids) {
+  Json::Value out(Json::arrayValue);
   int index = 0;
   for (const int internal_id : internal_ids) {
     auto item = trackJson(internal_id);
@@ -112,11 +113,11 @@ std::string lower(std::string s) {
 
 Service::Service() = default;
 
-std::optional<crow::json::wvalue> Service::query(const crow::json::rvalue &json) {
-  if (!json || !json.has("type")) {
+std::optional<Json::Value> Service::query(const Json::Value &json) {
+  if (json.isNull() || !json.isMember("type")) {
     return std::nullopt;
   }
-  const std::string &type = json["type"].s();
+  const std::string &type = json["type"].asString();
   if (type == "home") {
     return home(json);
   }
@@ -135,11 +136,11 @@ std::optional<crow::json::wvalue> Service::query(const crow::json::rvalue &json)
   return std::nullopt;
 }
 
-std::optional<crow::json::wvalue> Service::trackById(int id) {
+std::optional<Json::Value> Service::trackById(int id) {
   return trackJson(id);
 }
 
-std::optional<crow::json::wvalue> Service::albumById(int id) {
+std::optional<Json::Value> Service::albumById(int id) {
   auto &library = media_library::library();
   const auto ref = library.ref_for_compat(media_library::EntityType::Album, id);
   if (!ref) {
@@ -151,7 +152,7 @@ std::optional<crow::json::wvalue> Service::albumById(int id) {
   }
   const auto &album = result.value();
 
-  crow::json::wvalue out;
+  Json::Value out;
   out["id"] = id;
   out["name"] = album.title;
   std::vector<int> album_artist_ids;
@@ -181,7 +182,7 @@ std::optional<crow::json::wvalue> Service::albumById(int id) {
   return out;
 }
 
-std::optional<crow::json::wvalue> Service::artistById(int id) {
+std::optional<Json::Value> Service::artistById(int id) {
   auto &library = media_library::library();
   const auto ref = library.ref_for_compat(media_library::EntityType::Artist, id);
   if (!ref) {
@@ -193,7 +194,7 @@ std::optional<crow::json::wvalue> Service::artistById(int id) {
   }
   const auto &artist = result.value();
 
-  crow::json::wvalue out;
+  Json::Value out;
   out["id"] = id;
   out["name"] = artist.name;
   out["sort_name"] = artist.sort_name;
@@ -225,15 +226,15 @@ std::optional<crow::json::wvalue> Service::artistById(int id) {
   return out;
 }
 
-std::optional<crow::json::wvalue> Service::home(const crow::json::rvalue &json) {
+std::optional<Json::Value> Service::home(const Json::Value &json) {
   int after_id = 0;
   int pegcount = config::get().page_size;
 
-  if (json.has("afterid")) {
-    after_id = static_cast<int>(json["afterid"].i());
+  if (json.isMember("afterid")) {
+    after_id = static_cast<int>(json["afterid"].asInt64());
   }
-  if (json.has("pegcount")) {
-    pegcount = static_cast<int>(json["pegcount"].i());
+  if (json.isMember("pegcount")) {
+    pegcount = static_cast<int>(json["pegcount"].asInt64());
   }
 
   const auto snap = media_library::library().snapshot();
@@ -250,11 +251,11 @@ std::optional<crow::json::wvalue> Service::home(const crow::json::rvalue &json) 
   return tracksToList(ids);
 }
 
-std::optional<crow::json::wvalue> Service::tag(const crow::json::rvalue &json) {
-  if (!json.has("tag")) {
-    return crow::json::wvalue(crow::json::type::List);
+std::optional<Json::Value> Service::tag(const Json::Value &json) {
+  if (!json.isMember("tag")) {
+    return Json::Value(Json::arrayValue);
   }
-  const std::string tag_name = json["tag"].s();
+  const std::string tag_name = json["tag"].asString();
   const int page_size = config::get().page_size;
 
   const auto snap = media_library::library().snapshot();
@@ -282,19 +283,19 @@ std::optional<crow::json::wvalue> Service::tag(const crow::json::rvalue &json) {
   return tracksToList(ids);
 }
 
-std::optional<crow::json::wvalue> Service::album(const crow::json::rvalue &) {
+std::optional<Json::Value> Service::album(const Json::Value &) {
   return std::nullopt;
 }
 
-std::optional<crow::json::wvalue> Service::artist(const crow::json::rvalue &) {
+std::optional<Json::Value> Service::artist(const Json::Value &) {
   return std::nullopt;
 }
 
-std::optional<crow::json::wvalue> Service::search(const crow::json::rvalue &json) {
-  if (!json.has("q")) {
-    return crow::json::wvalue(crow::json::type::List);
+std::optional<Json::Value> Service::search(const Json::Value &json) {
+  if (!json.isMember("q")) {
+    return Json::Value(Json::arrayValue);
   }
-  const std::string query = lower(json["q"].s());
+  const std::string query = lower(json["q"].asString());
   const int page_size = config::get().page_size;
 
   const auto snap = media_library::library().snapshot();

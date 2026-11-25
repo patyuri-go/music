@@ -8,7 +8,7 @@
 
 #include "api/playlist/playlist.h"
 #include "api/webdav/webdav.h"
-#include "crow/json.h"
+#include "json_util.h"
 #include "media_library/lyric_parser.h"
 
 #include <algorithm>
@@ -198,16 +198,16 @@ std::optional<std::string> entity_locator(const std::string &entity_id) {
   std::string base_path;
   std::string user;
   std::string password;
-  auto config_json = crow::json::load(text_at(row, 3));
-  if (config_json) {
-    if (config_json.has("base_path")) {
-      base_path = config_json["base_path"].s();
+  const Json::Value config_json = json_util::parseOrNull(text_at(row, 3));
+  if (!config_json.isNull()) {
+    if (config_json.isMember("base_path")) {
+      base_path = config_json["base_path"].asString();
     }
-    if (config_json.has("username")) {
-      user = config_json["username"].s();
+    if (config_json.isMember("username")) {
+      user = config_json["username"].asString();
     }
-    if (config_json.has("password")) {
-      password = config_json["password"].s();
+    if (config_json.isMember("password")) {
+      password = config_json["password"].asString();
     }
   }
 

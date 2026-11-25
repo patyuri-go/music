@@ -1,6 +1,8 @@
 #include "api/v1/v1.h"
 
-#include "crow/json.h"
+#include <json/json.h>
+
+#include "json_util.h"
 #include "http_util.h"
 #include "media_library/library_directory.h"
 #include "media_library/media_runtime.h"
@@ -23,15 +25,15 @@ using namespace media_library;
 // 错误到 HTTP 的映射由 stream_http 统一提供：状态码与响应体全进程只有一份。
 // ---------------------------------------------------------------------------
 
-crow::response fail(const Error &error) {
+http_server::ResponsePtr fail(const Error &error) {
   return stream_http::error_response(error);
 }
 
-crow::response invalid(const std::string &message) {
+http_server::ResponsePtr invalid(const std::string &message) {
   return fail(Error::make(ErrorCode::InvalidRequest, message));
 }
 
-crow::response unavailable() {
+http_server::ResponsePtr unavailable() {
   return fail(Error::make(ErrorCode::ProviderUnavailable,
                           "media runtime is not initialized"));
 }
@@ -40,8 +42,8 @@ crow::response unavailable() {
 // 领域模型序列化
 // ---------------------------------------------------------------------------
 
-crow::json::wvalue ref_json(const SourceRef &ref) {
-  crow::json::wvalue out;
+Json::Value ref_json(const SourceRef &ref) {
+  Json::Value out;
   out["ref"] = to_string(ref);
   out["library_id"] = ref.library_id;
   out["type"] = std::string(entity_type_name(ref.entity_type));
@@ -49,253 +51,243 @@ crow::json::wvalue ref_json(const SourceRef &ref) {
   return out;
 }
 
-crow::json::wvalue restrictions_json(const std::vector<Restriction> &items) {
-  crow::json::wvalue::list out;
-  out.reserve(items.size());
+Json::Value restrictions_json(const std::vector<Restriction> &items) {
+  Json::Value out(Json::arrayValue);
   for (const Restriction &item : items) {
-    crow::json::wvalue entry;
+    Json::Value entry;
     entry["code"] = std::string(restriction_code_name(item.code));
     entry["message"] = item.message;
-    out.push_back(std::move(entry));
+    out.append(std::move(entry));
   }
-  return crow::json::wvalue(std::move(out));
+  return Json::Value(std::move(out));
 }
 
-crow::json::wvalue artwork_json(const ArtworkRef &artwork) {
-  crow::json::wvalue out;
+Json::Value artwork_json(const ArtworkRef &artwork) {
+  Json::Value out;
   out["owner"] = ref_json(artwork.owner);
   out["kind"] = artwork.kind;
   if (artwork.artwork_id.has_value()) {
     out["artwork_id"] = *artwork.artwork_id;
   } else {
-    out["artwork_id"] = nullptr;
+    out["artwork_id"] = Json::Value(Json::nullValue);
   }
   out["cache_tag"] = artwork.cache_tag;
   return out;
 }
 
-crow::json::wvalue artist_links_json(const std::vector<ArtistLink> &items) {
-  crow::json::wvalue::list out;
-  out.reserve(items.size());
+Json::Value artist_links_json(const std::vector<ArtistLink> &items) {
+  Json::Value out(Json::arrayValue);
   for (const ArtistLink &item : items) {
-    crow::json::wvalue entry;
+    Json::Value entry;
     entry["name"] = item.name;
     entry["artist"] = ref_json(item.ref);
-    out.push_back(std::move(entry));
+    out.append(std::move(entry));
   }
-  return crow::json::wvalue(std::move(out));
+  return Json::Value(std::move(out));
 }
 
-crow::json::wvalue album_artist_links_json(
+Json::Value album_artist_links_json(
     const std::vector<AlbumArtistLink> &items) {
-  crow::json::wvalue::list out;
-  out.reserve(items.size());
+  Json::Value out(Json::arrayValue);
   for (const AlbumArtistLink &item : items) {
-    crow::json::wvalue entry;
+    Json::Value entry;
     entry["name"] = item.name;
     entry["album_artist"] = ref_json(item.ref);
-    out.push_back(std::move(entry));
+    out.append(std::move(entry));
   }
-  return crow::json::wvalue(std::move(out));
+  return Json::Value(std::move(out));
 }
 
-crow::json::wvalue track_json(const Track &track) {
-  crow::json::wvalue out;
+Json::Value track_json(const Track &track) {
+  Json::Value out;
   out["ref"] = ref_json(track.ref);
   out["title"] = track.title;
   out["artists"] = artist_links_json(track.artists);
   out["album_artists"] = album_artist_links_json(track.album_artists);
   if (track.album.has_value()) {
-    crow::json::wvalue album;
+    Json::Value album;
     album["title"] = track.album->title;
     album["album"] = ref_json(track.album->ref);
     out["album"] = std::move(album);
   } else {
-    out["album"] = nullptr;
+    out["album"] = Json::Value(Json::nullValue);
   }
-  out["date"] = track.date.has_value() ? crow::json::wvalue(*track.date)
-                                       : crow::json::wvalue(nullptr);
+  out["date"] = track.date.has_value() ? Json::Value(*track.date)
+                                       : Json::Value(Json::nullValue);
   out["duration_ms"] = track.duration_ms.has_value()
-                           ? crow::json::wvalue(*track.duration_ms)
-                           : crow::json::wvalue(nullptr);
+                           ? Json::Value(*track.duration_ms)
+                           : Json::Value(Json::nullValue);
   out["track_no"] = track.track_no.has_value()
-                        ? crow::json::wvalue(*track.track_no)
-                        : crow::json::wvalue(nullptr);
+                        ? Json::Value(*track.track_no)
+                        : Json::Value(Json::nullValue);
   out["disc_no"] = track.disc_no.has_value()
-                       ? crow::json::wvalue(*track.disc_no)
-                       : crow::json::wvalue(nullptr);
-  out["year"] = track.year.has_value() ? crow::json::wvalue(*track.year)
-                                       : crow::json::wvalue(nullptr);
+                       ? Json::Value(*track.disc_no)
+                       : Json::Value(Json::nullValue);
+  out["year"] = track.year.has_value() ? Json::Value(*track.year)
+                                       : Json::Value(Json::nullValue);
 
-  crow::json::wvalue::list genres;
-  genres.reserve(track.genres.size());
+  Json::Value genres(Json::arrayValue);
   for (const std::string &genre : track.genres) {
-    genres.push_back(genre);
+    genres.append(genre);
   }
   out["genres"] = std::move(genres);
 
   out["artwork"] = track.artwork.has_value()
                        ? artwork_json(*track.artwork)
-                       : crow::json::wvalue(nullptr);
+                       : Json::Value(Json::nullValue);
   out["lyrics_available"] = track.lyrics_available;
   out["playable"] = track.playable;
   out["restrictions"] = restrictions_json(track.restrictions);
 
-  crow::json::wvalue audio;
+  Json::Value audio;
   audio["bitrate_kbps"] = track.audio.bitrate_kbps.has_value()
-                              ? crow::json::wvalue(*track.audio.bitrate_kbps)
-                              : crow::json::wvalue(nullptr);
+                              ? Json::Value(*track.audio.bitrate_kbps)
+                              : Json::Value(Json::nullValue);
   audio["sample_rate"] = track.audio.sample_rate.has_value()
-                             ? crow::json::wvalue(*track.audio.sample_rate)
-                             : crow::json::wvalue(nullptr);
+                             ? Json::Value(*track.audio.sample_rate)
+                             : Json::Value(Json::nullValue);
   audio["channels"] = track.audio.channels.has_value()
-                          ? crow::json::wvalue(*track.audio.channels)
-                          : crow::json::wvalue(nullptr);
+                          ? Json::Value(*track.audio.channels)
+                          : Json::Value(Json::nullValue);
   audio["format"] = track.audio.format;
   audio["size_bytes"] = track.audio.size_bytes.has_value()
-                            ? crow::json::wvalue(*track.audio.size_bytes)
-                            : crow::json::wvalue(nullptr);
+                            ? Json::Value(*track.audio.size_bytes)
+                            : Json::Value(Json::nullValue);
   out["audio"] = std::move(audio);
   return out;
 }
 
-crow::json::wvalue album_json(const Album &album) {
-  crow::json::wvalue out;
+Json::Value album_json(const Album &album) {
+  Json::Value out;
   out["ref"] = ref_json(album.ref);
   out["title"] = album.title;
   out["artists"] = album_artist_links_json(album.artists);
-  out["date"] = album.date.has_value() ? crow::json::wvalue(*album.date)
-                                       : crow::json::wvalue(nullptr);
-  out["year"] = album.year.has_value() ? crow::json::wvalue(*album.year)
-                                       : crow::json::wvalue(nullptr);
-  crow::json::wvalue::list genres;
-  genres.reserve(album.genres.size());
+  out["date"] = album.date.has_value() ? Json::Value(*album.date)
+                                       : Json::Value(Json::nullValue);
+  out["year"] = album.year.has_value() ? Json::Value(*album.year)
+                                       : Json::Value(Json::nullValue);
+  Json::Value genres(Json::arrayValue);
   for (const std::string &genre : album.genres) {
-    genres.push_back(genre);
+    genres.append(genre);
   }
   out["genres"] = std::move(genres);
   out["artwork"] = album.artwork.has_value()
                        ? artwork_json(*album.artwork)
-                       : crow::json::wvalue(nullptr);
+                       : Json::Value(Json::nullValue);
   return out;
 }
 
-crow::json::wvalue artist_json(const Artist &artist) {
-  crow::json::wvalue out;
+Json::Value artist_json(const Artist &artist) {
+  Json::Value out;
   out["ref"] = ref_json(artist.ref);
   out["name"] = artist.name;
   out["sort_name"] = artist.sort_name;
   out["artwork"] = artist.artwork.has_value()
                        ? artwork_json(*artist.artwork)
-                       : crow::json::wvalue(nullptr);
+                       : Json::Value(Json::nullValue);
   return out;
 }
 
-crow::json::wvalue playlist_json(const Playlist &playlist) {
-  crow::json::wvalue out;
+Json::Value playlist_json(const Playlist &playlist) {
+  Json::Value out;
   out["ref"] = ref_json(playlist.ref);
   out["name"] = playlist.name;
   out["description"] = playlist.description;
-  crow::json::wvalue::list tracks;
-  tracks.reserve(playlist.tracks.size());
+  Json::Value tracks(Json::arrayValue);
   for (const Track &track : playlist.tracks) {
-    tracks.push_back(to_string(track.ref));
+    tracks.append(to_string(track.ref));
   }
   out["tracks"] = std::move(tracks);
   return out;
 }
 
-crow::json::wvalue lyrics_json(const Lyrics &lyrics) {
-  crow::json::wvalue out;
+Json::Value lyrics_json(const Lyrics &lyrics) {
+  Json::Value out;
   out["track"] = ref_json(lyrics.track);
   out["language"] = lyrics.language.has_value()
-                        ? crow::json::wvalue(*lyrics.language)
-                        : crow::json::wvalue(nullptr);
-  crow::json::wvalue::list modes;
-  modes.reserve(lyrics.modes.size());
+                        ? Json::Value(*lyrics.language)
+                        : Json::Value(Json::nullValue);
+  Json::Value modes(Json::arrayValue);
   for (LyricsMode mode : lyrics.modes) {
     switch (mode) {
     case LyricsMode::WordSynced:
-      modes.emplace_back("word_synced");
+      modes.append("word_synced");
       break;
     case LyricsMode::LineSynced:
-      modes.emplace_back("line_synced");
+      modes.append("line_synced");
       break;
     case LyricsMode::Unsynced:
-      modes.emplace_back("unsynced");
+      modes.append("unsynced");
       break;
     case LyricsMode::HasTranslation:
-      modes.emplace_back("has_translation");
+      modes.append("has_translation");
       break;
     case LyricsMode::HasRomanization:
-      modes.emplace_back("has_romanization");
+      modes.append("has_romanization");
       break;
     case LyricsMode::HasBackground:
-      modes.emplace_back("has_background");
+      modes.append("has_background");
       break;
     }
   }
   out["modes"] = std::move(modes);
-  crow::json::wvalue::list lines;
-  lines.reserve(lyrics.lines.size());
+  Json::Value lines(Json::arrayValue);
   for (const LyricLine &line : lyrics.lines) {
-    crow::json::wvalue entry;
+    Json::Value entry;
     entry["start_ms"] = line.start_ms.has_value()
-                            ? crow::json::wvalue(*line.start_ms)
-                            : crow::json::wvalue(nullptr);
-    entry["end_ms"] = line.end_ms.has_value() ? crow::json::wvalue(*line.end_ms)
-                                              : crow::json::wvalue(nullptr);
+                            ? Json::Value(*line.start_ms)
+                            : Json::Value(Json::nullValue);
+    entry["end_ms"] = line.end_ms.has_value() ? Json::Value(*line.end_ms)
+                                              : Json::Value(Json::nullValue);
     entry["text"] = line_text(line);
     const std::vector<LyricWord> line_word_list = line_words(line);
-    crow::json::wvalue::list words;
-    words.reserve(line_word_list.size());
+    Json::Value words(Json::arrayValue);
     for (const LyricWord &word : line_word_list) {
-      crow::json::wvalue item;
+      Json::Value item;
       item["start_ms"] = word.start_ms;
       item["end_ms"] = word.end_ms.has_value()
-                           ? crow::json::wvalue(*word.end_ms)
-                           : crow::json::wvalue(nullptr);
+                           ? Json::Value(*word.end_ms)
+                           : Json::Value(Json::nullValue);
       item["text"] = word.text;
-      words.push_back(std::move(item));
+      words.append(std::move(item));
     }
     entry["words"] = std::move(words);
-    crow::json::wvalue::list aux;
+    Json::Value aux(Json::arrayValue);
     for (const LyricItem &item : line.items) {
       if (item.kind != LyricItemKind::Translation &&
           item.kind != LyricItemKind::Romanization) {
         continue;
       }
-      crow::json::wvalue node;
+      Json::Value node;
       node["kind"] = item.kind == LyricItemKind::Translation ? "translation"
                                                              : "romanization";
       node["text"] = item.text;
       const std::vector<LyricWord> aux_word_list = item_words(item);
-      crow::json::wvalue::list aux_words;
-      aux_words.reserve(aux_word_list.size());
+      Json::Value aux_words(Json::arrayValue);
       for (const LyricWord &word : aux_word_list) {
-        crow::json::wvalue w;
+        Json::Value w;
         w["start_ms"] = word.start_ms;
-        w["end_ms"] = word.end_ms.has_value() ? crow::json::wvalue(*word.end_ms)
-                                              : crow::json::wvalue(nullptr);
+        w["end_ms"] = word.end_ms.has_value() ? Json::Value(*word.end_ms)
+                                              : Json::Value(Json::nullValue);
         w["text"] = word.text;
-        aux_words.push_back(std::move(w));
+        aux_words.append(std::move(w));
       }
       node["words"] = std::move(aux_words);
-      aux.push_back(std::move(node));
+      aux.append(std::move(node));
     }
     entry["aux"] = std::move(aux);
-    lines.push_back(std::move(entry));
+    lines.append(std::move(entry));
   }
   out["lines"] = std::move(lines);
   out["plain_text"] = lyrics.plain_text.has_value()
-                          ? crow::json::wvalue(*lyrics.plain_text)
-                          : crow::json::wvalue(nullptr);
+                          ? Json::Value(*lyrics.plain_text)
+                          : Json::Value(Json::nullValue);
   return out;
 }
 
 // internal_locator 是进程内定位符，绝不写进响应（5.4.4）。
-crow::json::wvalue stream_json(const PlaybackSource &source) {
-  crow::json::wvalue out;
+Json::Value stream_json(const PlaybackSource &source) {
+  Json::Value out;
   out["track"] = ref_json(source.track);
   switch (source.kind) {
   case PlaybackKind::LocalFile:
@@ -312,19 +304,19 @@ crow::json::wvalue stream_json(const PlaybackSource &source) {
     break;
   }
   out["quality"] = source.quality.has_value()
-                       ? crow::json::wvalue(*source.quality)
-                       : crow::json::wvalue(nullptr);
+                       ? Json::Value(*source.quality)
+                       : Json::Value(Json::nullValue);
   out["bitrate_kbps"] = source.bitrate_kbps.has_value()
-                            ? crow::json::wvalue(*source.bitrate_kbps)
-                            : crow::json::wvalue(nullptr);
+                            ? Json::Value(*source.bitrate_kbps)
+                            : Json::Value(Json::nullValue);
   out["mime_type"] = source.mime_type;
   out["content_length"] = source.content_length.has_value()
-                              ? crow::json::wvalue(*source.content_length)
-                              : crow::json::wvalue(nullptr);
+                              ? Json::Value(*source.content_length)
+                              : Json::Value(Json::nullValue);
   out["range_supported"] = source.range_supported;
   out["expires_at"] = source.expires_at.has_value()
-                          ? crow::json::wvalue(*source.expires_at)
-                          : crow::json::wvalue(nullptr);
+                          ? Json::Value(*source.expires_at)
+                          : Json::Value(Json::nullValue);
   out["access_mode"] =
       source.access_mode == AccessMode::Redirect ? "redirect" : "proxy";
   out["cacheable"] = source.cacheable;
@@ -332,31 +324,31 @@ crow::json::wvalue stream_json(const PlaybackSource &source) {
   return out;
 }
 
-crow::json::wvalue hit_json(const SearchHit &hit) {
-  crow::json::wvalue out;
+Json::Value hit_json(const SearchHit &hit) {
+  Json::Value out;
   out["kind"] = std::string(entity_type_name(hit.kind));
   out["ref"] = ref_json(hit.ref);
   out["title"] = hit.title;
   out["subtitle"] = hit.subtitle.has_value()
-                        ? crow::json::wvalue(*hit.subtitle)
-                        : crow::json::wvalue(nullptr);
+                        ? Json::Value(*hit.subtitle)
+                        : Json::Value(Json::nullValue);
   out["artists"] = artist_links_json(hit.artists);
   out["album_artists"] = album_artist_links_json(hit.album_artists);
   // 所属专辑：曲目命中靠它挂进「专辑艺术家 → 专辑 → 曲目」树；专辑命中
   // 自身就是专辑节点，这里为 null，由调用方用 ref 顶替。
   if (hit.album.has_value()) {
-    crow::json::wvalue album;
+    Json::Value album;
     album["title"] = hit.album->title;
     album["album"] = ref_json(hit.album->ref);
     out["album"] = std::move(album);
   } else {
-    out["album"] = nullptr;
+    out["album"] = Json::Value(Json::nullValue);
   }
   out["artwork"] = hit.artwork.has_value() ? artwork_json(*hit.artwork)
-                                           : crow::json::wvalue(nullptr);
+                                           : Json::Value(Json::nullValue);
   out["duration_ms"] = hit.duration_ms.has_value()
-                           ? crow::json::wvalue(*hit.duration_ms)
-                           : crow::json::wvalue(nullptr);
+                           ? Json::Value(*hit.duration_ms)
+                           : Json::Value(Json::nullValue);
   out["playable"] = hit.playable;
   return out;
 }
@@ -365,112 +357,108 @@ crow::json::wvalue hit_json(const SearchHit &hit) {
 // 信封序列化
 // ---------------------------------------------------------------------------
 
-crow::json::wvalue origin_json(const Origin &origin) {
-  crow::json::wvalue out;
+Json::Value origin_json(const Origin &origin) {
+  Json::Value out;
   out["library_id"] = origin.library_id;
   out["ref"] = to_string(origin.ref);
   if (origin.aspect.has_value()) {
     out["aspect"] = std::string(aspect_name(*origin.aspect));
   } else {
-    out["aspect"] = nullptr;
+    out["aspect"] = Json::Value(Json::nullValue);
   }
   out["substituted"] = origin.substituted;
-  crow::json::wvalue::list chain;
-  chain.reserve(origin.chain.size());
+  Json::Value chain(Json::arrayValue);
   for (const RouteAttempt &attempt : origin.chain) {
-    crow::json::wvalue hop;
+    Json::Value hop;
     hop["library_id"] = attempt.library_id;
     hop["ok"] = attempt.ok;
     if (attempt.error.has_value()) {
       hop["error"] = std::string(error_code_name(*attempt.error));
     } else {
-      hop["error"] = nullptr;
+      hop["error"] = Json::Value(Json::nullValue);
     }
     hop["elapsed_ms"] = attempt.elapsed_ms;
-    chain.push_back(std::move(hop));
+    chain.append(std::move(hop));
   }
   out["chain"] = std::move(chain);
   return out;
 }
 
-crow::json::wvalue sources_json(const std::vector<SourceStatus> &sources) {
-  crow::json::wvalue::list out;
-  out.reserve(sources.size());
+Json::Value sources_json(const std::vector<SourceStatus> &sources) {
+  Json::Value out(Json::arrayValue);
   for (const SourceStatus &status : sources) {
-    crow::json::wvalue entry;
+    Json::Value entry;
     entry["library_id"] = status.library_id;
     entry["state"] = std::string(source_state_name(status.state));
     if (status.error.has_value()) {
       entry["error"] = std::string(error_code_name(status.error->code));
     } else {
-      entry["error"] = nullptr;
+      entry["error"] = Json::Value(Json::nullValue);
     }
     entry["item_count"] = status.item_count;
     entry["elapsed_ms"] = status.elapsed_ms;
-    out.push_back(std::move(entry));
+    out.append(std::move(entry));
   }
-  return crow::json::wvalue(std::move(out));
+  return Json::Value(std::move(out));
 }
 
 template <typename T, typename Fn>
-crow::json::wvalue sourced_json(const Sourced<T> &sourced, Fn fn) {
-  crow::json::wvalue out;
+Json::Value sourced_json(const Sourced<T> &sourced, Fn fn) {
+  Json::Value out;
   out["value"] = fn(sourced.value);
   out["origin"] = origin_json(sourced.origin);
   return out;
 }
 
 template <typename T, typename Fn>
-crow::json::wvalue sourced_page_json(const Sourced<Page<T>> &sourced, Fn fn) {
-  crow::json::wvalue page;
-  crow::json::wvalue::list items;
-  items.reserve(sourced.value.items.size());
+Json::Value sourced_page_json(const Sourced<Page<T>> &sourced, Fn fn) {
+  Json::Value page;
+  Json::Value items(Json::arrayValue);
   for (const T &item : sourced.value.items) {
-    items.push_back(fn(item));
+    items.append(fn(item));
   }
   page["items"] = std::move(items);
   page["next_cursor"] = sourced.value.next_cursor.has_value()
-                            ? crow::json::wvalue(*sourced.value.next_cursor)
-                            : crow::json::wvalue(nullptr);
+                            ? Json::Value(*sourced.value.next_cursor)
+                            : Json::Value(Json::nullValue);
   page["has_more"] = sourced.value.has_more;
 
-  crow::json::wvalue out;
+  Json::Value out;
   out["value"] = std::move(page);
   out["origin"] = origin_json(sourced.origin);
   return out;
 }
 
 template <typename T, typename Fn>
-crow::json::wvalue routed_page_json(const RoutedPage<T> &page, Fn fn) {
-  crow::json::wvalue out;
-  crow::json::wvalue::list items;
-  items.reserve(page.items.size());
+Json::Value routed_page_json(const RoutedPage<T> &page, Fn fn) {
+  Json::Value out;
+  Json::Value items(Json::arrayValue);
   for (const Sourced<T> &item : page.items) {
-    items.push_back(sourced_json(item, fn));
+    items.append(sourced_json(item, fn));
   }
   out["items"] = std::move(items);
   out["next_cursor"] = page.next_cursor.has_value()
-                           ? crow::json::wvalue(*page.next_cursor)
-                           : crow::json::wvalue(nullptr);
+                           ? Json::Value(*page.next_cursor)
+                           : Json::Value(Json::nullValue);
   out["has_more"] = page.has_more;
   out["sources"] = sources_json(page.sources);
   return out;
 }
 
 // 7.1 会话序列化：这里没有 locator，也没有 internal_locator 的任何形态。
-crow::json::wvalue session_json(const PlaybackSession &session) {
-  crow::json::wvalue summary;
+Json::Value session_json(const PlaybackSession &session) {
+  Json::Value summary;
   summary["track"] = ref_json(session.stream.value.track);
   summary["mime_type"] = session.stream.value.mime_type;
   summary["bitrate_kbps"] = session.stream.value.bitrate_kbps;
   summary["duration_ms"] = session.stream.value.duration_ms;
   summary["seekable"] = session.stream.value.seekable;
 
-  crow::json::wvalue stream;
+  Json::Value stream;
   stream["value"] = std::move(summary);
   stream["origin"] = origin_json(session.stream.origin);
 
-  crow::json::wvalue out;
+  Json::Value out;
   out["session_id"] = session.session_id;
   out["started_at_ms"] = session.started_at_ms;
   out["expires_at_ms"] = session.expires_at_ms;
@@ -485,17 +473,15 @@ crow::json::wvalue session_json(const PlaybackSession &session) {
 // 请求参数
 // ---------------------------------------------------------------------------
 
-std::optional<std::string> text_param(const crow::request &req,
+std::optional<std::string> text_param(const http_server::RequestPtr &req,
                                       const char *name) {
-  if (const char *value = req.url_params.get(name)) {
-    return std::string(value);
-  }
-  return std::nullopt;
+  return http_server::Query(req).get(name);
 }
 
-int int_param(const crow::request &req, const char *name, int fallback) {
-  if (const char *value = req.url_params.get(name)) {
-    const int parsed = std::atoi(value);
+int int_param(const http_server::RequestPtr &req, const char *name, int fallback) {
+  const std::optional<std::string> value = text_param(req, name);
+  if (value.has_value()) {
+    const int parsed = std::atoi(value->c_str());
     if (parsed > 0) {
       return parsed;
     }
@@ -503,15 +489,15 @@ int int_param(const crow::request &req, const char *name, int fallback) {
   return fallback;
 }
 
-bool bool_param(const crow::request &req, const char *name) {
-  if (const char *value = req.url_params.get(name)) {
-    const std::string text(value);
-    return text == "1" || text == "true" || text == "yes";
+bool bool_param(const http_server::RequestPtr &req, const char *name) {
+  const std::optional<std::string> value = text_param(req, name);
+  if (value.has_value()) {
+    return *value == "1" || *value == "true" || *value == "yes";
   }
   return false;
 }
 
-std::vector<std::string> csv_param(const crow::request &req, const char *name) {
+std::vector<std::string> csv_param(const http_server::RequestPtr &req, const char *name) {
   std::vector<std::string> out;
   const std::optional<std::string> raw = text_param(req, name);
   if (!raw.has_value()) {
@@ -539,14 +525,14 @@ std::optional<SourceRef> parse_ref_param(const std::string &text) {
   return parse_ref(http_util::urlDecode(text));
 }
 
-PageRequest page_of(const crow::request &req) {
+PageRequest page_of(const http_server::RequestPtr &req) {
   PageRequest page;
   page.limit = std::clamp(int_param(req, "limit", 50), 1, 200);
   page.cursor = text_param(req, "cursor");
   return page;
 }
 
-CallContext context_of(const crow::request &req) {
+CallContext context_of(const http_server::RequestPtr &req) {
   CallContext ctx;
   if (const std::optional<std::string> locale = text_param(req, "locale");
       locale.has_value()) {
@@ -555,7 +541,7 @@ CallContext context_of(const crow::request &req) {
   return ctx;
 }
 
-SearchQuery query_of(const crow::request &req) {
+SearchQuery query_of(const http_server::RequestPtr &req) {
   SearchQuery query;
   query.text = text_param(req, "q").value_or("");
   for (const std::string &name : csv_param(req, "types")) {
@@ -573,7 +559,7 @@ SearchQuery query_of(const crow::request &req) {
   return query;
 }
 
-crow::response bad_ref() { return invalid("malformed ref"); }
+http_server::ResponsePtr bad_ref() { return invalid("malformed ref"); }
 
 } // namespace
 
@@ -581,7 +567,7 @@ crow::response bad_ref() { return invalid("malformed ref"); }
 // 库清单与能力（只查注册表，不出数据）
 // ---------------------------------------------------------------------------
 
-crow::response libraries(const crow::request &) {
+http_server::ResponsePtr libraries(const http_server::RequestPtr &) {
   const std::shared_ptr<LibraryRegistry> registry =
       media_library::library_registry_ptr();
   if (registry == nullptr) {
@@ -589,9 +575,9 @@ crow::response libraries(const crow::request &) {
   }
   LibraryDirectory directory(registry);
 
-  crow::json::wvalue::list items;
+  Json::Value items(Json::arrayValue);
   for (const LibraryView &view : directory.list()) {
-    crow::json::wvalue entry;
+    Json::Value entry;
     entry["library_id"] = view.library_id;
     entry["display_name"] = view.display_name;
     entry["platform"] = std::string(platform_kind_name(view.platform));
@@ -601,29 +587,27 @@ crow::response libraries(const crow::request &) {
     if (view.health_reason.has_value()) {
       entry["health_reason"] = std::string(error_code_name(*view.health_reason));
     } else {
-      entry["health_reason"] = nullptr;
+      entry["health_reason"] = Json::Value(Json::nullValue);
     }
-    crow::json::wvalue::list supported;
-    supported.reserve(view.supported.size());
+    Json::Value supported(Json::arrayValue);
     for (const CapabilityId capability : view.supported) {
-      supported.push_back(std::string(capability_name(capability)));
+      supported.append(std::string(capability_name(capability)));
     }
     entry["supported"] = std::move(supported);
-    crow::json::wvalue::list available;
-    available.reserve(view.available.size());
+    Json::Value available(Json::arrayValue);
     for (const CapabilityId capability : view.available) {
-      available.push_back(std::string(capability_name(capability)));
+      available.append(std::string(capability_name(capability)));
     }
     entry["available"] = std::move(available);
-    items.push_back(std::move(entry));
+    items.append(std::move(entry));
   }
 
-  crow::json::wvalue body;
+  Json::Value body;
   body["libraries"] = std::move(items);
-  return http_util::jsonResponse(200, body.dump());
+  return http_util::jsonResponse(200, json_util::dump(body));
 }
 
-crow::response provider_health(const crow::request &) {
+http_server::ResponsePtr provider_health(const http_server::RequestPtr &) {
   const std::shared_ptr<LibraryRegistry> registry =
       media_library::library_registry_ptr();
   if (registry == nullptr) {
@@ -631,30 +615,30 @@ crow::response provider_health(const crow::request &) {
   }
   LibraryDirectory directory(registry);
 
-  crow::json::wvalue::list items;
+  Json::Value items(Json::arrayValue);
   for (const LibraryView &view : directory.list()) {
-    crow::json::wvalue entry;
+    Json::Value entry;
     entry["library_id"] = view.library_id;
     entry["state"] = std::string(health_state_name(view.health));
     if (view.health_reason.has_value()) {
       entry["reason"] = std::string(error_code_name(*view.health_reason));
     } else {
-      entry["reason"] = nullptr;
+      entry["reason"] = Json::Value(Json::nullValue);
     }
     entry["checked_at"] = view.health_checked_at;
-    items.push_back(std::move(entry));
+    items.append(std::move(entry));
   }
 
-  crow::json::wvalue body;
+  Json::Value body;
   body["providers"] = std::move(items);
-  return http_util::jsonResponse(200, body.dump());
+  return http_util::jsonResponse(200, json_util::dump(body));
 }
 
 // ---------------------------------------------------------------------------
 // 搜索 / 聚合
 // ---------------------------------------------------------------------------
 
-crow::response search(const crow::request &req) {
+http_server::ResponsePtr search(const http_server::RequestPtr &req) {
   const std::shared_ptr<MediaRouter> router = media_library::media_router_ptr();
   if (router == nullptr) {
     return unavailable();
@@ -670,18 +654,18 @@ crow::response search(const crow::request &req) {
     if (!result.ok()) {
       return fail(result.error());
     }
-    crow::json::wvalue body = sourced_page_json(result.value(), hit_json);
+    Json::Value body = sourced_page_json(result.value(), hit_json);
     body["mode"] = "single";
-    return http_util::jsonResponse(200, body.dump());
+    return http_util::jsonResponse(200, json_util::dump(body));
   }
 
   Result<RoutedPage<SearchHit>> result = router->search(query, ctx);
   if (!result.ok()) {
     return fail(result.error());
   }
-  crow::json::wvalue body = routed_page_json(result.value(), hit_json);
+  Json::Value body = routed_page_json(result.value(), hit_json);
   body["mode"] = "aggregate";
-  return http_util::jsonResponse(200, body.dump());
+  return http_util::jsonResponse(200, json_util::dump(body));
 }
 
 // ---------------------------------------------------------------------------
@@ -691,7 +675,7 @@ crow::response search(const crow::request &req) {
 namespace {
 
 // aspect 为空串表示单源读（get_track）；否则是多源方面读（resolve_*）。
-crow::response track_aspect(const crow::request &req,
+http_server::ResponsePtr track_aspect(const http_server::RequestPtr &req,
                             const std::string &ref_text,
                             const std::string &aspect) {
   const std::shared_ptr<MediaRouter> router = media_library::media_router_ptr();
@@ -713,7 +697,7 @@ crow::response track_aspect(const crow::request &req,
       return fail(result.error());
     }
     return http_util::jsonResponse(
-        200, sourced_json(result.value(), track_json).dump());
+        200, json_util::dump(sourced_json(result.value(), track_json)));
   }
 
   if (aspect == "metadata") {
@@ -722,7 +706,7 @@ crow::response track_aspect(const crow::request &req,
       return fail(result.error());
     }
     return http_util::jsonResponse(
-        200, sourced_json(result.value(), track_json).dump());
+        200, json_util::dump(sourced_json(result.value(), track_json)));
   }
 
   if (aspect == "stream") {
@@ -731,7 +715,7 @@ crow::response track_aspect(const crow::request &req,
       return fail(result.error());
     }
     return http_util::jsonResponse(
-        200, sourced_json(result.value(), stream_json).dump());
+        200, json_util::dump(sourced_json(result.value(), stream_json)));
   }
 
   if (aspect == "lyrics") {
@@ -740,7 +724,7 @@ crow::response track_aspect(const crow::request &req,
       return fail(result.error());
     }
     return http_util::jsonResponse(
-        200, sourced_json(result.value(), lyrics_json).dump());
+        200, json_util::dump(sourced_json(result.value(), lyrics_json)));
   }
 
   if (aspect == "artwork") {
@@ -749,7 +733,7 @@ crow::response track_aspect(const crow::request &req,
       return fail(result.error());
     }
     return http_util::jsonResponse(
-        200, sourced_json(result.value(), artwork_json).dump());
+        200, json_util::dump(sourced_json(result.value(), artwork_json)));
   }
 
   return invalid("unknown aspect");
@@ -757,11 +741,11 @@ crow::response track_aspect(const crow::request &req,
 
 } // namespace
 
-crow::response track(const crow::request &req, const std::string &ref_text) {
+http_server::ResponsePtr track(const http_server::RequestPtr &req, const std::string &ref_text) {
   return track_aspect(req, ref_text, text_param(req, "aspect").value_or(""));
 }
 
-crow::response track_stream(const crow::request &req, const std::string &ref) {
+http_server::ResponsePtr track_stream(const http_server::RequestPtr &req, const std::string &ref) {
   const std::optional<SourceRef> parsed = parse_ref_param(ref);
   if (!parsed.has_value()) {
     return bad_ref();
@@ -770,14 +754,14 @@ crow::response track_stream(const crow::request &req, const std::string &ref) {
     return invalid("expected a track reference");
   }
   // 出字节：open_playback -> open_stream -> Range 输出。locator 不出进程。
-  return stream_http::serve_track(req, *parsed, req.method == crow::HTTPMethod::HEAD);
+  return stream_http::serve_track(req, *parsed, req && req->method() == drogon::Head);
 }
 
-crow::response track_lyrics(const crow::request &req, const std::string &ref) {
+http_server::ResponsePtr track_lyrics(const http_server::RequestPtr &req, const std::string &ref) {
   return track_aspect(req, ref, "lyrics");
 }
 
-crow::response track_artwork(const crow::request &req, const std::string &ref) {
+http_server::ResponsePtr track_artwork(const http_server::RequestPtr &req, const std::string &ref) {
   // 字节出口：owner 是曲目本身，由 ArtworkService 经 MediaRouter 选源后
   // 落到对应库的 ArtworkProvider/ArtworkBytes；locator 不出进程。
   const std::optional<SourceRef> parsed = parse_ref_param(ref);
@@ -790,14 +774,14 @@ crow::response track_artwork(const crow::request &req, const std::string &ref) {
   media_library::ArtworkRef artwork;
   artwork.owner = *parsed;
   return stream_http::serve_artwork(req, artwork,
-                                    req.method == crow::HTTPMethod::HEAD);
+                                    req && req->method() == drogon::Head);
 }
 
 // ---------------------------------------------------------------------------
 // 专辑 / 艺术家
 // ---------------------------------------------------------------------------
 
-crow::response album(const crow::request &req, const std::string &ref_text) {
+http_server::ResponsePtr album(const http_server::RequestPtr &req, const std::string &ref_text) {
   const std::shared_ptr<MediaRouter> router = media_library::media_router_ptr();
   if (router == nullptr) {
     return unavailable();
@@ -814,10 +798,10 @@ crow::response album(const crow::request &req, const std::string &ref_text) {
     return fail(result.error());
   }
   return http_util::jsonResponse(200,
-                                 sourced_json(result.value(), album_json).dump());
+                                 json_util::dump(sourced_json(result.value(), album_json)));
 }
 
-crow::response album_tracks(const crow::request &req,
+http_server::ResponsePtr album_tracks(const http_server::RequestPtr &req,
                             const std::string &ref_text) {
   const std::shared_ptr<MediaRouter> router = media_library::media_router_ptr();
   if (router == nullptr) {
@@ -836,10 +820,10 @@ crow::response album_tracks(const crow::request &req,
     return fail(result.error());
   }
   return http_util::jsonResponse(
-      200, sourced_page_json(result.value(), track_json).dump());
+      200, json_util::dump(sourced_page_json(result.value(), track_json)));
 }
 
-crow::response artist(const crow::request &req, const std::string &ref_text) {
+http_server::ResponsePtr artist(const http_server::RequestPtr &req, const std::string &ref_text) {
   const std::shared_ptr<MediaRouter> router = media_library::media_router_ptr();
   if (router == nullptr) {
     return unavailable();
@@ -857,10 +841,10 @@ crow::response artist(const crow::request &req, const std::string &ref_text) {
     return fail(result.error());
   }
   return http_util::jsonResponse(
-      200, sourced_json(result.value(), artist_json).dump());
+      200, json_util::dump(sourced_json(result.value(), artist_json)));
 }
 
-crow::response artist_albums(const crow::request &req,
+http_server::ResponsePtr artist_albums(const http_server::RequestPtr &req,
                              const std::string &ref_text) {
   const std::shared_ptr<MediaRouter> router = media_library::media_router_ptr();
   if (router == nullptr) {
@@ -880,7 +864,7 @@ crow::response artist_albums(const crow::request &req,
     return fail(result.error());
   }
   return http_util::jsonResponse(
-      200, sourced_page_json(result.value(), album_json).dump());
+      200, json_util::dump(sourced_page_json(result.value(), album_json)));
 }
 
 // ---------------------------------------------------------------------------
@@ -888,7 +872,7 @@ crow::response artist_albums(const crow::request &req,
 // 写操作不存在——没有 PlaylistWriter 能力。
 // ---------------------------------------------------------------------------
 
-crow::response playlists(const crow::request &req) {
+http_server::ResponsePtr playlists(const http_server::RequestPtr &req) {
   // library_id 显式指定 -> 单源（路由器）；不指定 -> 总管跨库汇总。
   if (const std::optional<std::string> library_id = text_param(req, "library_id");
       library_id.has_value() && !library_id->empty()) {
@@ -902,9 +886,9 @@ crow::response playlists(const crow::request &req) {
     if (!result.ok()) {
       return fail(result.error());
     }
-    crow::json::wvalue body = sourced_page_json(result.value(), playlist_json);
+    Json::Value body = sourced_page_json(result.value(), playlist_json);
     body["mode"] = "single";
-    return http_util::jsonResponse(200, body.dump());
+    return http_util::jsonResponse(200, json_util::dump(body));
   }
 
   const std::shared_ptr<media_library::PlaylistDirectory> directory =
@@ -917,12 +901,12 @@ crow::response playlists(const crow::request &req) {
   if (!result.ok()) {
     return fail(result.error());
   }
-  crow::json::wvalue body = routed_page_json(result.value(), playlist_json);
+  Json::Value body = routed_page_json(result.value(), playlist_json);
   body["mode"] = "aggregate";
-  return http_util::jsonResponse(200, body.dump());
+  return http_util::jsonResponse(200, json_util::dump(body));
 }
 
-crow::response playlist(const crow::request &req, const std::string &ref_text) {
+http_server::ResponsePtr playlist(const http_server::RequestPtr &req, const std::string &ref_text) {
   const std::shared_ptr<media_library::PlaylistDirectory> directory =
       media_library::playlist_directory_ptr();
   if (directory == nullptr) {
@@ -941,7 +925,7 @@ crow::response playlist(const crow::request &req, const std::string &ref_text) {
     return fail(result.error());
   }
   return http_util::jsonResponse(
-      200, sourced_json(result.value(), playlist_json).dump());
+      200, json_util::dump(sourced_json(result.value(), playlist_json)));
 }
 
 // ---------------------------------------------------------------------------
@@ -950,8 +934,8 @@ crow::response playlist(const crow::request &req, const std::string &ref_text) {
 
 namespace {
 
-crow::json::wvalue linked_ref_json(const LinkedRef &item) {
-  crow::json::wvalue out;
+Json::Value linked_ref_json(const LinkedRef &item) {
+  Json::Value out;
   out["ref"] = to_string(item.ref);
   out["library_id"] = item.ref.library_id;
   out["type"] = std::string(entity_type_name(item.ref.entity_type));
@@ -961,27 +945,25 @@ crow::json::wvalue linked_ref_json(const LinkedRef &item) {
   return out;
 }
 
-crow::json::wvalue overrides_json(const LinkOverrides &overrides) {
-  crow::json::wvalue out = crow::json::wvalue::empty_object();
+Json::Value overrides_json(const LinkOverrides &overrides) {
+  Json::Value out = Json::Value(Json::objectValue);
   for (const auto &entry : overrides.order) {
-    crow::json::wvalue::list libraries;
-    libraries.reserve(entry.second.size());
+    Json::Value libraries(Json::arrayValue);
     for (const std::string &library_id : entry.second) {
-      libraries.emplace_back(library_id);
+      libraries.append(library_id);
     }
     out[std::string(aspect_name(entry.first))] =
-        crow::json::wvalue(std::move(libraries));
+        Json::Value(std::move(libraries));
   }
   return out;
 }
 
-crow::json::wvalue link_view_json(const EntityLinkView &view) {
-  crow::json::wvalue out;
+Json::Value link_view_json(const EntityLinkView &view) {
+  Json::Value out;
   out["entity_type"] = std::string(entity_type_name(view.entity_type));
-  crow::json::wvalue::list refs;
-  refs.reserve(view.refs.size());
+  Json::Value refs(Json::arrayValue);
   for (const LinkedRef &item : view.refs) {
-    refs.push_back(linked_ref_json(item));
+    refs.append(linked_ref_json(item));
   }
   out["refs"] = std::move(refs);
   out["overrides"] = overrides_json(view.overrides);
@@ -1003,73 +985,72 @@ std::string ref_of_library(const EntityLinkView &view,
   return std::string();
 }
 
-crow::json::wvalue order_json(EntityLinkResolver &resolver,
+Json::Value order_json(EntityLinkResolver &resolver,
                               const SourceRef &anchor,
                               const EntityLinkView &view,
                               const std::vector<Aspect> &aspects) {
-  crow::json::wvalue out = crow::json::wvalue::empty_object();
+  Json::Value out = Json::Value(Json::objectValue);
   for (Aspect aspect : aspects) {
-    crow::json::wvalue::list entries;
+    Json::Value entries(Json::arrayValue);
     for (const std::string &library_id :
          resolver.effective_order(anchor, aspect)) {
-      crow::json::wvalue entry;
+      Json::Value entry;
       entry["library_id"] = library_id;
       const std::string ref = ref_of_library(view, library_id);
       if (!ref.empty()) {
         entry["ref"] = ref;
       }
-      entries.push_back(std::move(entry));
+      entries.append(std::move(entry));
     }
     out[std::string(aspect_name(aspect))] =
-        crow::json::wvalue(std::move(entries));
+        Json::Value(std::move(entries));
   }
   return out;
 }
 
-std::optional<SourceRef> ref_from_body(const crow::json::rvalue &body,
+std::optional<SourceRef> ref_from_body(const Json::Value &body,
                                        const char *field) {
-  if (!body.has(field)) {
+  if (!body.isMember(field)) {
     return std::nullopt;
   }
-  const crow::json::rvalue &value = body[field];
-  if (value.t() != crow::json::type::String) {
+  const Json::Value &value = body[field];
+  if (!value.isString()) {
     return std::nullopt;
   }
-  return parse_ref(std::string(value.s()));
+  return parse_ref(std::string(value.asString()));
 }
 
-std::optional<LinkOverrides> overrides_from_body(const crow::json::rvalue &body,
+std::optional<LinkOverrides> overrides_from_body(const Json::Value &body,
                                                  std::string &error) {
-  if (!body.has("order")) {
+  if (!body.isMember("order")) {
     error = "body requires an order object";
     return std::nullopt;
   }
-  const crow::json::rvalue &order = body["order"];
-  if (order.t() != crow::json::type::Object) {
+  const Json::Value &order = body["order"];
+  if (!order.isObject()) {
     error = "order must be an object";
     return std::nullopt;
   }
   LinkOverrides overrides;
-  for (const std::string &name : order.keys()) {
+  for (const std::string &name : order.getMemberNames()) {
     const std::optional<Aspect> aspect = parse_aspect(name);
     if (!aspect.has_value()) {
       error = "unknown aspect: " + name;
       return std::nullopt;
     }
-    const crow::json::rvalue &values = order[name];
-    if (values.t() != crow::json::type::List) {
+    const Json::Value &values = order[name];
+    if (!values.isArray()) {
       error = "aspect " + name + " must be a list of library ids";
       return std::nullopt;
     }
     std::vector<std::string> libraries;
-    libraries.reserve(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) {
-      const crow::json::rvalue &value = values[i];
-      if (value.t() != crow::json::type::String) {
+    for (Json::ArrayIndex i = 0; i < values.size(); ++i) {
+      const Json::Value &value = values[i];
+      if (!value.isString()) {
         error = "aspect " + name + " must be a list of library ids";
         return std::nullopt;
       }
-      libraries.emplace_back(value.s());
+      libraries.emplace_back(value.asString());
     }
     overrides.order[*aspect] = std::move(libraries);
   }
@@ -1078,7 +1059,7 @@ std::optional<LinkOverrides> overrides_from_body(const crow::json::rvalue &body,
 
 } // namespace
 
-crow::response entity_link(const crow::request &req,
+http_server::ResponsePtr entity_link(const http_server::RequestPtr &req,
                            const std::string &ref_text) {
   const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
   if (resolver == nullptr) {
@@ -1092,10 +1073,10 @@ crow::response entity_link(const crow::request &req,
   if (!view.ok()) {
     return fail(view.error());
   }
-  return http_util::jsonResponse(200, link_view_json(view.value()).dump());
+  return http_util::jsonResponse(200, json_util::dump(link_view_json(view.value())));
 }
 
-crow::response entity_link_order(const crow::request &req,
+http_server::ResponsePtr entity_link_order(const http_server::RequestPtr &req,
                                  const std::string &ref_text) {
   const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
   if (resolver == nullptr) {
@@ -1129,18 +1110,18 @@ crow::response entity_link_order(const crow::request &req,
     }
   }
 
-  crow::json::wvalue body;
+  Json::Value body;
   body["order"] = order_json(*resolver, *ref, view.value(), aspects);
-  return http_util::jsonResponse(200, body.dump());
+  return http_util::jsonResponse(200, json_util::dump(body));
 }
 
-crow::response entity_link_create(const crow::request &req) {
+http_server::ResponsePtr entity_link_create(const http_server::RequestPtr &req) {
   const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
   if (resolver == nullptr) {
     return unavailable();
   }
-  const crow::json::rvalue body = crow::json::load(req.body);
-  if (!body || body.t() != crow::json::type::Object) {
+  const Json::Value body = json_util::parseOrNull(req->body());
+  if (body.isNull() || !body.isObject()) {
     return invalid("body must be a JSON object");
   }
   const std::optional<SourceRef> a = ref_from_body(body, "a");
@@ -1157,10 +1138,10 @@ crow::response entity_link_create(const crow::request &req) {
   if (!view.ok()) {
     return fail(view.error());
   }
-  return http_util::jsonResponse(200, link_view_json(view.value()).dump());
+  return http_util::jsonResponse(200, json_util::dump(link_view_json(view.value())));
 }
 
-crow::response entity_link_delete(const crow::request &req,
+http_server::ResponsePtr entity_link_delete(const http_server::RequestPtr &req,
                                   const std::string &ref_text) {
   const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
   if (resolver == nullptr) {
@@ -1174,10 +1155,10 @@ crow::response entity_link_delete(const crow::request &req,
   if (!status.ok()) {
     return fail(status.error());
   }
-  return crow::response(204);
+  return http_server::textResponse(204, "");
 }
 
-crow::response entity_link_remove_member(const crow::request &req,
+http_server::ResponsePtr entity_link_remove_member(const http_server::RequestPtr &req,
                                          const std::string &anchor_text,
                                          const std::string &member_text) {
   const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
@@ -1206,10 +1187,10 @@ crow::response entity_link_remove_member(const crow::request &req,
   if (!status.ok()) {
     return fail(status.error());
   }
-  return crow::response(204);
+  return http_server::textResponse(204, "");
 }
 
-crow::response entity_link_set_overrides(const crow::request &req,
+http_server::ResponsePtr entity_link_set_overrides(const http_server::RequestPtr &req,
                                          const std::string &ref_text) {
   const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
   if (resolver == nullptr) {
@@ -1219,8 +1200,8 @@ crow::response entity_link_set_overrides(const crow::request &req,
   if (!ref.has_value()) {
     return bad_ref();
   }
-  const crow::json::rvalue body = crow::json::load(req.body);
-  if (!body || body.t() != crow::json::type::Object) {
+  const Json::Value body = json_util::parseOrNull(req->body());
+  if (body.isNull() || !body.isObject()) {
     return invalid("body must be a JSON object");
   }
   std::string error;
@@ -1238,12 +1219,12 @@ crow::response entity_link_set_overrides(const crow::request &req,
   if (!applied.ok()) {
     return fail(applied.error());
   }
-  crow::json::wvalue out;
+  Json::Value out;
   out["overrides"] = overrides_json(applied.value());
-  return http_util::jsonResponse(200, out.dump());
+  return http_util::jsonResponse(200, json_util::dump(out));
 }
 
-crow::response entity_link_clear_override(const crow::request &req,
+http_server::ResponsePtr entity_link_clear_override(const http_server::RequestPtr &req,
                                           const std::string &ref_text,
                                           const std::string &aspect_text) {
   const std::shared_ptr<EntityLinkResolver> resolver = entity_links_ptr();
@@ -1262,7 +1243,7 @@ crow::response entity_link_clear_override(const crow::request &req,
   if (!status.ok()) {
     return fail(status.error());
   }
-  return crow::response(204);
+  return http_server::textResponse(204, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,7 +1258,7 @@ std::shared_ptr<PlaybackService> playback_or_null() {
 
 } // namespace
 
-crow::response playback_open(const crow::request &req,
+http_server::ResponsePtr playback_open(const http_server::RequestPtr &req,
                              const std::string &ref_text) {
   const std::shared_ptr<PlaybackService> service = playback_or_null();
   if (service == nullptr) {
@@ -1294,10 +1275,10 @@ crow::response playback_open(const crow::request &req,
   if (!session.ok()) {
     return fail(session.error());
   }
-  return http_util::jsonResponse(201, session_json(session.value()).dump());
+  return http_util::jsonResponse(201, json_util::dump(session_json(session.value())));
 }
 
-crow::response playback_session(const crow::request &,
+http_server::ResponsePtr playback_session(const http_server::RequestPtr &,
                                 const std::string &session_id) {
   const std::shared_ptr<PlaybackService> service = playback_or_null();
   if (service == nullptr) {
@@ -1307,10 +1288,10 @@ crow::response playback_session(const crow::request &,
   if (!session.ok()) {
     return fail(session.error());
   }
-  return http_util::jsonResponse(200, session_json(session.value()).dump());
+  return http_util::jsonResponse(200, json_util::dump(session_json(session.value())));
 }
 
-crow::response playback_refresh(const crow::request &req,
+http_server::ResponsePtr playback_refresh(const http_server::RequestPtr &req,
                                 const std::string &session_id) {
   const std::shared_ptr<PlaybackService> service = playback_or_null();
   if (service == nullptr) {
@@ -1321,10 +1302,10 @@ crow::response playback_refresh(const crow::request &req,
   if (!session.ok()) {
     return fail(session.error());
   }
-  return http_util::jsonResponse(200, session_json(session.value()).dump());
+  return http_util::jsonResponse(200, json_util::dump(session_json(session.value())));
 }
 
-crow::response playback_close(const crow::request &,
+http_server::ResponsePtr playback_close(const http_server::RequestPtr &,
                               const std::string &session_id) {
   const std::shared_ptr<PlaybackService> service = playback_or_null();
   if (service == nullptr) {
@@ -1334,12 +1315,12 @@ crow::response playback_close(const crow::request &,
   if (!status.ok()) {
     return fail(status.error());
   }
-  return crow::response(204);
+  return http_server::textResponse(204, "");
 }
 
-crow::response playback_stream(const crow::request &req,
+http_server::ResponsePtr playback_stream(const http_server::RequestPtr &req,
                                const std::string &session_id) {
-  return stream_http::serve_session(req, session_id, req.method == crow::HTTPMethod::HEAD);
+  return stream_http::serve_session(req, session_id, req && req->method() == drogon::Head);
 }
 
 } // namespace api_v1

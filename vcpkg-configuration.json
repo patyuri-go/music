@@ -1,8 +1,5 @@
 {
   "overlay-triplets": [
     "./triplets"
-  ],
-  "overlay-ports": [
-    "./ports"
   ]
 }

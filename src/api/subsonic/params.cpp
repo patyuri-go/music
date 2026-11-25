@@ -6,36 +6,14 @@
 #include <cstring>
 
 namespace subsonic {
-namespace {
 
-bool same_key(const std::string &a, const char *b) {
-  const std::size_t n = std::strlen(b);
-  if (a.size() != n) {
-    return false;
-  }
-  for (std::size_t i = 0; i < n; ++i) {
-    if (std::tolower(static_cast<unsigned char>(a[i])) !=
-        std::tolower(static_cast<unsigned char>(b[i]))) {
-      return false;
-    }
-  }
-  return true;
+std::string text(const http_server::RequestPtr &req, const char *name) {
+  const std::optional<std::string> value =
+      http_server::Query(req).get(std::string(name));
+  return value.has_value() ? *value : std::string();
 }
 
-} // namespace
-
-std::string text(const crow::request &req, const char *name) {
-  for (const auto &key : req.url_params.keys()) {
-    if (!same_key(key, name)) {
-      continue;
-    }
-    const char *value = req.url_params.get(key);
-    return value ? std::string(value) : std::string();
-  }
-  return std::string();
-}
-
-int integer(const crow::request &req, const char *name, int fallback) {
+int integer(const http_server::RequestPtr &req, const char *name, int fallback) {
   const std::string raw = text(req, name);
   if (raw.empty()) {
     return fallback;
@@ -62,7 +40,7 @@ std::string Paging::log_text() const {
   return "size=" + std::to_string(size) + " offset=" + std::to_string(offset);
 }
 
-Paging paging(const crow::request &req, int default_size) {
+Paging paging(const http_server::RequestPtr &req, int default_size) {
   Paging page;
   page.size = integer(req, "size", default_size);
   page.offset = integer(req, "offset", 0);
@@ -70,7 +48,7 @@ Paging paging(const crow::request &req, int default_size) {
   return page;
 }
 
-std::optional<std::string> id_param(const crow::request &req) {
+std::optional<std::string> id_param(const http_server::RequestPtr &req) {
   std::string raw = text(req, "id");
   if (raw.empty()) {
     return std::nullopt;

@@ -7,30 +7,17 @@
 namespace subsonic {
 namespace {
 
-// 取查询参数。Subsonic 客户端一律用小写键，少数实现会混用大小写，
-// 这里做一次大小写不敏感匹配。
-std::string param(const crow::request &req, const char *key) {
-  const std::string want(key);
-  for (const auto &k : req.url_params.keys()) {
-    if (k.size() != want.size()) {
-      continue;
-    }
-    const bool same =
-        std::equal(k.begin(), k.end(), want.begin(), [](char a, char b) {
-          return std::tolower(static_cast<unsigned char>(a)) ==
-                 std::tolower(static_cast<unsigned char>(b));
-        });
-    if (same) {
-      const char *v = req.url_params.get(k);
-      return v ? std::string(v) : std::string();
-    }
-  }
-  return std::string();
+// 取查询参数。Subsonic 客户端一律用小写键，少数实现会混用大小写；
+// http_server::Query 本身大小写不敏感，这里只是取首个值。
+std::string param(const http_server::RequestPtr &req, const char *key) {
+  const std::optional<std::string> value =
+      http_server::Query(req).get(std::string(key));
+  return value.has_value() ? *value : std::string();
 }
 
 } // namespace
 
-AccessLog::AccessLog(const crow::request &req, std::string method, bool enabled)
+AccessLog::AccessLog(const http_server::RequestPtr &req, std::string method, bool enabled)
     : enabled_(enabled), method_(std::move(method)),
       started_(std::chrono::steady_clock::now()) {
   if (!enabled_) {

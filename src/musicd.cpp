@@ -1,12 +1,11 @@
 #include "config.h"
-#include "crow/app.h"
-#include "crow/http_request.h"
-#include "crow/http_response.h"
-#include "crow/json.h"
+#include <json/json.h>
 
-#include "crow/logging.h"
+#include "json_util.h"
+
 #include "database.h"
 #include "db.h"
+#include "http_server.h"
 #include "http_util.h"
 #include "image_cache.h"
 #include "jellyfin.h"
@@ -32,6 +31,7 @@
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
+#include <system_error>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -198,7 +198,7 @@ bool isUnderAnyRoot(const fs::path &target) {
   return false;
 }
 
-crow::response browseWebdavRoot(int root_id, const std::string &root_url,
+http_server::ResponsePtr browseWebdavRoot(int root_id, const std::string &root_url,
                                 const std::string &rel_path) {
   try {
     webdav::Url base = webdav::resolveCredentials(root_url);
@@ -318,7 +318,7 @@ crow::response browseWebdavRoot(int root_id, const std::string &root_url,
       e.name = urlDecode(raw_name);
     }
 
-    crow::json::wvalue out(crow::json::type::List);
+    Json::Value out(Json::arrayValue);
     int i = 0;
     for (const auto &kv : merged) {
       const Entry &e = kv.second;
@@ -333,13 +333,13 @@ crow::response browseWebdavRoot(int root_id, const std::string &root_url,
           (e.inDb && e.onDisk) ? "both" : (e.inDb ? "db" : "disk");
       ++i;
     }
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   } catch (const std::exception &e) {
     return jsonResponse(500, "{\"erro\":true}");
   }
 }
 
-crow::response browseDir(int root_id, const std::string &rel_path) {
+http_server::ResponsePtr browseDir(int root_id, const std::string &rel_path) {
   try {
     if (root_id <= 0) {
       return jsonResponse(400, "{\"erro\":true}");
@@ -431,7 +431,7 @@ crow::response browseDir(int root_id, const std::string &rel_path) {
       e.name = p.filename().string();
     }
 
-    crow::json::wvalue out(crow::json::type::List);
+    Json::Value out(Json::arrayValue);
     int i = 0;
     for (const auto &kv : merged) {
       const Entry &e = kv.second;
@@ -447,7 +447,7 @@ crow::response browseDir(int root_id, const std::string &rel_path) {
                              : (e.inDb ? "db" : "disk");
       ++i;
     }
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   } catch (const std::exception &e) {
     return jsonResponse(500, "{\"erro\":true}");
   }
@@ -502,39 +502,36 @@ template <typename T, typename Fetch> std::vector<T> fetch_all(Fetch fetch) {
   return out;
 }
 
-crow::json::wvalue strings_json(const std::vector<std::string> &values) {
-  crow::json::wvalue::list list;
-  list.reserve(values.size());
-  for (const std::string &value : values) {
-    list.emplace_back(value);
+Json::Value strings_json(const std::vector<std::string> &values) {
+  Json::Value list(Json::arrayValue);
+    for (const std::string &value : values) {
+    list.append(value);
   }
-  return crow::json::wvalue(std::move(list));
+  return std::move(list);
 }
 
-crow::json::wvalue
+Json::Value
 artist_links_json(const std::vector<media_library::ArtistLink> &links) {
-  crow::json::wvalue::list list;
-  list.reserve(links.size());
+  Json::Value list(Json::arrayValue);
   for (const media_library::ArtistLink &link : links) {
-    crow::json::wvalue item;
+    Json::Value item;
     item["id"] = ref_text(link.ref);
     item["name"] = link.name;
-    list.push_back(std::move(item));
+    list.append(std::move(item));
   }
-  return crow::json::wvalue(std::move(list));
+  return std::move(list);
 }
 
-crow::json::wvalue album_artist_links_json(
+Json::Value album_artist_links_json(
     const std::vector<media_library::AlbumArtistLink> &links) {
-  crow::json::wvalue::list list;
-  list.reserve(links.size());
+  Json::Value list(Json::arrayValue);
   for (const media_library::AlbumArtistLink &link : links) {
-    crow::json::wvalue item;
+    Json::Value item;
     item["id"] = ref_text(link.ref);
     item["name"] = link.name;
-    list.push_back(std::move(item));
+    list.append(std::move(item));
   }
-  return crow::json::wvalue(std::move(list));
+  return std::move(list);
 }
 
 std::string artistKeyOf(const std::vector<std::string> &names) {
@@ -839,20 +836,21 @@ std::vector<int> tracksUnderArtist(int artist_id) {
   return ids;
 }
 
-crow::json::wvalue playlistSummaryJson(const playlist::Playlist &p) {
-  crow::json::wvalue w;
+Json::Value playlistSummaryJson(const playlist::Playlist &p) {
+  Json::Value w;
   w["id"] = p.id;
   w["name"] = p.name;
-  w["song_count"] = playlist::songCount(p);
-  w["total_duration_ms"] = playlist::totalDurationMs(p);
+  w["song_count"] = static_cast<Json::Int64>(playlist::songCount(p));
+  w["total_duration_ms"] =
+      static_cast<Json::Int64>(playlist::totalDurationMs(p));
   return w;
 }
 
-crow::json::wvalue playlistDetailJson(const playlist::Playlist &p) {
-  crow::json::wvalue w = playlistSummaryJson(p);
-  crow::json::wvalue::list songs;
+Json::Value playlistDetailJson(const playlist::Playlist &p) {
+  Json::Value w = playlistSummaryJson(p);
+  Json::Value songs(Json::arrayValue);
   for (const auto &s : p.songs) {
-    crow::json::wvalue sw;
+    Json::Value sw;
     sw["path"] = s.path;
     sw["album"] = s.album;
     sw["album_artist"] = s.album_artist;
@@ -860,13 +858,82 @@ crow::json::wvalue playlistDetailJson(const playlist::Playlist &p) {
     sw["track_id"] = s.track_id;
     sw["title"] = s.title;
     sw["artist"] = s.artist;
-    songs.emplace_back(std::move(sw));
+    songs.append(std::move(sw));
   }
-  w["songs"] = crow::json::wvalue(songs);
+  w["songs"] = songs;
   return w;
 }
 
+// ---------------------------------------------------------------------------
+// 路由声明 → Drogon 注册
+//
+// 保留原文件里 `MUSICD_ROUTE(app, path)(lambda)` / `.methods(...)` 的写法，
+// 内部把 `<string>`/`<int>`/`<path>` 翻译成 Drogon 占位符：
+//   <string>、<int> → {n}（不跨斜杠）
+//   <path>          → (.*)（跨斜杠，走正则路由）
+// ---------------------------------------------------------------------------
+
+struct RouteSpec {
+  std::string pattern;
+  bool regex = false;
+};
+
+RouteSpec makeRouteSpec(const std::string &raw) {
+  RouteSpec spec;
+  spec.regex = raw.find("<path>") != std::string::npos;
+  int index = 0;
+  for (std::size_t i = 0; i < raw.size();) {
+    if (raw[i] == '<') {
+      const std::size_t close = raw.find('>', i);
+      if (close == std::string::npos) {
+        spec.pattern.append(raw.substr(i));
+        break;
+      }
+      const std::string name = raw.substr(i + 1, close - i - 1);
+      if (spec.regex) {
+        spec.pattern += (name == "path") ? "(.*)" : "([^/]*)";
+      } else {
+        ++index;
+        spec.pattern.push_back('{');
+        spec.pattern += std::to_string(index);
+        spec.pattern.push_back('}');
+      }
+      i = close + 1;
+      continue;
+    }
+    spec.pattern.push_back(raw[i]);
+    ++i;
+  }
+  return spec;
+}
+
+struct RouteBuilder {
+  int port;
+  RouteSpec spec;
+  std::vector<drogon::HttpMethod> verbs{drogon::Get};
+
+  RouteBuilder(int p, std::string raw)
+      : port(p), spec(makeRouteSpec(raw)) {}
+
+  template <typename... M> RouteBuilder &methods(M... m) {
+    verbs = {m...};
+    return *this;
+  }
+
+  template <typename F> void operator()(F f) const {
+    for (const drogon::HttpMethod method : verbs) {
+      if (spec.regex) {
+        http_server::onPortRegex(port, method, spec.pattern, f);
+      } else {
+        http_server::onPort(port, method, spec.pattern, f);
+      }
+    }
+  }
+};
+
 } // namespace
+
+#define MUSICD_ROUTE(app, url) RouteBuilder((cfg.port), (url))
 
 int main(int argc, char *argv[]) {
   try {
@@ -1012,148 +1079,149 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     return 1;
   }
 
-  crow::SimpleApp app;
-  app.loglevel(crow::LogLevel::WARNING);
-
-  CROW_ROUTE(app, "/")([&cfg]() {
-    crow::response res;
-    res.set_static_file_info((cfg.static_dir / "index.html").string());
-    return res;
+  MUSICD_ROUTE(app, "/")([&cfg](const http_server::RequestPtr &req) {
+    return drogon::HttpResponse::newFileResponse(
+        (cfg.static_dir / "index.html").string(), 0, 0, false, "",
+        drogon::CT_NONE, "", req);
   });
 
-  CROW_ROUTE(app, "/web/<path>")([&cfg](std::string path) {
-    crow::response res;
+  MUSICD_ROUTE(app, "/web/<path>")([&cfg](const http_server::RequestPtr &req,
+                                        std::string path) {
     auto target = resolveWithin(cfg.static_dir, path);
     if (!target) {
-      res.code = 403;
-      res.body = "forbidden";
-      return res;
+      return http_server::textResponse(403, "forbidden");
     }
-    res.set_static_file_info_unsafe(target->string());
-    return res;
+    // 目录（典型是 `/web/` 解析到 web 根）不能被 newFileResponse 处理，
+    // 它返回 500；原先这里走 404，保持一致。
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(*target, ec)) {
+      return jsonResponse(404, "{\"erro\":true}");
+    }
+    return drogon::HttpResponse::newFileResponse(target->string(), 0, 0, false,
+                                                 "", drogon::CT_NONE, "", req);
   });
 
   // ---- 原生统一读门面 /api/v1：直接依赖 MediaRouter + LibraryDirectory ----
   // 这一层只做参数解析与 JSON 序列化，不选源、不组合、不拼字段。
-  CROW_ROUTE(app, "/api/v1/libraries")([](const crow::request &req) {
+  MUSICD_ROUTE(app, "/api/v1/libraries")([](const http_server::RequestPtr &req) {
     return api_v1::libraries(req);
   });
-  CROW_ROUTE(app, "/api/v1/providers")([](const crow::request &req) {
+  MUSICD_ROUTE(app, "/api/v1/providers")([](const http_server::RequestPtr &req) {
     return api_v1::provider_health(req);
   });
-  CROW_ROUTE(app, "/api/v1/health/providers")([](const crow::request &req) {
+  MUSICD_ROUTE(app, "/api/v1/health/providers")([](const http_server::RequestPtr &req) {
     return api_v1::provider_health(req);
   });
-  CROW_ROUTE(app, "/api/v1/search")([](const crow::request &req) {
+  MUSICD_ROUTE(app, "/api/v1/search")([](const http_server::RequestPtr &req) {
     return api_v1::search(req);
   });
-  CROW_ROUTE(app, "/api/v1/tracks/<string>")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/tracks/<string>")([](const http_server::RequestPtr &req,
                                                 std::string ref) {
     return api_v1::track(req, ref);
   });
-  CROW_ROUTE(app, "/api/v1/tracks/<string>/stream")
-      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
-          [](const crow::request &req, std::string ref) {
+  MUSICD_ROUTE(app, "/api/v1/tracks/<string>/stream")
+      .methods(drogon::Get, drogon::Head)(
+          [](const http_server::RequestPtr &req, std::string ref) {
             return api_v1::track_stream(req, ref);
           });
-  CROW_ROUTE(app, "/api/v1/tracks/<string>/lyrics")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/tracks/<string>/lyrics")([](const http_server::RequestPtr &req,
                                                        std::string ref) {
     return api_v1::track_lyrics(req, ref);
   });
-  CROW_ROUTE(app, "/api/v1/tracks/<string>/artwork")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/tracks/<string>/artwork")([](const http_server::RequestPtr &req,
                                                         std::string ref) {
     return api_v1::track_artwork(req, ref);
   });
-  CROW_ROUTE(app, "/api/v1/albums/<string>")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/albums/<string>")([](const http_server::RequestPtr &req,
                                                 std::string ref) {
     return api_v1::album(req, ref);
   });
-  CROW_ROUTE(app, "/api/v1/albums/<string>/tracks")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/albums/<string>/tracks")([](const http_server::RequestPtr &req,
                                                        std::string ref) {
     return api_v1::album_tracks(req, ref);
   });
-  CROW_ROUTE(app, "/api/v1/artists/<string>")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/artists/<string>")([](const http_server::RequestPtr &req,
                                                  std::string ref) {
     return api_v1::artist(req, ref);
   });
-  CROW_ROUTE(app, "/api/v1/artists/<string>/albums")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/artists/<string>/albums")([](const http_server::RequestPtr &req,
                                                         std::string ref) {
     return api_v1::artist_albums(req, ref);
   });
-  CROW_ROUTE(app, "/api/v1/playlists")([](const crow::request &req) {
+  MUSICD_ROUTE(app, "/api/v1/playlists")([](const http_server::RequestPtr &req) {
     return api_v1::playlists(req);
   });
-  CROW_ROUTE(app, "/api/v1/playlists/<string>")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/playlists/<string>")([](const http_server::RequestPtr &req,
                                                    std::string ref) {
     return api_v1::playlist(req, ref);
   });
 
   // ---- 实体链接：读写都以 SourceRef 为句柄，内部 link_id 不出进程 ----
-  CROW_ROUTE(app, "/api/v1/entity-links")
-      .methods("POST"_method)([](const crow::request &req) {
+  MUSICD_ROUTE(app, "/api/v1/entity-links")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
         return api_v1::entity_link_create(req);
       });
-  CROW_ROUTE(app, "/api/v1/entity-links/<string>")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/entity-links/<string>")([](const http_server::RequestPtr &req,
                                                       std::string ref) {
     return api_v1::entity_link(req, ref);
   });
-  CROW_ROUTE(app, "/api/v1/entity-links/<string>")
-      .methods("DELETE"_method)([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/entity-links/<string>")
+      .methods(drogon::Delete)([](const http_server::RequestPtr &req,
                                    std::string ref) {
         return api_v1::entity_link_delete(req, ref);
       });
-  CROW_ROUTE(app, "/api/v1/entity-links/<string>/order")
-      ([](const crow::request &req, std::string ref) {
+  MUSICD_ROUTE(app, "/api/v1/entity-links/<string>/order")
+      ([](const http_server::RequestPtr &req, std::string ref) {
         return api_v1::entity_link_order(req, ref);
       });
-  CROW_ROUTE(app, "/api/v1/entity-links/<string>/members/<string>")
-      .methods("DELETE"_method)([](const crow::request &req, std::string anchor,
+  MUSICD_ROUTE(app, "/api/v1/entity-links/<string>/members/<string>")
+      .methods(drogon::Delete)([](const http_server::RequestPtr &req, std::string anchor,
                                    std::string member) {
         return api_v1::entity_link_remove_member(req, anchor, member);
       });
-  CROW_ROUTE(app, "/api/v1/entity-links/<string>/overrides")
-      .methods("PUT"_method)([](const crow::request &req, std::string ref) {
+  MUSICD_ROUTE(app, "/api/v1/entity-links/<string>/overrides")
+      .methods(drogon::Put)([](const http_server::RequestPtr &req, std::string ref) {
         return api_v1::entity_link_set_overrides(req, ref);
       });
-  CROW_ROUTE(app, "/api/v1/entity-links/<string>/overrides/<string>")
-      .methods("DELETE"_method)([](const crow::request &req, std::string ref,
+  MUSICD_ROUTE(app, "/api/v1/entity-links/<string>/overrides/<string>")
+      .methods(drogon::Delete)([](const http_server::RequestPtr &req, std::string ref,
                                    std::string aspect) {
         return api_v1::entity_link_clear_override(req, ref, aspect);
       });
 
   // ---- 播放会话：open / 查询 / 刷新 / 关闭 / 字节流 ----
-  CROW_ROUTE(app, "/api/v1/playback/<string>")
-      .methods("POST"_method)([](const crow::request &req, std::string ref) {
+  MUSICD_ROUTE(app, "/api/v1/playback/<string>")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req, std::string ref) {
         return api_v1::playback_open(req, ref);
       });
-  CROW_ROUTE(app, "/api/v1/playback/<string>")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/playback/<string>")([](const http_server::RequestPtr &req,
                                                  std::string session_id) {
     return api_v1::playback_session(req, session_id);
   });
-  CROW_ROUTE(app, "/api/v1/playback/<string>")
-      .methods("DELETE"_method)([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/playback/<string>")
+      .methods(drogon::Delete)([](const http_server::RequestPtr &req,
                                    std::string session_id) {
         return api_v1::playback_close(req, session_id);
       });
-  CROW_ROUTE(app, "/api/v1/playback/<string>/refresh")
-      .methods("POST"_method)([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/playback/<string>/refresh")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req,
                                  std::string session_id) {
         return api_v1::playback_refresh(req, session_id);
       });
-  CROW_ROUTE(app, "/api/v1/playback/<string>/refresh")([](const crow::request &req,
+  MUSICD_ROUTE(app, "/api/v1/playback/<string>/refresh")([](const http_server::RequestPtr &req,
                                                          std::string session_id) {
     return api_v1::playback_refresh(req, session_id);
   });
-  CROW_ROUTE(app, "/api/v1/playback/<string>/stream")
-      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
-          [](const crow::request &req, std::string session_id) {
+  MUSICD_ROUTE(app, "/api/v1/playback/<string>/stream")
+      .methods(drogon::Get, drogon::Head)(
+          [](const http_server::RequestPtr &req, std::string session_id) {
             return api_v1::playback_stream(req, session_id);
           });
 
-  CROW_ROUTE(app, "/api/query")
-      .methods("POST"_method)([](const crow::request &req) {
-        auto json = crow::json::load(req.body);
-        if (!json || !json.has("type")) {
+  MUSICD_ROUTE(app, "/api/query")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
+        const Json::Value json = json_util::parseOrNull(req->body());
+        if (json.isNull() || !json.isMember("type")) {
           return jsonResponse(400, "{\"erro\":true}");
         }
         Service service;
@@ -1161,11 +1229,11 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         if (!result) {
           return jsonResponse(404, "{}");
         }
-        return jsonResponse(200, result->dump());
+        return jsonResponse(200, json_util::dump(*result));
       });
 
   // 读接口：id 是 SourceRef 规范串；详情一律经 MediaRouter 取领域模型。
-  CROW_ROUTE(app, "/api/track/<string>")([](std::string id_text) {
+  MUSICD_ROUTE(app, "/api/track/<string>")([](std::string id_text) {
     const std::optional<media_library::SourceRef> ref =
         api_ref(id_text, media_library::EntityType::Track);
     if (!ref.has_value()) {
@@ -1176,7 +1244,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
       return jsonResponse(404, "{\"erro\":true}");
     }
     const media_library::Track &value = track.value().value;
-    crow::json::wvalue out;
+    Json::Value out;
     out["id"] = ref_text(value.ref);
     out["title"] = value.title;
     out["artists"] = artist_links_json(value.artists);
@@ -1204,10 +1272,10 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     out["playable"] = value.playable;
     out["artwork"] = value.artwork.has_value() ? ref_text(value.ref)
                                                : std::string();
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/track/<int>").methods("DELETE"_method)([](int id) {
+  MUSICD_ROUTE(app, "/api/track/<int>").methods(drogon::Delete)([](int id) {
     repo::TrackRepo repo(db::mainSession());
     if (repo.remove(id)) {
       return jsonResponse(200, "{\"status\":\"ok\"}");
@@ -1215,7 +1283,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     return jsonResponse(404, "{\"erro\":true}");
   });
 
-  CROW_ROUTE(app, "/api/album/<string>")([](std::string id_text) {
+  MUSICD_ROUTE(app, "/api/album/<string>")([](std::string id_text) {
     const std::optional<media_library::SourceRef> ref =
         api_ref(id_text, media_library::EntityType::Album);
     if (!ref.has_value()) {
@@ -1233,7 +1301,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                                                                      {});
             });
 
-    crow::json::wvalue out;
+    Json::Value out;
     out["id"] = ref_text(value.ref);
     out["name"] = value.title;
     out["album_artists"] = album_artist_links_json(value.artists);
@@ -1241,22 +1309,21 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     out["genres"] = strings_json(value.genres);
     out["artwork"] = value.artwork.has_value() ? ref_text(value.ref)
                                                : std::string();
-    crow::json::wvalue::list track_list;
-    track_list.reserve(tracks.size());
-    for (const media_library::Track &track : tracks) {
-      crow::json::wvalue item;
+    Json::Value track_list(Json::arrayValue);
+      for (const media_library::Track &track : tracks) {
+      Json::Value item;
       item["id"] = ref_text(track.ref);
       item["title"] = track.title;
       item["track_no"] = track.track_no.value_or(0);
       item["disc_no"] = track.disc_no.value_or(0);
       item["duration_ms"] = track.duration_ms.value_or(std::int64_t{0});
-      track_list.push_back(std::move(item));
+      track_list.append(std::move(item));
     }
     out["tracks"] = std::move(track_list);
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/album/<int>").methods("DELETE"_method)([](int id) {
+  MUSICD_ROUTE(app, "/api/album/<int>").methods(drogon::Delete)([](int id) {
     try {
       repo::AlbumRepo album_repo(db::mainSession());
       if (!album_repo.byId(id)) {
@@ -1277,17 +1344,17 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                  {static_cast<std::int64_t>(id)});
       db.execute(schema::sql::kAlbumDelete, {static_cast<std::int64_t>(id)});
 
-      crow::json::wvalue out;
+      Json::Value out;
       out["status"] = "ok";
       out["tracks_removed"] = removed;
-      return jsonResponse(200, out.dump());
+      return jsonResponse(200, json_util::dump(out));
     } catch (const std::exception &e) {
       return jsonResponse(500, "{\"erro\":true}");
     }
   });
 
-  CROW_ROUTE(app, "/api/album/<int>/update")
-      .methods("POST"_method)([](const crow::request &req, int id) {
+  MUSICD_ROUTE(app, "/api/album/<int>/update")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req, int id) {
         try {
           repo::AlbumRepo album_repo(db::mainSession());
           auto album = album_repo.byId(id);
@@ -1295,19 +1362,19 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
             return jsonResponse(404, "{\"erro\":true}");
           }
 
-          const crow::json::rvalue body = crow::json::load(req.body);
-          if (!body) {
+          const Json::Value body = json_util::parseOrNull(req->body());
+          if (body.isNull()) {
             return jsonResponse(400, "{\"erro\":true}");
           }
 
           db::Session &db = db::mainSession();
 
           const std::string new_name =
-              body.has("name") ? body["name"].s() : album->name;
+              body.isMember("name") ? body["name"].asString() : album->name;
 
           std::vector<std::string> artist_names;
-          if (body.has("album_artist")) {
-            artist_names = metadata::splitArtists(body["album_artist"].s());
+          if (body.isMember("album_artist")) {
+            artist_names = metadata::splitArtists(body["album_artist"].asString());
           } else {
             repo::ArtistRepo artist_repo(db::mainSession());
             for (const int aid : album->artist_ids) {
@@ -1348,13 +1415,13 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
           setAlbumArtists(db, target, artist_ids);
 
-          if (body.has("year")) {
+          if (body.isMember("year")) {
             db.execute(schema::sql::kAlbumUpdateYear,
-                       {static_cast<std::int64_t>(body["year"].i()),
+                       {static_cast<std::int64_t>(body["year"].asInt64()),
                         static_cast<std::int64_t>(target)});
           }
-          if (body.has("cover_path")) {
-            std::string cover_value = body["cover_path"].s();
+          if (body.isMember("cover_path")) {
+            std::string cover_value = body["cover_path"].asString();
             if (!cover_value.empty()) {
               repo::ScanRootRepo cover_roots(db::mainSession());
               for (const auto &r : cover_roots.list()) {
@@ -1369,17 +1436,17 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                        {cover_value, static_cast<std::int64_t>(target)});
           }
 
-          crow::json::wvalue out;
+          Json::Value out;
           out["status"] = "ok";
           out["album_id"] = target;
           out["merged"] = (target != id);
-          return jsonResponse(200, out.dump());
+          return jsonResponse(200, json_util::dump(out));
         } catch (const std::exception &) {
           return jsonResponse(409, "{\"erro\":true,\"reason\":\"conflict\"}");
         }
       });
 
-  CROW_ROUTE(app, "/api/artist/<string>")([](std::string id_text) {
+  MUSICD_ROUTE(app, "/api/artist/<string>")([](std::string id_text) {
     // 艺术家与专辑艺术家是两种引用，同一个底层艺术家两边都能打开。
     const std::optional<media_library::SourceRef> parsed =
         media_library::parse_ref(id_text);
@@ -1404,95 +1471,94 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                                                                       {});
             });
 
-    crow::json::wvalue out;
+    Json::Value out;
     out["id"] = ref_text(value.ref);
     out["name"] = value.name;
     out["sort_name"] = value.sort_name;
     out["artwork"] = value.artwork.has_value() ? ref_text(value.ref)
                                                : std::string();
-    crow::json::wvalue::list album_list;
-    album_list.reserve(albums.size());
-    for (const media_library::Album &album : albums) {
-      crow::json::wvalue item;
+    Json::Value album_list(Json::arrayValue);
+      for (const media_library::Album &album : albums) {
+      Json::Value item;
       item["id"] = ref_text(album.ref);
       item["name"] = album.title;
       item["year"] = album.year.value_or(0);
-      album_list.push_back(std::move(item));
+      album_list.append(std::move(item));
     }
     out["albums"] = std::move(album_list);
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
 
-  CROW_ROUTE(app, "/api/playlists/refresh").methods("POST"_method)([] {
+  MUSICD_ROUTE(app, "/api/playlists/refresh").methods(drogon::Post)([] {
     auto r = playlist::refresh();
-    crow::json::wvalue out;
+    Json::Value out;
     out["playlists"] = r.playlists;
     out["songs"] = r.songs;
     out["matched"] = r.matched;
-    crow::json::wvalue::list unmatched;
+    Json::Value unmatched(Json::arrayValue);
     for (const auto &u : r.unmatched) {
-      crow::json::wvalue uw;
+      Json::Value uw;
       uw["playlist"] = u.playlist;
       uw["path"] = u.song.path;
       uw["album"] = u.song.album;
       uw["album_artist"] = u.song.album_artist;
-      unmatched.emplace_back(std::move(uw));
+      unmatched.append(std::move(uw));
     }
-    out["unmatched"] = crow::json::wvalue(unmatched);
-    return jsonResponse(200, out.dump());
+    out["unmatched"] = unmatched;
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/playlists")([] {
+  MUSICD_ROUTE(app, "/api/playlists")([] {
     auto playlists = playlist::list();
-    crow::json::wvalue out(crow::json::type::List);
+    Json::Value out(Json::arrayValue);
     int i = 0;
     for (const auto &p : playlists) {
       out[i] = playlistSummaryJson(p);
       ++i;
     }
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/playlists")
-      .methods("POST"_method)([](const crow::request &req) {
-        auto json = crow::json::load(req.body);
-        if (!json || !json.has("name")) {
+  MUSICD_ROUTE(app, "/api/playlists")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
+        const Json::Value json = json_util::parseOrNull(req->body());
+        if (json.isNull() || !json.isMember("name")) {
           return jsonResponse(400, "{\"erro\":true}");
         }
-        playlist::Playlist p = playlist::create(std::string(json["name"].s()));
-        return jsonResponse(200, playlistDetailJson(p).dump());
+        playlist::Playlist p = playlist::create(std::string(json["name"].asString()));
+        return jsonResponse(200, json_util::dump(playlistDetailJson(p)));
       });
 
-  CROW_ROUTE(app, "/api/playlists/<string>")([](const crow::request &,
+  MUSICD_ROUTE(app, "/api/playlists/<string>")([](const http_server::RequestPtr &,
                                                 std::string id) {
     playlist::Playlist p;
     if (!playlist::get(id, p)) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    return jsonResponse(200, playlistDetailJson(p).dump());
+    return jsonResponse(200, json_util::dump(playlistDetailJson(p)));
   });
 
-  CROW_ROUTE(app, "/api/playlists/<string>")
-      .methods("DELETE"_method)([](const crow::request &, std::string id) {
+  MUSICD_ROUTE(app, "/api/playlists/<string>")
+      .methods(drogon::Delete)([](const http_server::RequestPtr &, std::string id) {
         if (!playlist::remove(id)) {
           return jsonResponse(404, "{\"erro\":true}");
         }
         return jsonResponse(200, "{\"status\":\"ok\"}");
       });
 
-  CROW_ROUTE(app, "/api/playlists/<string>/songs")
-      .methods("POST"_method)([](const crow::request &req, std::string id) {
-        auto json = crow::json::load(req.body);
-        if (!json) {
+  MUSICD_ROUTE(app, "/api/playlists/<string>/songs")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req, std::string id) {
+        const Json::Value json = json_util::parseOrNull(req->body());
+        if (json.isNull()) {
           return jsonResponse(400, "{\"erro\":true}");
         }
         std::string err;
         bool ok = false;
-        if (json.has("trackId")) {
-          ok = playlist::addTrack(id, static_cast<int>(json["trackId"].i()), err);
-        } else if (json.has("path")) {
-          ok = playlist::addPath(id, std::string(json["path"].s()), err);
+        if (json.isMember("trackId")) {
+          ok = playlist::addTrack(id, static_cast<int>(json["trackId"].asInt64()), err);
+        } else if (json.isMember("path")) {
+          ok = playlist::addPath(id, std::string(json["path"].asString()), err);
         } else {
           err = "missing path or trackId";
         }
@@ -1501,11 +1567,11 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         }
         playlist::Playlist p;
         playlist::get(id, p);
-        return jsonResponse(200, playlistDetailJson(p).dump());
+        return jsonResponse(200, json_util::dump(playlistDetailJson(p)));
       });
 
-  CROW_ROUTE(app, "/api/playlists/<string>/songs/<int>")
-      .methods("DELETE"_method)([](const crow::request &, std::string id,
+  MUSICD_ROUTE(app, "/api/playlists/<string>/songs/<int>")
+      .methods(drogon::Delete)([](const http_server::RequestPtr &, std::string id,
                                    int index) {
         if (!playlist::removeAt(id, index)) {
           return jsonResponse(404, "{\"erro\":true}");
@@ -1513,10 +1579,10 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         return jsonResponse(200, "{\"status\":\"ok\"}");
       });
 
-  CROW_ROUTE(app, "/api/roots")([] {
+  MUSICD_ROUTE(app, "/api/roots")([] {
     repo::ScanRootRepo repo(db::mainSession());
     auto roots = repo.list();
-    crow::json::wvalue out(crow::json::type::List);
+    Json::Value out(Json::arrayValue);
     int i = 0;
     for (const auto &r : roots) {
       out[i]["id"] = r.id;
@@ -1527,39 +1593,39 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
       out[i]["type"] = r.type;
       ++i;
     }
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/roots")
-      .methods("POST"_method)([](const crow::request &req) {
-        auto json = crow::json::load(req.body);
-        if (!json || !json.has("path")) {
+  MUSICD_ROUTE(app, "/api/roots")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
+        const Json::Value json = json_util::parseOrNull(req->body());
+        if (json.isNull() || !json.isMember("path")) {
           return jsonResponse(400, "{\"erro\":true}");
         }
         repo::ScanRootRepo repo(db::mainSession());
-        const std::string path = json["path"].s();
+        const std::string path = json["path"].asString();
         const std::string user =
-            json.has("user") ? std::string(json["user"].s()) : std::string();
+            json.isMember("user") ? std::string(json["user"].asString()) : std::string();
         const std::string pass =
-            json.has("pass") ? std::string(json["pass"].s()) : std::string();
+            json.isMember("pass") ? std::string(json["pass"].asString()) : std::string();
         std::string name =
-            json.has("name") ? std::string(json["name"].s()) : std::string();
+            json.isMember("name") ? std::string(json["name"].asString()) : std::string();
         if (name.empty()) {
           name = deriveRootName(path);
         }
         std::string type =
-            json.has("type") ? std::string(json["type"].s()) : std::string();
+            json.isMember("type") ? std::string(json["type"].asString()) : std::string();
         if (type.empty()) {
           type = rootTypeOf(path);
         }
         int id = repo.add(path, user, pass, name, type);
-        crow::json::wvalue out;
+        Json::Value out;
         out["id"] = id;
-        return jsonResponse(200, out.dump());
+        return jsonResponse(200, json_util::dump(out));
       });
 
-  CROW_ROUTE(app, "/api/roots/<int>")
-      .methods("DELETE"_method)([](int id) {
+  MUSICD_ROUTE(app, "/api/roots/<int>")
+      .methods(drogon::Delete)([](int id) {
         repo::ScanRootRepo repo(db::mainSession());
         if (!repo.byId(id)) {
           return jsonResponse(404, "{\"erro\":true}");
@@ -1579,50 +1645,50 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         } catch (const std::exception &) {
           return jsonResponse(500, "{\"erro\":true}");
         }
-        crow::json::wvalue out;
+        Json::Value out;
         out["status"] = "ok";
         out["tracks_removed"] = removed;
-        return jsonResponse(200, out.dump());
+        return jsonResponse(200, json_util::dump(out));
       });
 
-  CROW_ROUTE(app, "/api/scan")
-      .methods("POST"_method)([](const crow::request &) {
+  MUSICD_ROUTE(app, "/api/scan")
+      .methods(drogon::Post)([](const http_server::RequestPtr &) {
         const int job_id = scanner::enqueueJob(
             "scan-all", [] { scanner::scanAllBlocking(); });
-        crow::json::wvalue out;
+        Json::Value out;
         out["status"] = "queued";
         out["jobId"] = job_id;
-        return jsonResponse(202, out.dump());
+        return jsonResponse(202, json_util::dump(out));
       });
 
-  CROW_ROUTE(app, "/api/scan/status")([] {
+  MUSICD_ROUTE(app, "/api/scan/status")([] {
     const auto p = scanner::status();
-    crow::json::wvalue out;
+    Json::Value out;
     out["scanning"] = p.scanning;
     out["total_roots"] = p.total_roots;
     out["current_root_index"] = p.current_root_index;
-    out["roots"] = crow::json::wvalue(crow::json::type::List);
+    out["roots"] = Json::Value(Json::arrayValue);
     for (size_t i = 0; i < p.roots.size(); ++i) {
       const auto &r = p.roots[i];
-      out["roots"][i]["id"] = r.id;
-      out["roots"][i]["path"] = r.path;
-      out["roots"][i]["scanning"] = r.scanning;
-      out["roots"][i]["files_processed"] = r.files_processed;
-      out["roots"][i]["files_added"] = r.files_added;
-      out["roots"][i]["files_updated"] = r.files_updated;
-      out["roots"][i]["files_removed"] = r.files_removed;
-      out["roots"][i]["errors"] = r.errors;
-      out["roots"][i]["current_file"] = r.current_file;
+      out["roots"][static_cast<Json::ArrayIndex>(i)]["id"] = r.id;
+      out["roots"][static_cast<Json::ArrayIndex>(i)]["path"] = r.path;
+      out["roots"][static_cast<Json::ArrayIndex>(i)]["scanning"] = r.scanning;
+      out["roots"][static_cast<Json::ArrayIndex>(i)]["files_processed"] = r.files_processed;
+      out["roots"][static_cast<Json::ArrayIndex>(i)]["files_added"] = r.files_added;
+      out["roots"][static_cast<Json::ArrayIndex>(i)]["files_updated"] = r.files_updated;
+      out["roots"][static_cast<Json::ArrayIndex>(i)]["files_removed"] = r.files_removed;
+      out["roots"][static_cast<Json::ArrayIndex>(i)]["errors"] = r.errors;
+      out["roots"][static_cast<Json::ArrayIndex>(i)]["current_file"] = r.current_file;
     }
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/jobs")([] {
+  MUSICD_ROUTE(app, "/api/jobs")([] {
     const auto jobs = scanner::jobList();
-    crow::json::wvalue out(crow::json::type::List);
+    Json::Value out(Json::arrayValue);
     int i = 0;
     for (const auto &j : jobs) {
-      crow::json::wvalue item;
+      Json::Value item;
       item["id"] = j.id;
       item["kind"] = j.kind;
       item["state"] = j.state;
@@ -1633,24 +1699,24 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
       item["errors"] = j.errors;
       item["current"] = j.current;
       item["threads"] = j.threads;
-      crow::json::wvalue::list paths;
+      Json::Value paths(Json::arrayValue);
       for (const auto &p : j.current_paths) {
-        paths.emplace_back(p);
+        paths.append(p);
       }
-      item["current_paths"] = crow::json::wvalue(std::move(paths));
+      item["current_paths"] = std::move(paths);
       item["error"] = j.error;
       out[i] = std::move(item);
       ++i;
     }
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/jobs/<int>")([](int id) {
+  MUSICD_ROUTE(app, "/api/jobs/<int>")([](int id) {
     const auto j = scanner::jobStatus(id);
     if (j.id == 0) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    crow::json::wvalue out;
+    Json::Value out;
     out["id"] = j.id;
     out["kind"] = j.kind;
     out["state"] = j.state;
@@ -1661,20 +1727,20 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     out["errors"] = j.errors;
     out["current"] = j.current;
     out["threads"] = j.threads;
-    crow::json::wvalue::list paths;
+    Json::Value paths(Json::arrayValue);
     for (const auto &p : j.current_paths) {
-      paths.emplace_back(p);
+      paths.append(p);
     }
-    out["current_paths"] = crow::json::wvalue(std::move(paths));
+    out["current_paths"] = std::move(paths);
     out["error"] = j.error;
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
   // TODO(legacy): 跨库聚合后由媒体库层直接提供最近播放列表。
-  CROW_ROUTE(app, "/api/recent")([] {
+  MUSICD_ROUTE(app, "/api/recent")([] {
     media_library::CatalogSnapshot snap;
     media_library::compat_snapshot(snap);
-    crow::json::wvalue out(crow::json::type::List);
+    Json::Value out(Json::arrayValue);
     int i = 0;
     for (const int internal_id : snap.recent_play_track_ids) {
       auto item = Service().trackById(internal_id);
@@ -1688,12 +1754,12 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         break;
       }
     }
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/album/<string>/cover")
-      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
-          [](const crow::request &req, std::string id_text) {
+  MUSICD_ROUTE(app, "/api/album/<string>/cover")
+      .methods(drogon::Get, drogon::Head)(
+          [](const http_server::RequestPtr &req, std::string id_text) {
             const std::optional<media_library::SourceRef> ref =
                 api_ref(id_text, media_library::EntityType::Album);
             if (!ref.has_value()) {
@@ -1702,12 +1768,12 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
             media_library::ArtworkRef artwork;
             artwork.owner = *ref;
             return stream_http::serve_artwork(
-                req, artwork, req.method == crow::HTTPMethod::HEAD);
+                req, artwork, req->method() == drogon::Head);
           });
 
-  CROW_ROUTE(app, "/api/track/<int>/file")
-      .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Head)(
-          [](const crow::request &req, int id) {
+  MUSICD_ROUTE(app, "/api/track/<int>/file")
+      .methods(drogon::Get, drogon::Head)(
+          [](const http_server::RequestPtr &req, int id) {
             // TODO(legacy): 对外 id 仍是库内 int；改走 SourceRef 后这条路由可删除。
             const auto ref = media_library::compat_ref_for(
                 media_library::EntityType::Track, id);
@@ -1716,11 +1782,11 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
             }
             // 选源交给 MediaRouter（经 PlaybackService），locator 不再出现在 HTTP 层。
             return stream_http::serve_track(
-                req, *ref, req.method == crow::HTTPMethod::HEAD);
+                req, *ref, req->method() == drogon::Head);
           });
 
-  CROW_ROUTE(app, "/api/track/<int>/play")
-      .methods("POST"_method)([](int id) {
+  MUSICD_ROUTE(app, "/api/track/<int>/play")
+      .methods(drogon::Post)([](int id) {
         repo::TrackRepo repo(db::mainSession());
         if (repo.recordPlay(id)) {
           return jsonResponse(200, "{\"status\":\"ok\"}");
@@ -1728,15 +1794,15 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         return jsonResponse(404, "{\"erro\":true}");
       });
 
-  CROW_ROUTE(app, "/api/fs/browse/<int>")([](int root_id) {
+  MUSICD_ROUTE(app, "/api/fs/browse/<int>")([](int root_id) {
     return browseDir(root_id, "");
   });
 
-  CROW_ROUTE(app, "/api/fs/browse/<int>/<path>")([](int root_id, std::string path) {
+  MUSICD_ROUTE(app, "/api/fs/browse/<int>/<path>")([](int root_id, std::string path) {
     return browseDir(root_id, urlDecode(path));
   });
 
-  CROW_ROUTE(app, "/api/fs/file-meta/<path>")([](std::string path) {
+  MUSICD_ROUTE(app, "/api/fs/file-meta/<path>")([](std::string path) {
     const std::string p = urlDecode(path);
     if (!webdav::isWebdavUrl(p) && (!isUnderAnyRoot(p) || !fs::exists(p))) {
       return jsonResponse(404, "{\"erro\":true}");
@@ -1745,7 +1811,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     if (!meta) {
       return jsonResponse(500, "{\"erro\":true}");
     }
-    crow::json::wvalue out;
+    Json::Value out;
     out["title"] = meta->title;
     out["artist"] = meta->artist;
     out["album"] = meta->album;
@@ -1754,28 +1820,28 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     out["comment"] = meta->comment;
     out["track_no"] = meta->track_no;
     out["disc_no"] = meta->disc_no;
-    out["size_bytes"] = static_cast<long long>(meta->size_bytes);
+    out["size_bytes"] = static_cast<Json::Int64>(meta->size_bytes);
     out["bitrate"] = meta->bitrate;
     out["sample_rate"] = meta->sample_rate;
     out["channels"] = meta->channels;
     out["format"] = meta->format;
-    crow::json::wvalue::list artists;
+    Json::Value artists(Json::arrayValue);
     for (const auto &name : meta->artists) {
-      artists.emplace_back(name);
+      artists.append(name);
     }
-    out["artists"] = crow::json::wvalue(artists);
-    crow::json::wvalue::list album_artists;
+    out["artists"] = artists;
+    Json::Value album_artists(Json::arrayValue);
     for (const auto &name : meta->album_artists) {
-      album_artists.emplace_back(name);
+      album_artists.append(name);
     }
-    out["album_artists"] = crow::json::wvalue(album_artists);
-    return jsonResponse(200, out.dump());
+    out["album_artists"] = album_artists;
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/fs/orphans")([](const crow::request &req) {
+  MUSICD_ROUTE(app, "/api/fs/orphans")([](const http_server::RequestPtr &req) {
     try {
       int root_id = 0;
-      std::string root_id_str = req.url_params.get("rootId");
+      std::string root_id_str = http_server::Query(req).getOr("rootId", "");
       if (!root_id_str.empty()) {
         root_id = std::stoi(root_id_str);
       }
@@ -1792,7 +1858,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
       repo::TrackRepo track_repo(db::mainSession());
       auto tracks = track_repo.byRootId(root_id);
 
-      crow::json::wvalue out(crow::json::type::List);
+      Json::Value out(Json::arrayValue);
       int i = 0;
       for (const auto &t : tracks) {
         if (!fs::exists(t.path)) {
@@ -1800,21 +1866,21 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
           out[i]["path"] = t.path;
           out[i]["title"] = t.title;
           out[i]["album_id"] = t.album_id;
-          crow::json::wvalue::list aids;
+          Json::Value aids(Json::arrayValue);
           for (const int aid : t.artist_ids) {
-            aids.emplace_back(aid);
+            aids.append(aid);
           }
-          out[i]["artist_ids"] = crow::json::wvalue(aids);
+          out[i]["artist_ids"] = aids;
           ++i;
         }
       }
-      return jsonResponse(200, out.dump());
+      return jsonResponse(200, json_util::dump(out));
     } catch (...) {
       return jsonResponse(500, "{\"erro\":true}");
     }
   });
 
-  CROW_ROUTE(app, "/api/track/<int>/file-meta")([](int id) {
+  MUSICD_ROUTE(app, "/api/track/<int>/file-meta")([](int id) {
     // TODO(legacy): 直接读本地文件标签，只对本地库有意义。
     const auto ref = media_library::compat_ref_for(
         media_library::EntityType::Track, id);
@@ -1835,7 +1901,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
       return jsonResponse(500, "{\"erro\":true}");
     }
 
-    crow::json::wvalue out;
+    Json::Value out;
     out["title"] = meta->title;
     out["artist"] = meta->artist;
     out["album"] = meta->album;
@@ -1844,31 +1910,31 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     out["comment"] = meta->comment;
     out["track_no"] = meta->track_no;
     out["disc_no"] = meta->disc_no;
-    out["size_bytes"] = static_cast<long long>(meta->size_bytes);
+    out["size_bytes"] = static_cast<Json::Int64>(meta->size_bytes);
     out["bitrate"] = meta->bitrate;
     out["sample_rate"] = meta->sample_rate;
     out["channels"] = meta->channels;
     out["format"] = meta->format;
-    crow::json::wvalue::list artists;
+    Json::Value artists(Json::arrayValue);
     for (const auto &name : meta->artists) {
-      artists.emplace_back(name);
+      artists.append(name);
     }
-    out["artists"] = crow::json::wvalue(artists);
-    crow::json::wvalue::list album_artists;
+    out["artists"] = artists;
+    Json::Value album_artists(Json::arrayValue);
     for (const auto &name : meta->album_artists) {
-      album_artists.emplace_back(name);
+      album_artists.append(name);
     }
-    out["album_artists"] = crow::json::wvalue(album_artists);
-    return jsonResponse(200, out.dump());
+    out["album_artists"] = album_artists;
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/track/<string>/lyrics")([](std::string id_text) {
+  MUSICD_ROUTE(app, "/api/track/<string>/lyrics")([](std::string id_text) {
     const std::optional<media_library::SourceRef> ref =
         api_ref(id_text, media_library::EntityType::Track);
     if (!ref.has_value()) {
       return jsonResponse(404, "{\"erro\":true}");
     }
-    crow::json::wvalue out;
+    Json::Value out;
     out["text"] = "";
     out["synced"] = false;
     const auto lyrics = media_library::media_router().resolve_lyrics(*ref, {});
@@ -1891,20 +1957,20 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
       out["text"] = media_library::lyrics_to_ttml(value, meta);
       out["synced"] = media_library::is_synced(value);
     }
-    return jsonResponse(200, out.dump());
+    return jsonResponse(200, json_util::dump(out));
   });
 
-  CROW_ROUTE(app, "/api/track/<int>/lyrics")
-      .methods("POST"_method)([](const crow::request &req, int id) {
+  MUSICD_ROUTE(app, "/api/track/<int>/lyrics")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req, int id) {
         repo::TrackRepo repo(db::mainSession());
         if (!repo.byId(id)) {
           return jsonResponse(404, "{\"erro\":true}");
         }
-        auto body = crow::json::load(req.body);
-        if (!body || !body.has("text")) {
+        const Json::Value body = json_util::parseOrNull(req->body());
+        if (body.isNull() || !body.isMember("text")) {
           return jsonResponse(400, "{\"erro\":true}");
         }
-        const std::string text = body["text"].s();
+        const std::string text = body["text"].asString();
         db::Session &db = db::mainSession();
         if (text.empty()) {
           db.execute("DELETE FROM track_lyrics WHERE track_id = ?",
@@ -1918,14 +1984,14 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         return jsonResponse(200, "{\"status\":\"ok\"}");
       });
 
-  CROW_ROUTE(app, "/api/scan/dir")
-      .methods("POST"_method)([](const crow::request &req) {
-        auto json = crow::json::load(req.body);
-        if (!json || !json.has("rootId") || !json.has("path")) {
+  MUSICD_ROUTE(app, "/api/scan/dir")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
+        const Json::Value json = json_util::parseOrNull(req->body());
+        if (json.isNull() || !json.isMember("rootId") || !json.isMember("path")) {
           return jsonResponse(400, "{\"erro\":true}");
         }
-        int root_id = json["rootId"].i();
-        std::string dir_path = json["path"].s();
+        int root_id = json["rootId"].asInt64();
+        std::string dir_path = json["path"].asString();
 
         repo::ScanRootRepo root_repo(db::mainSession());
         auto root_opt = root_repo.byId(root_id);
@@ -1948,44 +2014,44 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         const int job_id = scanner::enqueueJob(
             "scan-dir",
             [root_id, target] { scanner::scanDir(root_id, target); });
-        crow::json::wvalue out;
+        Json::Value out;
         out["status"] = "queued";
         out["jobId"] = job_id;
-        return jsonResponse(202, out.dump());
+        return jsonResponse(202, json_util::dump(out));
       });
 
-  CROW_ROUTE(app, "/api/track/<int>/sync-from-file")
-      .methods("POST"_method)([](int id) {
+  MUSICD_ROUTE(app, "/api/track/<int>/sync-from-file")
+      .methods(drogon::Post)([](int id) {
         repo::TrackRepo track_repo(db::mainSession());
         if (!track_repo.byId(id)) {
           return jsonResponse(404, "{\"erro\":true}");
         }
         const int job_id = scanner::enqueueJob(
             "sync-from-file", [id] { syncFromFileById(id); });
-        crow::json::wvalue out;
+        Json::Value out;
         out["status"] = "queued";
         out["jobId"] = job_id;
-        return jsonResponse(202, out.dump());
+        return jsonResponse(202, json_util::dump(out));
       });
 
-  CROW_ROUTE(app, "/api/track/<int>/sync-to-file")
-      .methods("POST"_method)([](int id) {
+  MUSICD_ROUTE(app, "/api/track/<int>/sync-to-file")
+      .methods(drogon::Post)([](int id) {
         repo::TrackRepo track_repo(db::mainSession());
         if (!track_repo.byId(id)) {
           return jsonResponse(404, "{\"erro\":true}");
         }
         const int job_id = scanner::enqueueJob(
             "sync-to-file", [id] { syncToFileById(id); });
-        crow::json::wvalue out;
+        Json::Value out;
         out["status"] = "queued";
         out["jobId"] = job_id;
-        return jsonResponse(202, out.dump());
+        return jsonResponse(202, json_util::dump(out));
       });
 
-  CROW_ROUTE(app, "/api/track/<int>/update")
-      .methods("POST"_method)([](const crow::request &req, int id) {
-        auto json = crow::json::load(req.body);
-        if (!json) {
+  MUSICD_ROUTE(app, "/api/track/<int>/update")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req, int id) {
+        const Json::Value json = json_util::parseOrNull(req->body());
+        if (json.isNull()) {
           return jsonResponse(400, "{\"erro\":true}");
         }
 
@@ -1996,35 +2062,35 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         }
 
         repo::Track t = *track;
-        if (json.has("title")) {
-          t.title = json["title"].s();
+        if (json.isMember("title")) {
+          t.title = json["title"].asString();
         }
         db::Session &db = db::mainSession();
         repo::ArtistRepo artist_repo(db::mainSession());
         repo::AlbumRepo album_repo(db::mainSession());
 
         std::vector<std::string> artist_names;
-        if (json.has("artist")) {
-          artist_names = metadata::splitArtists(json["artist"].s());
+        if (json.isMember("artist")) {
+          artist_names = metadata::splitArtists(json["artist"].asString());
         }
 
         std::vector<std::string> album_artist_names;
-        if (json.has("album_artist")) {
-          album_artist_names = metadata::splitArtists(json["album_artist"].s());
+        if (json.isMember("album_artist")) {
+          album_artist_names = metadata::splitArtists(json["album_artist"].asString());
         } else if (!artist_names.empty()) {
           album_artist_names = artist_names;
         }
 
         std::string album_name;
-        if (json.has("album")) {
-          album_name = json["album"].s();
+        if (json.isMember("album")) {
+          album_name = json["album"].asString();
         }
 
         if (!artist_names.empty()) {
           setTrackArtists(db, id, ensureArtistIds(db, artist_names));
         }
 
-        if (json.has("album") || json.has("album_artist")) {
+        if (json.isMember("album") || json.isMember("album_artist")) {
           if (album_name.empty() && t.album_id > 0) {
             if (auto a = album_repo.byId(t.album_id)) {
               album_name = a->name;
@@ -2045,13 +2111,13 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                             ensureArtistIds(db, album_artist_names));
           }
         }
-        if (json.has("year") && t.album_id > 0) {
+        if (json.isMember("year") && t.album_id > 0) {
           db.execute(schema::sql::kAlbumUpdateYear,
-                     {static_cast<std::int64_t>(json["year"].i()),
+                     {static_cast<std::int64_t>(json["year"].asInt64()),
                       static_cast<std::int64_t>(t.album_id)});
         }
-        if (json.has("genre")) {
-          std::string genre_name = json["genre"].s();
+        if (json.isMember("genre")) {
+          std::string genre_name = json["genre"].asString();
           db.execute("DELETE FROM track_genre WHERE track_id = ?",
                      {static_cast<std::int64_t>(id)});
           if (!genre_name.empty()) {
@@ -2065,91 +2131,90 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
             }
           }
         }
-        if (json.has("disc_no")) {
-          t.disc_no = json["disc_no"].i();
+        if (json.isMember("disc_no")) {
+          t.disc_no = json["disc_no"].asInt64();
         }
-        if (json.has("track_no")) {
-          t.track_no = json["track_no"].i();
+        if (json.isMember("track_no")) {
+          t.track_no = json["track_no"].asInt64();
         }
-        if (json.has("duration_ms")) {
-          t.duration_ms = json["duration_ms"].i();
+        if (json.isMember("duration_ms")) {
+          t.duration_ms = json["duration_ms"].asInt64();
         }
-        if (json.has("bitrate")) {
-          t.bitrate = json["bitrate"].i();
+        if (json.isMember("bitrate")) {
+          t.bitrate = json["bitrate"].asInt64();
         }
-        if (json.has("sample_rate")) {
-          t.sample_rate = json["sample_rate"].i();
+        if (json.isMember("sample_rate")) {
+          t.sample_rate = json["sample_rate"].asInt64();
         }
-        if (json.has("channels")) {
-          t.channels = json["channels"].i();
+        if (json.isMember("channels")) {
+          t.channels = json["channels"].asInt64();
         }
-        if (json.has("format")) {
-          t.format = json["format"].s();
+        if (json.isMember("format")) {
+          t.format = json["format"].asString();
         }
-        if (json.has("size_bytes")) {
-          t.size_bytes = json["size_bytes"].i();
+        if (json.isMember("size_bytes")) {
+          t.size_bytes = json["size_bytes"].asInt64();
         }
-        if (json.has("mtime")) {
-          t.mtime = json["mtime"].i();
+        if (json.isMember("mtime")) {
+          t.mtime = json["mtime"].asInt64();
         }
-        if (json.has("rating")) {
-          t.rating = json["rating"].i();
+        if (json.isMember("rating")) {
+          t.rating = json["rating"].asInt64();
         }
 
         repo.updatePartial(t);
         return jsonResponse(200, "{\"status\":\"ok\"}");
       });
 
-  CROW_ROUTE(app, "/api/fs/batch")
-      .methods("POST"_method)([](const crow::request &req) {
-        auto json = crow::json::load(req.body);
-        if (!json) {
+  MUSICD_ROUTE(app, "/api/fs/batch")
+      .methods(drogon::Post)([](const http_server::RequestPtr &req) {
+        const Json::Value json = json_util::parseOrNull(req->body());
+        if (json.isNull()) {
           return jsonResponse(400, "{\"erro\":true}");
         }
-        bool is_list = false;
-        try { is_list = json.t() == crow::json::type::List; } catch (...) {}
+        const bool is_list = json.isArray();
         if (!is_list) {
           return jsonResponse(400, "{\"erro\":true}");
         }
 
-        crow::json::wvalue result(crow::json::type::List);
+        Json::Value result(Json::arrayValue);
         std::map<int, std::vector<std::string>> scan_paths_by_root;
         std::map<int, std::vector<int>> scan_indices_by_root;
         std::vector<int> sync_from_ids;
         std::vector<int> sync_from_indices;
         std::vector<int> sync_to_ids;
         std::vector<int> sync_to_indices;
-        const auto collectTrackIds = [](const crow::json::rvalue &item,
+        const auto collectTrackIds = [](const Json::Value &item,
                                         std::vector<int> &out) {
-          if (item.has("trackId")) {
-            out.push_back(item["trackId"].i());
+          if (item.isMember("trackId")) {
+            out.push_back(item["trackId"].asInt64());
             return;
           }
-          if (item.has("albumId")) {
-            for (const int id : tracksUnderAlbum(item["albumId"].i())) {
+          if (item.isMember("albumId")) {
+            for (const int id : tracksUnderAlbum(item["albumId"].asInt64())) {
               out.push_back(id);
             }
             return;
           }
-          if (item.has("artistId")) {
-            for (const int id : tracksUnderArtist(item["artistId"].i())) {
+          if (item.isMember("artistId")) {
+            for (const int id : tracksUnderArtist(item["artistId"].asInt64())) {
               out.push_back(id);
             }
             return;
           }
-          if (item.has("path")) {
-            const int root_id = item["rootId"].i();
-            for (const int id : tracksUnderPath(root_id, item["path"].s())) {
+          if (item.isMember("path")) {
+            const int root_id = item["rootId"].asInt64();
+            for (const int id : tracksUnderPath(root_id, item["path"].asString())) {
               out.push_back(id);
             }
           }
         };
         int i = 0;
         for (const auto &item : json) {
-          std::string action = item["action"].s();
+          std::string action = item["action"].asString();
           if (action == "scan") {
-            const int root_id = item["rootId"].i();
-            scan_paths_by_root[root_id].push_back(item["path"].s());
+            const int root_id = item["rootId"].asInt64();
+            scan_paths_by_root[root_id].push_back(item["path"].asString());
             scan_indices_by_root[root_id].push_back(i);
           } else if (action == "sync-from-file") {
             collectTrackIds(item, sync_from_ids);
@@ -2158,37 +2223,37 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
             collectTrackIds(item, sync_to_ids);
             sync_to_indices.push_back(i);
           } else if (action == "update") {
-            int track_id = item["trackId"].i();
+            int track_id = item["trackId"].asInt64();
             auto fields = item["fields"];
             repo::TrackRepo track_repo(db::mainSession());
             auto track = track_repo.byId(track_id);
             if (track) {
               repo::Track t = *track;
-              if (fields.has("title")) {
-                t.title = fields["title"].s();
+              if (fields.isMember("title")) {
+                t.title = fields["title"].asString();
               }
               db::Session &db = db::mainSession();
               repo::ArtistRepo artist_repo(db::mainSession());
               repo::AlbumRepo album_repo(db::mainSession());
               std::vector<std::string> artist_names;
-              if (fields.has("artist")) {
-                artist_names = metadata::splitArtists(fields["artist"].s());
+              if (fields.isMember("artist")) {
+                artist_names = metadata::splitArtists(fields["artist"].asString());
               }
               std::vector<std::string> album_artist_names;
-              if (fields.has("album_artist")) {
+              if (fields.isMember("album_artist")) {
                 album_artist_names =
-                    metadata::splitArtists(fields["album_artist"].s());
+                    metadata::splitArtists(fields["album_artist"].asString());
               } else if (!artist_names.empty()) {
                 album_artist_names = artist_names;
               }
               std::string album_name;
-              if (fields.has("album")) {
-                album_name = fields["album"].s();
+              if (fields.isMember("album")) {
+                album_name = fields["album"].asString();
               }
               if (!artist_names.empty()) {
                 setTrackArtists(db, track_id, ensureArtistIds(db, artist_names));
               }
-              if (fields.has("album") || fields.has("album_artist")) {
+              if (fields.isMember("album") || fields.isMember("album_artist")) {
                 if (album_name.empty() && t.album_id > 0) {
                   if (auto a = album_repo.byId(t.album_id)) {
                     album_name = a->name;
@@ -2210,35 +2275,35 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                                   ensureArtistIds(db, album_artist_names));
                 }
               }
-              if (fields.has("disc_no")) {
-                t.disc_no = fields["disc_no"].i();
+              if (fields.isMember("disc_no")) {
+                t.disc_no = fields["disc_no"].asInt64();
               }
-              if (fields.has("track_no")) {
-                t.track_no = fields["track_no"].i();
+              if (fields.isMember("track_no")) {
+                t.track_no = fields["track_no"].asInt64();
               }
-              if (fields.has("duration_ms")) {
-                t.duration_ms = fields["duration_ms"].i();
+              if (fields.isMember("duration_ms")) {
+                t.duration_ms = fields["duration_ms"].asInt64();
               }
-              if (fields.has("bitrate")) {
-                t.bitrate = fields["bitrate"].i();
+              if (fields.isMember("bitrate")) {
+                t.bitrate = fields["bitrate"].asInt64();
               }
-              if (fields.has("sample_rate")) {
-                t.sample_rate = fields["sample_rate"].i();
+              if (fields.isMember("sample_rate")) {
+                t.sample_rate = fields["sample_rate"].asInt64();
               }
-              if (fields.has("channels")) {
-                t.channels = fields["channels"].i();
+              if (fields.isMember("channels")) {
+                t.channels = fields["channels"].asInt64();
               }
-              if (fields.has("format")) {
-                t.format = fields["format"].s();
+              if (fields.isMember("format")) {
+                t.format = fields["format"].asString();
               }
-              if (fields.has("size_bytes")) {
-                t.size_bytes = fields["size_bytes"].i();
+              if (fields.isMember("size_bytes")) {
+                t.size_bytes = fields["size_bytes"].asInt64();
               }
-              if (fields.has("mtime")) {
-                t.mtime = fields["mtime"].i();
+              if (fields.isMember("mtime")) {
+                t.mtime = fields["mtime"].asInt64();
               }
-              if (fields.has("rating")) {
-                t.rating = fields["rating"].i();
+              if (fields.isMember("rating")) {
+                t.rating = fields["rating"].asInt64();
               }
               track_repo.updatePartial(t);
               result[i]["status"] = "ok";
@@ -2247,26 +2312,26 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
               result[i]["error"] = "track not found";
             }
           } else if (action == "delete-index") {
-            if (item.has("trackId") || item.has("albumId") ||
-                item.has("artistId")) {
+            if (item.isMember("trackId") || item.isMember("albumId") ||
+                item.isMember("artistId")) {
               db::Session &db = db::mainSession();
               int removed = 0;
               try {
-                if (item.has("trackId")) {
+                if (item.isMember("trackId")) {
                   removed = static_cast<int>(
                       db.execute("DELETE FROM track WHERE id = ?",
                                  {static_cast<std::int64_t>(
-                                     item["trackId"].i())}));
-                } else if (item.has("albumId")) {
+                                     item["trackId"].asInt64())}));
+                } else if (item.isMember("albumId")) {
                   removed = static_cast<int>(
                       db.execute("DELETE FROM track WHERE album_id = ?",
                                  {static_cast<std::int64_t>(
-                                     item["albumId"].i())}));
+                                     item["albumId"].asInt64())}));
                 } else {
                   removed = static_cast<int>(db.execute(
                       "DELETE FROM track WHERE album_id IN "
                       "(SELECT album_id FROM album_artist WHERE artist_id = ?)",
-                      {static_cast<std::int64_t>(item["artistId"].i())}));
+                      {static_cast<std::int64_t>(item["artistId"].asInt64())}));
                 }
                 db.exec("DELETE FROM album WHERE id NOT IN (SELECT DISTINCT "
                         "album_id FROM track WHERE album_id IS NOT NULL)");
@@ -2282,8 +2347,8 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
               ++i;
               continue;
             }
-            int root_id = item["rootId"].i();
-            std::string path = item["path"].s();
+            int root_id = item["rootId"].asInt64();
+            std::string path = item["path"].asString();
             try {
               repo::ScanRootRepo root_repo(db::mainSession());
               auto root_opt = root_repo.byId(root_id);
@@ -2329,7 +2394,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                   const std::string vtarget =
                       storage::toVirtual(*root_opt, target);
                   const bool is_dir =
-                      item.has("isDir") ? item["isDir"].b()
+                      item.isMember("isDir") ? item["isDir"].asBool()
                                         : fs::is_directory(target, ec);
                   int removed = 0;
                   if (is_dir) {
@@ -2398,7 +2463,7 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
             result[idx]["jobId"] = job_id;
           }
         }
-        return jsonResponse(200, result.dump());
+        return jsonResponse(200, json_util::dump(result));
       });
 
   std::cout << "[boot] 生效端口 主=" << cfg.port << " Jellyfin="
@@ -2409,23 +2474,29 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
                                      : std::string("off"))
             << std::endl;
 
-  std::thread jellyfin_thread;
+  // 三个服务共用进程内唯一的 Drogon app：入站按本地端口加路由前缀，
+  // 各端口的路由互不串扰。
+  http_server::installPortRouting();
+  http_server::installErrorPages();
   if (cfg.jellyfin_enabled) {
-    jellyfin_thread = std::thread([&cfg]() { jellyfin::run(cfg); });
+    jellyfin::mount(cfg);
   }
-  std::thread subsonic_thread;
   if (cfg.subsonic.enabled) {
-    subsonic_thread = std::thread([&cfg]() { subsonic::run(cfg); });
+    subsonic::mount(cfg);
   }
 
-  app.port(cfg.port).multithreaded().concurrency(8).run();
+  http_server::listen(cfg.port);
+  if (cfg.jellyfin_enabled) {
+    http_server::listen(cfg.jellyfin_port);
+  }
+  if (cfg.subsonic.enabled) {
+    http_server::listen(cfg.subsonic.port);
+  }
+  http_server::setWorkerThreads(8);
+  http_server::setQuietLogging();
 
-  if (jellyfin_thread.joinable()) {
-    jellyfin_thread.join();
-  }
-  if (subsonic_thread.joinable()) {
-    subsonic_thread.join();
-  }
+  drogon::app().run();
+
   media_library::shutdown_media_runtime();
   media_library::shutdown_library();
   image_cache::shutdown();

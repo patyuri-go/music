@@ -1,6 +1,8 @@
 #include "api/api-enhanced/client.h"
 
-#include "crow/json.h"
+#include <json/json.h>
+
+#include "json_util.h"
 
 #include <algorithm>
 #include <chrono>
@@ -53,89 +55,86 @@ media_library::Error platform_error(const std::string &path, std::int64_t code) 
   return error;
 }
 
-bool is_object(const crow::json::rvalue &value) {
-  return static_cast<bool>(value) && value.t() == crow::json::type::Object;
+bool is_object(const Json::Value &value) {
+  return !value.isNull() && value.isObject();
 }
 
-bool is_list(const crow::json::rvalue &value) {
-  return static_cast<bool>(value) && value.t() == crow::json::type::List;
+bool is_list(const Json::Value &value) {
+  return !value.isNull() && value.isArray();
 }
 
-bool is_string(const crow::json::rvalue &value) {
-  return static_cast<bool>(value) && value.t() == crow::json::type::String;
+bool is_string(const Json::Value &value) {
+  return !value.isNull() && value.isString();
 }
 
-bool is_number(const crow::json::rvalue &value) {
-  return static_cast<bool>(value) && value.t() == crow::json::type::Number;
+bool is_number(const Json::Value &value) {
+  return !value.isNull() && value.isNumeric();
 }
 
 // 缺键、空值、类型不符都退化为默认值：平台字段随时可能缺失，不能因为
 // 少一个可选字段就让整次请求失败。
-std::string field_string(const crow::json::rvalue &object, const char *key) {
-  if (!is_object(object) || !object.has(key)) {
+std::string field_string(const Json::Value &object, const char *key) {
+  if (!is_object(object) || !object.isMember(key)) {
     return {};
   }
-  const crow::json::rvalue &value = object[key];
+  const Json::Value &value = object[key];
   if (!is_string(value)) {
     return {};
   }
-  return std::string(value.s());
+  return std::string(value.asString());
 }
 
 // cd 可能是字符串 "1"，i() 同时接受 Number 与 String。
-std::int64_t field_int64(const crow::json::rvalue &object, const char *key,
+std::int64_t field_int64(const Json::Value &object, const char *key,
                          std::int64_t fallback = 0) {
-  if (!is_object(object) || !object.has(key)) {
+  if (!is_object(object) || !object.isMember(key)) {
     return fallback;
   }
-  const crow::json::rvalue &value = object[key];
+  const Json::Value &value = object[key];
   if (!is_number(value) && !is_string(value)) {
     return fallback;
   }
-  return static_cast<std::int64_t>(value.i());
+  return static_cast<std::int64_t>(value.asInt64());
 }
 
-bool field_bool(const crow::json::rvalue &object, const char *key,
+bool field_bool(const Json::Value &object, const char *key,
                 bool fallback = false) {
-  if (!is_object(object) || !object.has(key)) {
+  if (!is_object(object) || !object.isMember(key)) {
     return fallback;
   }
-  const crow::json::rvalue &value = object[key];
-  if (value.t() == crow::json::type::True) {
-    return true;
-  }
-  if (value.t() == crow::json::type::False) {
-    return false;
+  const Json::Value &value = object[key];
+  if (value.isBool()) {
+    return value.asBool();
   }
   return fallback;
 }
 
-std::vector<std::string> field_strings(const crow::json::rvalue &object,
+std::vector<std::string> field_strings(const Json::Value &object,
                                        const char *key) {
   std::vector<std::string> out;
-  if (!is_object(object) || !object.has(key)) {
+  if (!is_object(object) || !object.isMember(key)) {
     return out;
   }
-  const crow::json::rvalue &value = object[key];
+  const Json::Value &value = object[key];
   if (!is_list(value)) {
     return out;
   }
-  for (std::size_t i = 0; i < value.size(); ++i) {
-    const crow::json::rvalue &item = value[i];
+  for (Json::ArrayIndex i = 0; i < value.size(); ++i) {
+    const Json::Value &item = value[i];
     if (is_string(item)) {
-      out.emplace_back(item.s());
+      out.emplace_back(item.asString());
     }
   }
   return out;
 }
 
-std::vector<NeteaseArtistRef> parse_artists(const crow::json::rvalue &value) {
+std::vector<NeteaseArtistRef> parse_artists(const Json::Value &value) {
   std::vector<NeteaseArtistRef> out;
   if (!is_list(value)) {
     return out;
   }
-  for (std::size_t i = 0; i < value.size(); ++i) {
-    const crow::json::rvalue &item = value[i];
+  for (Json::ArrayIndex i = 0; i < value.size(); ++i) {
+    const Json::Value &item = value[i];
     if (!is_object(item)) {
       continue;
     }
@@ -150,13 +149,13 @@ std::vector<NeteaseArtistRef> parse_artists(const crow::json::rvalue &value) {
   return out;
 }
 
-NeteaseQuality parse_quality(const crow::json::rvalue &object,
+NeteaseQuality parse_quality(const Json::Value &object,
                              const char *key) {
   NeteaseQuality quality;
-  if (!is_object(object) || !object.has(key)) {
+  if (!is_object(object) || !object.isMember(key)) {
     return quality;
   }
-  const crow::json::rvalue &value = object[key];
+  const Json::Value &value = object[key];
   if (!is_object(value)) {
     return quality;
   }
@@ -169,7 +168,7 @@ NeteaseQuality parse_quality(const crow::json::rvalue &object,
 
 // album 对象在 /album、/cloudsearch?type=10、/artist/album 三处的形状一致；
 // 曲目里的 al{} 是它的真子集，同一个解析器够用。
-NeteaseAlbumBrief parse_album_brief(const crow::json::rvalue &object) {
+NeteaseAlbumBrief parse_album_brief(const Json::Value &object) {
   NeteaseAlbumBrief album;
   if (!is_object(object)) {
     return album;
@@ -180,12 +179,12 @@ NeteaseAlbumBrief parse_album_brief(const crow::json::rvalue &object) {
   album.publish_time_ms = field_int64(object, "publishTime");
   album.tags = field_strings(object, "tags");
   album.description = field_string(object, "description");
-  if (object.has("artists")) {
+  if (object.isMember("artists")) {
     album.artists = parse_artists(object["artists"]);
   }
   // artists[] 为空时回退单对象 artist（老版本/部分端点只给这一个）。
-  if (album.artists.empty() && object.has("artist")) {
-    const crow::json::rvalue &single = object["artist"];
+  if (album.artists.empty() && object.isMember("artist")) {
+    const Json::Value &single = object["artist"];
     if (is_object(single)) {
       NeteaseArtistRef artist;
       artist.id = field_int64(single, "id");
@@ -198,7 +197,7 @@ NeteaseAlbumBrief parse_album_brief(const crow::json::rvalue &object) {
   return album;
 }
 
-NeteaseSong parse_song(const crow::json::rvalue &object) {
+NeteaseSong parse_song(const Json::Value &object) {
   NeteaseSong song;
   if (!is_object(object)) {
     return song;
@@ -219,10 +218,10 @@ NeteaseSong parse_song(const crow::json::rvalue &object) {
   if (song.translated_names.empty()) {
     song.translated_names = field_strings(object, "transNames");
   }
-  if (object.has("ar")) {
+  if (object.isMember("ar")) {
     song.artists = parse_artists(object["ar"]);
   }
-  if (object.has("al")) {
+  if (object.isMember("al")) {
     song.album = parse_album_brief(object["al"]);
   }
   song.l = parse_quality(object, "l");
@@ -233,7 +232,7 @@ NeteaseSong parse_song(const crow::json::rvalue &object) {
   return song;
 }
 
-NeteaseArtist parse_artist(const crow::json::rvalue &object) {
+NeteaseArtist parse_artist(const Json::Value &object) {
   NeteaseArtist artist;
   if (!is_object(object)) {
     return artist;
@@ -247,7 +246,7 @@ NeteaseArtist parse_artist(const crow::json::rvalue &object) {
   return artist;
 }
 
-NeteasePlaylist parse_playlist(const crow::json::rvalue &object) {
+NeteasePlaylist parse_playlist(const Json::Value &object) {
   NeteasePlaylist playlist;
   if (!is_object(object)) {
     return playlist;
@@ -259,7 +258,7 @@ NeteasePlaylist parse_playlist(const crow::json::rvalue &object) {
   playlist.update_time_ms = field_int64(object, "updateTime");
   playlist.description = field_string(object, "description");
   playlist.tags = field_strings(object, "tags");
-  if (object.has("creator")) {
+  if (object.isMember("creator")) {
     playlist.creator_name = field_string(object["creator"], "nickname");
   }
   return playlist;
@@ -269,12 +268,12 @@ NeteasePlaylist parse_playlist(const crow::json::rvalue &object) {
 template <typename T, typename Extractor>
 media_library::Result<T>
 parse_body(const std::string &body, const std::string &path, Extractor extract) {
-  const crow::json::rvalue json = crow::json::load(body);
-  if (!json || json.t() != crow::json::type::Object) {
+  const Json::Value json = json_util::parseOrNull(body);
+  if (json.isNull() || !json.isObject()) {
     return media_library::Result<T>::failure(invalid_json(path));
   }
-  if (json.has("code") && is_number(json["code"])) {
-    const std::int64_t code = static_cast<std::int64_t>(json["code"].i());
+  if (json.isMember("code") && is_number(json["code"])) {
+    const std::int64_t code = static_cast<std::int64_t>(json["code"].asInt64());
     if (code != 200) {
       return media_library::Result<T>::failure(platform_error(path, code));
     }
@@ -362,8 +361,8 @@ NeteaseClient::login_status(const media_library::CallContext &ctx) {
     return media_library::Result<NeteaseLoginStatus>::failure(body.error());
   }
 
-  const crow::json::rvalue json = crow::json::load(body.value());
-  if (!json || json.t() != crow::json::type::Object) {
+  const Json::Value json = json_util::parseOrNull(body.value());
+  if (json.isNull() || !json.isObject()) {
     return media_library::Result<NeteaseLoginStatus>::failure(
         invalid_json("/login/status"));
   }
@@ -371,31 +370,31 @@ NeteaseClient::login_status(const media_library::CallContext &ctx) {
   NeteaseLoginStatus status;
   // 该端点的语义是 {"data":{"code":200,"account":...}}；
   // 兼容极老版本直接给顶层 account。
-  const crow::json::rvalue &payload =
-      json.has("data") && json["data"].t() == crow::json::type::Object
+  const Json::Value &payload =
+      json.isMember("data") && json["data"].isObject()
           ? json["data"]
           : json;
 
-  if (payload.has("account") &&
-      payload["account"].t() != crow::json::type::Null &&
-      payload["account"].t() == crow::json::type::Object) {
-    const crow::json::rvalue &account = payload["account"];
+  if (payload.isMember("account") &&
+      !payload["account"].isNull() &&
+      payload["account"].isObject()) {
+    const Json::Value &account = payload["account"];
     status.authenticated = true;
-    if (account.has("id") && account["id"].t() == crow::json::type::Number) {
-      status.user_id = static_cast<std::int64_t>(account["id"].i());
+    if (account.isMember("id") && account["id"].isNumeric()) {
+      status.user_id = static_cast<std::int64_t>(account["id"].asInt64());
     }
-    if (account.has("vipType") &&
-        account["vipType"].t() == crow::json::type::Number) {
-      status.vip_type = static_cast<int>(account["vipType"].i());
+    if (account.isMember("vipType") &&
+        account["vipType"].isNumeric()) {
+      status.vip_type = static_cast<int>(account["vipType"].asInt64());
     }
   }
 
-  if (payload.has("profile") &&
-      payload["profile"].t() == crow::json::type::Object) {
-    const crow::json::rvalue &profile = payload["profile"];
-    if (profile.has("nickname") &&
-        profile["nickname"].t() == crow::json::type::String) {
-      status.nickname = profile["nickname"].s();
+  if (payload.isMember("profile") &&
+      payload["profile"].isObject()) {
+    const Json::Value &profile = payload["profile"];
+    if (profile.isMember("nickname") &&
+        profile["nickname"].isString()) {
+      status.nickname = profile["nickname"].asString();
     }
   }
 
@@ -414,14 +413,14 @@ NeteaseClient::song_detail(const std::vector<std::int64_t> &ids,
     return Result::failure(body.error());
   }
   return parse_body<std::vector<NeteaseSong>>(
-      body.value(), "/song/detail", [](const crow::json::rvalue &json) {
+      body.value(), "/song/detail", [](const Json::Value &json) {
         std::vector<NeteaseSong> songs;
-        if (!json.has("songs") || !is_list(json["songs"])) {
+        if (!json.isMember("songs") || !is_list(json["songs"])) {
           return songs;
         }
-        const crow::json::rvalue &list = json["songs"];
+        const Json::Value &list = json["songs"];
         songs.reserve(list.size());
-        for (std::size_t i = 0; i < list.size(); ++i) {
+        for (Json::ArrayIndex i = 0; i < list.size(); ++i) {
           NeteaseSong song = parse_song(list[i]);
           if (song.id > 0) {
             songs.push_back(std::move(song));
@@ -443,16 +442,16 @@ NeteaseClient::album(std::int64_t id, const media_library::CallContext &ctx) {
     return Result::failure(body.error());
   }
   return parse_body<NeteaseAlbum>(
-      body.value(), "/album", [](const crow::json::rvalue &json) {
+      body.value(), "/album", [](const Json::Value &json) {
         NeteaseAlbum album;
-        if (json.has("album")) {
+        if (json.isMember("album")) {
           album.brief = parse_album_brief(json["album"]);
         }
         // 实测曲目在顶层 songs[]，album.songs 为空数组。
-        if (json.has("songs") && is_list(json["songs"])) {
-          const crow::json::rvalue &list = json["songs"];
+        if (json.isMember("songs") && is_list(json["songs"])) {
+          const Json::Value &list = json["songs"];
           album.songs.reserve(list.size());
-          for (std::size_t i = 0; i < list.size(); ++i) {
+          for (Json::ArrayIndex i = 0; i < list.size(); ++i) {
             NeteaseSong song = parse_song(list[i]);
             if (song.id > 0) {
               album.songs.push_back(std::move(song));
@@ -476,9 +475,9 @@ NeteaseClient::artist(std::int64_t id, const media_library::CallContext &ctx) {
     return Result::failure(body.error());
   }
   return parse_body<NeteaseArtist>(
-      body.value(), "/artists", [](const crow::json::rvalue &json) {
+      body.value(), "/artists", [](const Json::Value &json) {
         NeteaseArtist artist;
-        if (json.has("artist")) {
+        if (json.isMember("artist")) {
           artist = parse_artist(json["artist"]);
         }
         return artist;
@@ -503,13 +502,13 @@ NeteaseClient::artist_albums(std::int64_t id, int limit, int offset,
     return Result::failure(body.error());
   }
   return parse_body<NeteasePage<NeteaseAlbumBrief>>(
-      body.value(), "/artist/album", [](const crow::json::rvalue &json) {
+      body.value(), "/artist/album", [](const Json::Value &json) {
         NeteasePage<NeteaseAlbumBrief> page;
         page.has_more = field_bool(json, "more");
-        if (json.has("hotAlbums") && is_list(json["hotAlbums"])) {
-          const crow::json::rvalue &list = json["hotAlbums"];
+        if (json.isMember("hotAlbums") && is_list(json["hotAlbums"])) {
+          const Json::Value &list = json["hotAlbums"];
           page.items.reserve(list.size());
-          for (std::size_t i = 0; i < list.size(); ++i) {
+          for (Json::ArrayIndex i = 0; i < list.size(); ++i) {
             NeteaseAlbumBrief album = parse_album_brief(list[i]);
             if (album.id > 0) {
               page.items.push_back(std::move(album));
@@ -537,18 +536,18 @@ NeteaseClient::search_songs(const std::string &keywords, int limit, int offset,
     return Result::failure(body.error());
   }
   return parse_body<NeteasePage<NeteaseSong>>(
-      body.value(), "/cloudsearch", [offset](const crow::json::rvalue &json) {
+      body.value(), "/cloudsearch", [offset](const Json::Value &json) {
         NeteasePage<NeteaseSong> page;
-        if (!json.has("result") || !is_object(json["result"])) {
+        if (!json.isMember("result") || !is_object(json["result"])) {
           return page;
         }
-        const crow::json::rvalue &result = json["result"];
-        if (!result.has("songs") || !is_list(result["songs"])) {
+        const Json::Value &result = json["result"];
+        if (!result.isMember("songs") || !is_list(result["songs"])) {
           return page;
         }
-        const crow::json::rvalue &list = result["songs"];
+        const Json::Value &list = result["songs"];
         page.items.reserve(list.size());
-        for (std::size_t i = 0; i < list.size(); ++i) {
+        for (Json::ArrayIndex i = 0; i < list.size(); ++i) {
           NeteaseSong song = parse_song(list[i]);
           if (song.id > 0) {
             page.items.push_back(std::move(song));
@@ -581,18 +580,18 @@ NeteaseClient::search_albums(const std::string &keywords, int limit,
     return Result::failure(body.error());
   }
   return parse_body<NeteasePage<NeteaseAlbumBrief>>(
-      body.value(), "/cloudsearch", [offset](const crow::json::rvalue &json) {
+      body.value(), "/cloudsearch", [offset](const Json::Value &json) {
         NeteasePage<NeteaseAlbumBrief> page;
-        if (!json.has("result") || !is_object(json["result"])) {
+        if (!json.isMember("result") || !is_object(json["result"])) {
           return page;
         }
-        const crow::json::rvalue &result = json["result"];
-        if (!result.has("albums") || !is_list(result["albums"])) {
+        const Json::Value &result = json["result"];
+        if (!result.isMember("albums") || !is_list(result["albums"])) {
           return page;
         }
-        const crow::json::rvalue &list = result["albums"];
+        const Json::Value &list = result["albums"];
         page.items.reserve(list.size());
-        for (std::size_t i = 0; i < list.size(); ++i) {
+        for (Json::ArrayIndex i = 0; i < list.size(); ++i) {
           NeteaseAlbumBrief album = parse_album_brief(list[i]);
           if (album.id > 0) {
             page.items.push_back(std::move(album));
@@ -624,18 +623,18 @@ NeteaseClient::search_artists(const std::string &keywords, int limit,
     return Result::failure(body.error());
   }
   return parse_body<NeteasePage<NeteaseArtist>>(
-      body.value(), "/cloudsearch", [offset](const crow::json::rvalue &json) {
+      body.value(), "/cloudsearch", [offset](const Json::Value &json) {
         NeteasePage<NeteaseArtist> page;
-        if (!json.has("result") || !is_object(json["result"])) {
+        if (!json.isMember("result") || !is_object(json["result"])) {
           return page;
         }
-        const crow::json::rvalue &result = json["result"];
-        if (!result.has("artists") || !is_list(result["artists"])) {
+        const Json::Value &result = json["result"];
+        if (!result.isMember("artists") || !is_list(result["artists"])) {
           return page;
         }
-        const crow::json::rvalue &list = result["artists"];
+        const Json::Value &list = result["artists"];
         page.items.reserve(list.size());
-        for (std::size_t i = 0; i < list.size(); ++i) {
+        for (Json::ArrayIndex i = 0; i < list.size(); ++i) {
           NeteaseArtist artist = parse_artist(list[i]);
           if (artist.id > 0) {
             page.items.push_back(std::move(artist));
@@ -666,16 +665,16 @@ NeteaseClient::song_url(std::int64_t id, const std::string &level,
     return Result::failure(body.error());
   }
   return parse_body<NeteaseSongUrl>(
-      body.value(), "/song/url/v1", [](const crow::json::rvalue &json) {
+      body.value(), "/song/url/v1", [](const Json::Value &json) {
         NeteaseSongUrl url;
-        if (!json.has("data") || !is_list(json["data"])) {
+        if (!json.isMember("data") || !is_list(json["data"])) {
           return url;
         }
-        const crow::json::rvalue &list = json["data"];
+        const Json::Value &list = json["data"];
         if (list.size() == 0 || !is_object(list[0])) {
           return url;
         }
-        const crow::json::rvalue &item = list[0];
+        const Json::Value &item = list[0];
         url.url = field_string(item, "url");
         url.type = field_string(item, "type");
         url.bitrate = field_int64(item, "br");
@@ -686,13 +685,13 @@ NeteaseClient::song_url(std::int64_t id, const std::string &level,
         url.fee = static_cast<int>(field_int64(item, "fee"));
         url.code = static_cast<int>(field_int64(item, "code"));
         url.time_ms = field_int64(item, "time");
-        if (item.has("freeTrialInfo") && is_object(item["freeTrialInfo"])) {
-          const crow::json::rvalue &trial = item["freeTrialInfo"];
+        if (item.isMember("freeTrialInfo") && is_object(item["freeTrialInfo"])) {
+          const Json::Value &trial = item["freeTrialInfo"];
           url.free_trial = true;
           url.trial_end_seconds = field_int64(trial, "end");
-        } else if (item.has("freeTrialPrivilege") &&
+        } else if (item.isMember("freeTrialPrivilege") &&
                    is_object(item["freeTrialPrivilege"])) {
-          const crow::json::rvalue &trial = item["freeTrialPrivilege"];
+          const Json::Value &trial = item["freeTrialPrivilege"];
           // resConsumable=false 且不可重复试听时也算试听限制。
           if (field_bool(trial, "resConsumable", true) == false) {
             url.free_trial = true;
@@ -714,26 +713,26 @@ NeteaseClient::lyric(std::int64_t id, const media_library::CallContext &ctx) {
     return Result::failure(body.error());
   }
   return parse_body<NeteaseLyrics>(
-      body.value(), "/lyric/new", [](const crow::json::rvalue &json) {
+      body.value(), "/lyric/new", [](const Json::Value &json) {
         NeteaseLyrics lyrics;
         std::string lrc_text;
-        if (json.has("lrc") && is_object(json["lrc"])) {
+        if (json.isMember("lrc") && is_object(json["lrc"])) {
           lrc_text = field_string(json["lrc"], "lyric");
         }
-        if (json.has("tlyric") && is_object(json["tlyric"])) {
+        if (json.isMember("tlyric") && is_object(json["tlyric"])) {
           lyrics.translation = field_string(json["tlyric"], "lyric");
         }
-        if (json.has("romalrc") && is_object(json["romalrc"])) {
+        if (json.isMember("romalrc") && is_object(json["romalrc"])) {
           lyrics.romanization = field_string(json["romalrc"], "lyric");
         }
-        if (json.has("yrc") && is_object(json["yrc"])) {
+        if (json.isMember("yrc") && is_object(json["yrc"])) {
           lyrics.body = field_string(json["yrc"], "lyric");
         }
         if (lyrics.body.empty()) {
           lyrics.body = lrc_text;
         }
         // ytlrc 是逐字译文，比行级 tlyric 更准：有就优先用它。
-        if (json.has("ytlrc") && is_object(json["ytlrc"])) {
+        if (json.isMember("ytlrc") && is_object(json["ytlrc"])) {
           const std::string ytlrc = field_string(json["ytlrc"], "lyric");
           if (!ytlrc.empty()) {
             lyrics.translation = ytlrc;
@@ -761,14 +760,14 @@ NeteaseClient::user_playlists(const std::string &uid, int limit, int offset,
     return Result::failure(body.error());
   }
   return parse_body<NeteasePage<NeteasePlaylist>>(
-      body.value(), "/user/playlist", [](const crow::json::rvalue &json) {
+      body.value(), "/user/playlist", [](const Json::Value &json) {
         NeteasePage<NeteasePlaylist> page;
-        if (!json.has("playlist") || !is_list(json["playlist"])) {
+        if (!json.isMember("playlist") || !is_list(json["playlist"])) {
           return page;
         }
-        const crow::json::rvalue &list = json["playlist"];
+        const Json::Value &list = json["playlist"];
         page.items.reserve(list.size());
-        for (std::size_t i = 0; i < list.size(); ++i) {
+        for (Json::ArrayIndex i = 0; i < list.size(); ++i) {
           NeteasePlaylist playlist = parse_playlist(list[i]);
           if (playlist.id > 0) {
             page.items.push_back(std::move(playlist));
@@ -793,8 +792,8 @@ NeteaseClient::playlist(std::int64_t id, const media_library::CallContext &ctx) 
     return Result::failure(body.error());
   }
   return parse_body<NeteasePlaylist>(
-      body.value(), "/playlist/detail", [](const crow::json::rvalue &json) {
-        if (!json.has("playlist") || !is_object(json["playlist"])) {
+      body.value(), "/playlist/detail", [](const Json::Value &json) {
+        if (!json.isMember("playlist") || !is_object(json["playlist"])) {
           return NeteasePlaylist{};
         }
         return parse_playlist(json["playlist"]);
@@ -819,14 +818,14 @@ NeteaseClient::playlist_tracks(std::int64_t id, int limit, int offset,
     return Result::failure(body.error());
   }
   return parse_body<NeteasePage<NeteaseSong>>(
-      body.value(), "/playlist/track/all", [limit](const crow::json::rvalue &json) {
+      body.value(), "/playlist/track/all", [limit](const Json::Value &json) {
         NeteasePage<NeteaseSong> page;
-        if (!json.has("songs") || !is_list(json["songs"])) {
+        if (!json.isMember("songs") || !is_list(json["songs"])) {
           return page;
         }
-        const crow::json::rvalue &list = json["songs"];
+        const Json::Value &list = json["songs"];
         page.items.reserve(list.size());
-        for (std::size_t i = 0; i < list.size(); ++i) {
+        for (Json::ArrayIndex i = 0; i < list.size(); ++i) {
           NeteaseSong song = parse_song(list[i]);
           if (song.id > 0) {
             page.items.push_back(std::move(song));

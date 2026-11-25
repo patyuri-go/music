@@ -1,24 +1,24 @@
 #ifndef SERVICE_H
 #define SERVICE_H
 
-#include "crow/json.h"
+#include <json/json.h>
 #include <optional>
 #include <string>
 
 class Service {
 public:
   Service();
-  std::optional<crow::json::wvalue> query(const crow::json::rvalue &json);
-  std::optional<crow::json::wvalue> trackById(int id);
-  std::optional<crow::json::wvalue> albumById(int id);
-  std::optional<crow::json::wvalue> artistById(int id);
+  std::optional<Json::Value> query(const Json::Value &json);
+  std::optional<Json::Value> trackById(int id);
+  std::optional<Json::Value> albumById(int id);
+  std::optional<Json::Value> artistById(int id);
 
 private:
-  std::optional<crow::json::wvalue> home(const crow::json::rvalue &json);
-  std::optional<crow::json::wvalue> tag(const crow::json::rvalue &json);
-  std::optional<crow::json::wvalue> album(const crow::json::rvalue &json);
-  std::optional<crow::json::wvalue> artist(const crow::json::rvalue &json);
-  std::optional<crow::json::wvalue> search(const crow::json::rvalue &json);
+  std::optional<Json::Value> home(const Json::Value &json);
+  std::optional<Json::Value> tag(const Json::Value &json);
+  std::optional<Json::Value> album(const Json::Value &json);
+  std::optional<Json::Value> artist(const Json::Value &json);
+  std::optional<Json::Value> search(const Json::Value &json);
 };
 
 #endif

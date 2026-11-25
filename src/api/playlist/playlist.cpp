@@ -10,7 +10,9 @@
 #include <sstream>
 
 #include "config.h"
-#include "crow/json.h"
+#include <json/json.h>
+
+#include "json_util.h"
 #include "database.h"
 #include "db.h"
 #include "storage.h"
@@ -140,19 +142,19 @@ bool matchSong(db::Session &session, Song &s) {
 }
 
 std::string toJson(const Playlist &p) {
-  crow::json::wvalue w;
+  Json::Value w;
   w["id"] = p.id;
   w["name"] = p.name;
-  crow::json::wvalue::list songs;
+  Json::Value songs(Json::arrayValue);
   for (const auto &s : p.songs) {
-    crow::json::wvalue sw;
+    Json::Value sw;
     sw["path"] = s.path;
     sw["album"] = s.album;
     sw["album_artist"] = s.album_artist;
-    songs.emplace_back(std::move(sw));
+    songs.append(std::move(sw));
   }
-  w["songs"] = crow::json::wvalue(songs);
-  return w.dump();
+  w["songs"] = std::move(songs);
+  return json_util::dump(w);
 }
 
 bool saveLocked(const Playlist &p) {
@@ -172,30 +174,31 @@ Playlist parseFile(const fs::path &file) {
   }
   std::stringstream buf;
   buf << in.rdbuf();
-  auto j = crow::json::load(buf.str());
-  if (!j) {
+  auto parsed = json_util::parse(buf.str());
+  if (!parsed) {
     return p;
   }
-  if (j.has("id")) {
-    p.id = j["id"].s();
+  const Json::Value &j = *parsed;
+  if (j.isMember("id")) {
+    p.id = j["id"].asString();
   }
   if (p.id.empty()) {
     p.id = file.stem().string();
   }
-  if (j.has("name")) {
-    p.name = j["name"].s();
+  if (j.isMember("name")) {
+    p.name = j["name"].asString();
   }
-  if (j.has("songs") && j["songs"].t() == crow::json::type::List) {
+  if (j.isMember("songs") && j["songs"].isArray()) {
     for (const auto &sj : j["songs"]) {
       Song s;
-      if (sj.has("path")) {
-        s.path = sj["path"].s();
+      if (sj.isMember("path")) {
+        s.path = sj["path"].asString();
       }
-      if (sj.has("album")) {
-        s.album = sj["album"].s();
+      if (sj.isMember("album")) {
+        s.album = sj["album"].asString();
       }
-      if (sj.has("album_artist")) {
-        s.album_artist = sj["album_artist"].s();
+      if (sj.isMember("album_artist")) {
+        s.album_artist = sj["album_artist"].asString();
       }
       if (!s.path.empty()) {
         p.songs.push_back(std::move(s));

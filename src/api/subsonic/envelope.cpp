@@ -1,6 +1,7 @@
 #include "api/subsonic/envelope.h"
 
 #include "http_util.h"
+#include "json_util.h"
 
 namespace subsonic {
 
@@ -27,31 +28,31 @@ std::string error_name(media_library::ErrorCode code) {
   return std::string(media_library::error_code_name(code));
 }
 
-crow::response json_response(const crow::json::wvalue &body) {
-  return http_util::jsonResponse(200, body.dump());
+http_server::ResponsePtr json_response(const Json::Value &body) {
+  return http_util::jsonResponse(200, json_util::dump(body));
 }
 
-crow::response failure_response(Code code, const std::string &message) {
-  crow::json::wvalue error;
+http_server::ResponsePtr failure_response(Code code, const std::string &message) {
+  Json::Value error;
   error["code"] = static_cast<int>(code);
   error["message"] = message;
 
-  crow::json::wvalue body;
+  Json::Value body;
   body["status"] = "failed";
   body["version"] = kApiVersion;
   body["type"] = "musicd";
   body["error"] = std::move(error);
 
-  crow::json::wvalue root;
+  Json::Value root;
   root["subsonic-response"] = std::move(body);
   // Subsonic 规范里错误也用 HTTP 200 返回，错误只在信包里。
   return json_response(root);
 }
 
-crow::response ok_response(crow::json::wvalue payload,
+http_server::ResponsePtr ok_response(Json::Value payload,
                            const std::string &server_name,
                            const std::string &server_version) {
-  crow::json::wvalue body;
+  Json::Value body;
   body["status"] = "ok";
   body["version"] = kApiVersion;
   body["type"] = server_name.empty() ? "musicd" : server_name;
@@ -59,13 +60,13 @@ crow::response ok_response(crow::json::wvalue payload,
   body["openSubsonic"] = true;
 
   // payload 展开到同一层（Subsonic 的负载就在 subsonic-response 里）。
-  if (payload.t() == crow::json::type::Object) {
-    for (const std::string &key : payload.keys()) {
+  if (payload.isObject()) {
+    for (const std::string &key : payload.getMemberNames()) {
       body[key] = std::move(payload[key]);
     }
   }
 
-  crow::json::wvalue root;
+  Json::Value root;
   root["subsonic-response"] = std::move(body);
   return json_response(root);
 }

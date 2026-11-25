@@ -129,7 +129,7 @@ public:
                                           "original", error)) {
           return make_file_stream(hit->string(), mime);
         }
-        CROW_LOG_DEBUG << "[artwork] image_cache ensure failed for "
+        DLOG_DEBUG << "[artwork] image_cache ensure failed for "
                        << *value.location.cache_virtual_path << ": " << error;
       }
     }
