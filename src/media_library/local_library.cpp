@@ -9,6 +9,7 @@
 
 #include "api/playlist/playlist.h"
 #include "json_util.h"
+#include "media_library/byte_stream.h"
 #include "media_library/lyric_parser.h"
 
 #include <algorithm>
@@ -834,6 +835,20 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
   source.range_supported = true;
   source.cacheable = false;
   source.access_mode = AccessMode::Proxy;
+
+  // 只查表就宣布「可出流」是不诚实的：存储服务可能不可达。这里先探一次
+  // （Range 0- 只取响应头，不拉正文），失败按 ProviderUnavailable 上报，
+  // 让 Router 的回退链接手；成功后真正的流由会话按需再开。
+  auto probe = make_http_stream(source.internal_locator, source.mime_type,
+                               source.content_length, source.range_supported);
+  if (!probe.ok()) {
+    return Result<PlaybackSource>::failure(probe.error());
+  }
+  const Status ready = probe.value()->prepare();
+  if (!ready.ok()) {
+    return Result<PlaybackSource>::failure(ready.error());
+  }
+
   return Result<PlaybackSource>::success(std::move(source));
 }
 
