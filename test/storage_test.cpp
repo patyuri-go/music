@@ -85,7 +85,8 @@ int main(int argc, char **argv) {
   const std::string album_null_ref = fixture("FIXTURE_ALBUM_NULL_REF");
   const std::string track_ref = fixture("FIXTURE_TRACK_ROLE_REF");
   const std::string track_plain_ref = fixture("FIXTURE_TRACK_PLAIN_REF");
-  const std::string track_null_ref = fixture("FIXTURE_TRACK_NULL_REF");
+  const std::string track_unlinked_ref =
+      fixture("FIXTURE_TRACK_UNLINKED_NULL_REF");
   const std::string track_entity = fixture("FIXTURE_TRACK_ROLE_ENTITY");
   const std::string plain_entity = fixture("FIXTURE_TRACK_PLAIN_ENTITY");
 
@@ -178,9 +179,11 @@ int main(int argc, char **argv) {
         "304 保留 Cache-Control");
 
   std::cout << "\n== 空 entity_id 硬失败 ==\n";
-  const Response null_track = get(cfg, "/api/v1/tracks/" + track_null_ref +
+  // 12 号曲目挂到了跨库链接上（见 cross_library_test），这里用 14 号：
+  // 同样 entity_id 为 NULL，但没有链接，所以仍应硬失败。
+  const Response null_track = get(cfg, "/api/v1/tracks/" + track_unlinked_ref +
                                            "/stream");
-  check(null_track.status == 404, "track.entity_id 为 NULL -> 404");
+  check(null_track.status == 404, "无链接且 entity_id 为 NULL -> 404");
   const Response null_cover = get(cfg, "/api/album/" + album_null_ref +
                                          "/cover");
   check(null_cover.status == 404, "album.entity_id 为 NULL -> 404");

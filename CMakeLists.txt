@@ -192,6 +192,19 @@ target_include_directories(storage_test PRIVATE
 )
 musicd_test_target(storage_test)
 
+# 跨库取流：本地曲目在 entity_link 上挂到网易云，验证 Router 的回退链。
+# 由 run_integration.sh 驱动，**不**注册进 CTest。
+add_executable(cross_library_test
+  ./test/cross_library_test.cpp
+  ./src/json_util.cpp
+)
+target_link_libraries(cross_library_test PRIVATE Drogon::Drogon)
+target_include_directories(cross_library_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
+musicd_test_target(cross_library_test)
+
 # /api/query 类型守卫回归测试：走真实 HTTP，需要活的 musicd 与数据库。
 # 由 run_integration.sh 驱动，**不**注册进 CTest（ctest 必须保持纯单元）。
 add_executable(query_api_test
@@ -222,6 +235,17 @@ add_executable(fake_pg
   ./test/fake_pg/fake_pg.cpp
 )
 musicd_test_target(fake_pg)
+
+# 假网易云 API：只实现 musicd 会打到的端点，端口由内核分配并打印到 stdout。
+add_executable(fake_netease
+  ./test/fake_netease.cpp
+)
+target_link_libraries(fake_netease PRIVATE Drogon::Drogon)
+target_include_directories(fake_netease PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
+musicd_test_target(fake_netease)
 
 # 夹具写入/清理：直接连中央库，复用 config/db/schema/storage。
 add_executable(test_fixture
