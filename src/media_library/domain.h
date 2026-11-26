@@ -286,6 +286,8 @@ struct PlaybackSource {
   bool cacheable = false;
   std::vector<Restriction> restrictions;
   std::string internal_locator;
+  // 打开远端流时等待响应头的上限；0 表示除 libcurl 自身超时外不额外限制。
+  std::int64_t open_timeout_ms = 0;
 };
 
 struct PageRequest {

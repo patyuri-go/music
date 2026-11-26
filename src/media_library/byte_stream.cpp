@@ -107,7 +107,8 @@ class HttpByteStream final : public ByteStream {
 public:
   static Result<std::unique_ptr<ByteStream>>
   open(std::string locator, std::string mime_type,
-       std::optional<std::int64_t> size, bool seekable) {
+       std::optional<std::int64_t> size, bool seekable,
+       std::int64_t open_timeout_ms) {
     if (locator.empty()) {
       return Result<std::unique_ptr<ByteStream>>::failure(
           internal_error("byte stream has no locator"));
@@ -116,8 +117,8 @@ public:
     info.mime_type = std::move(mime_type);
     info.size_bytes = size.value_or(-1);
     info.seekable = seekable;
-    std::unique_ptr<ByteStream> stream(
-        new HttpByteStream(std::move(locator), std::move(info)));
+    std::unique_ptr<ByteStream> stream(new HttpByteStream(
+        std::move(locator), std::move(info), open_timeout_ms));
     return Result<std::unique_ptr<ByteStream>>::success(std::move(stream));
   }
 
@@ -181,8 +182,10 @@ public:
   }
 
 private:
-  HttpByteStream(std::string locator, StreamInfo info)
-      : locator_(std::move(locator)), info_(std::move(info)) {}
+  HttpByteStream(std::string locator, StreamInfo info,
+                 std::int64_t open_timeout_ms)
+      : locator_(std::move(locator)), info_(std::move(info)),
+        open_timeout_ms_(open_timeout_ms) {}
 
   bool ensure_open() {
     if (open_) {
@@ -199,14 +202,19 @@ private:
       extra.push_back("Range: bytes=" + std::to_string(offset_) + "-");
     }
     http_client::Stream stream =
-        http_client::openStream(base, base.path, extra);
+        http_client::openStream(base, base.path, extra, open_timeout_ms_);
     if (stream.status != 200 && stream.status != 206) {
       if (stream.close) {
         stream.close();
       }
-      open_error_ = Error::make(ErrorCode::ProviderUnavailable,
-                               "cannot open remote stream");
-      open_error_.retryable = stream.status == 0;
+      if (stream.timed_out) {
+        open_error_ = Error::make(ErrorCode::Timeout,
+                                 "remote stream timed out");
+      } else {
+        open_error_ = Error::make(ErrorCode::ProviderUnavailable,
+                                 "cannot open remote stream");
+        open_error_.retryable = stream.status == 0;
+      }
       return false;
     }
     if (info_.size_bytes < 0) {
@@ -247,6 +255,7 @@ private:
   std::string locator_;
   StreamInfo info_;
   std::int64_t offset_ = 0;
+  std::int64_t open_timeout_ms_ = 0;
   http_client::Stream handle_;
   bool open_ = false;
   Error open_error_;
@@ -261,9 +270,10 @@ Result<std::unique_ptr<ByteStream>> make_file_stream(std::string path,
 
 Result<std::unique_ptr<ByteStream>>
 make_http_stream(std::string locator, std::string mime_type,
-                 std::optional<std::int64_t> size, bool seekable) {
+                 std::optional<std::int64_t> size, bool seekable,
+                 std::int64_t open_timeout_ms) {
   return HttpByteStream::open(std::move(locator), std::move(mime_type), size,
-                              seekable);
+                              seekable, open_timeout_ms);
 }
 
 } // namespace media_library

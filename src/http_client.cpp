@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -103,6 +104,8 @@ struct SharedStream {
   long status = 0;
   long long length = -1;
   std::map<std::string, std::string> headers;
+  int error = 0;
+  bool timed_out = false;
 
   void cancel() {
     {
@@ -323,7 +326,8 @@ Response Client::request(const std::string &method, const std::string &path,
 }
 
 Stream openStream(const Url &base, const std::string &path,
-                  const std::vector<std::string> &extra_headers) {
+                  const std::vector<std::string> &extra_headers,
+                  std::int64_t header_timeout_ms) {
   static std::once_flag curl_once;
   std::call_once(curl_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
   auto shared = std::make_shared<SharedStream>();
@@ -340,6 +344,7 @@ Stream openStream(const Url &base, const std::string &path,
     if (handle == nullptr) {
       std::lock_guard<std::mutex> lock(shared->mutex);
       shared->failed = true;
+      shared->error = static_cast<int>(CURLE_FAILED_INIT);
       shared->finished = true;
       shared->headers_ready = true;
       shared->cv.notify_all();
@@ -367,6 +372,7 @@ Stream openStream(const Url &base, const std::string &path,
       shared->headers_ready = true;
       if (code != CURLE_OK) {
         shared->failed = true;
+        shared->error = static_cast<int>(code);
       }
       if (shared->status == 0 && code == CURLE_OK) {
         long status = 0;
@@ -385,7 +391,21 @@ Stream openStream(const Url &base, const std::string &path,
 
   {
     std::unique_lock<std::mutex> lock(shared->mutex);
-    shared->cv.wait(lock, [&shared] { return shared->headers_ready; });
+    const auto ready = [&shared] { return shared->headers_ready; };
+    if (header_timeout_ms > 0) {
+      if (!shared->cv.wait_for(
+              lock, std::chrono::milliseconds(header_timeout_ms), ready)) {
+        // 响应头迟迟不来：让生产者尽快收手，并把这次失败标成超时。
+        shared->timed_out = true;
+        shared->failed = true;
+        shared->cancelled = true;
+        lock.unlock();
+        shared->cv.notify_all();
+        lock.lock();
+      }
+    } else {
+      shared->cv.wait(lock, ready);
+    }
   }
 
   Stream stream;
@@ -394,6 +414,8 @@ Stream openStream(const Url &base, const std::string &path,
     stream.status = static_cast<int>(shared->status);
     stream.length = shared->length;
     stream.headers = shared->headers;
+    stream.error = shared->error;
+    stream.timed_out = shared->timed_out;
   }
   stream.read = [shared](char *buf, std::size_t n) -> long long {
     if (n == 0) {

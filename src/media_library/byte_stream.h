@@ -55,9 +55,11 @@ Result<std::unique_ptr<ByteStream>> make_file_stream(std::string path,
 // 远端（http/https/WebDAV）流。连接惰性建立；seek 靠带 Range 重开连接。
 // `size` 未知时传 nullopt 或 -1，运行时从响应头补齐。
 // `seekable=false` 表示源明确不支持 Range（此时拒绝非零 seek）。
+// `open_timeout_ms > 0` 时限制等待响应头的时间；超时按 ErrorCode::Timeout 上报。
 Result<std::unique_ptr<ByteStream>> make_http_stream(
     std::string locator, std::string mime_type,
-    std::optional<std::int64_t> size = std::nullopt, bool seekable = true);
+    std::optional<std::int64_t> size = std::nullopt, bool seekable = true,
+    std::int64_t open_timeout_ms = 0);
 
 } // namespace media_library
 

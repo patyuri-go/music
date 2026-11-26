@@ -750,6 +750,8 @@ std::string content_url(const std::string &entity_id) {
   return api_url(trim(entity_id));
 }
 
+int timeout_ms() { return g_options.timeout_ms; }
+
 bool valid_entity_id(const std::string &entity_id) {
   const std::string id = trim(entity_id);
   if (id.size() != 36) {

@@ -1,6 +1,7 @@
 #ifndef HTTP_CLIENT_H
 #define HTTP_CLIENT_H
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
@@ -64,11 +65,19 @@ struct Stream {
   int status = 0;
   long long length = -1;
   std::map<std::string, std::string> headers;
+  // libcurl 的 CURLcode；0 表示没有传输错误。
+  int error = 0;
+  // 等待响应头是否超时。与正文耗时无关。
+  bool timed_out = false;
 };
 
 // 打开一个 GET 流（支持 Range 透传）。返回时响应头已就绪；失败时 status 为 0。
+//
+// `header_timeout_ms` 只限制「响应头就绪」的等待：上游连上了却不回包时，
+// 不能让调用方无限挂着。正文不设总时长上限，否则长音频会被截断。
 Stream openStream(const Url &base, const std::string &path,
-                  const std::vector<std::string> &extra_headers);
+                  const std::vector<std::string> &extra_headers,
+                  std::int64_t header_timeout_ms = 0);
 
 } // namespace http_client
 

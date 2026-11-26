@@ -34,6 +34,9 @@ bool valid_entity_id(const std::string &entity_id);
 // 存储服务的内容地址；配置里的 host/port/scheme 决定前缀。
 std::string content_url(const std::string &entity_id);
 
+// 配置里的超时（毫秒）。多来源路由拿它约束「探测响应头」的等待时间。
+int timeout_ms();
+
 // 异步代理一次内容请求。
 //
 // - entity_id：track.entity_id（音频）或 album.entity_id（封面）的 UUID。
