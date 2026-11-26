@@ -5,10 +5,12 @@
 #include "json_util.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -84,17 +86,37 @@ std::string field_string(const Json::Value &object, const char *key) {
   return std::string(value.asString());
 }
 
-// cd 可能是字符串 "1"，i() 同时接受 Number 与 String。
+// 平台对同一字段可能给数字，也可能给字符串（cd 是最典型的一例）。
+// jsoncpp 的 asInt64() 只接受数值类型，遇到字符串会抛
+// "Value is not convertible to Int64."，所以字符串必须自己解析：
+// from_chars 不抛异常、不受 locale 影响，非数字串与溢出都回退默认值。
+std::int64_t parse_int64(const std::string &text, std::int64_t fallback) {
+  if (text.empty()) {
+    return fallback;
+  }
+  std::int64_t value = 0;
+  const char *first = text.data();
+  const char *last = first + text.size();
+  const std::from_chars_result result = std::from_chars(first, last, value);
+  if (result.ec != std::errc() || result.ptr != last) {
+    return fallback;
+  }
+  return value;
+}
+
 std::int64_t field_int64(const Json::Value &object, const char *key,
                          std::int64_t fallback = 0) {
   if (!is_object(object) || !object.isMember(key)) {
     return fallback;
   }
   const Json::Value &value = object[key];
-  if (!is_number(value) && !is_string(value)) {
-    return fallback;
+  if (is_number(value)) {
+    return static_cast<std::int64_t>(value.asInt64());
   }
-  return static_cast<std::int64_t>(value.asInt64());
+  if (is_string(value)) {
+    return parse_int64(value.asString(), fallback);
+  }
+  return fallback;
 }
 
 bool field_bool(const Json::Value &object, const char *key,
