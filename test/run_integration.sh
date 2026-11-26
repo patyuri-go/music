@@ -6,11 +6,13 @@
 #   ./test/run_integration.sh [config.json]
 #
 # 前置：cmake --build --preset default 已生成 build/bin/musicd 与
-#       build/bin/test/{fake_storage,test_fixture,playlist_test,...}。
+#       build/bin/test/{fake_pg,fake_storage,test_fixture,playlist_test,...}。
 # 使用独立端口，不干扰正在运行的 musicd：
 #   musicd 15667 / Jellyfin 19000 / Subsonic 14533 / fake_storage 15666
 #
-# 数据库来自传入的 config.json（默认 ./config.json），临时配置只改端口。
+# 不依赖真实的 PostgreSQL 与存储服务：fake_pg 实现 PostgreSQL 线协议并内置
+# 夹具数据，fake_storage 按实体 id 返回确定字节；fake_pg 端口由内核分配。
+# 传入的 config.json 只用于取其余配置，临时配置里的数据库地址会被替换。
 
 set -uo pipefail
 
@@ -18,9 +20,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 SOURCE_CONFIG="${1:-$ROOT/config.json}"
+# config.json 被 gitignore。没有它也要能跑：下面会写一份最小配置。
+SOURCE_CONFIG_MISSING=0
 if [[ ! -f "$SOURCE_CONFIG" ]]; then
-  echo "找不到配置: $SOURCE_CONFIG" >&2
-  exit 2
+  SOURCE_CONFIG_MISSING=1
 fi
 
 MAIN_PORT=15667
@@ -30,7 +33,8 @@ STORAGE_PORT=15666
 BIN_DIR="$ROOT/build/bin"
 TEST_BIN_DIR="$BIN_DIR/test"
 
-for bin in "$BIN_DIR/musicd" "$TEST_BIN_DIR/fake_storage" "$TEST_BIN_DIR/test_fixture" \
+for bin in "$BIN_DIR/musicd" "$TEST_BIN_DIR/fake_pg" \
+           "$TEST_BIN_DIR/fake_storage" "$TEST_BIN_DIR/test_fixture" \
            "$TEST_BIN_DIR/playlist_test" "$TEST_BIN_DIR/lyrics_test" \
            "$TEST_BIN_DIR/artists_test" "$TEST_BIN_DIR/storage_test" \
            "$TEST_BIN_DIR/query_api_test"; do
@@ -45,13 +49,55 @@ TMP_CONFIG="$TMP_DIR/config.json"
 LOG_DIR="$TMP_DIR/logs"
 mkdir -p "$LOG_DIR"
 
-# 只替换端口与超时；数据库等其余配置原样保留。
+if [[ $SOURCE_CONFIG_MISSING -eq 1 ]]; then
+  echo "未找到 $SOURCE_CONFIG，使用内置最小配置"
+  SOURCE_CONFIG="$TMP_DIR/base.json"
+  cat > "$SOURCE_CONFIG" <<'JSON'
+{
+  "main_port": 15667,
+  "page_size": 50,
+  "static_dir": "web",
+  "jellyfin": { "enabled": true, "port": 9000 },
+  "subsonic": { "enabled": true, "port": 4533 },
+  "db": {
+    "PostgreSQL": {
+      "url": "postgresql://127.0.0.1:5432/music",
+      "user": "musicd",
+      "dbname": "music"
+    }
+  },
+  "libraries": [
+    { "type": "local", "id": "local-main", "storage_port": 15666,
+      "storage_timeout_ms": 5000 }
+  ]
+}
+JSON
+fi
+
+PG_PID=""
+echo "== 启动 fake_pg（端口由内核分配）=="
+"$TEST_BIN_DIR/fake_pg" --port 0 > "$LOG_DIR/fake_pg.log" 2>&1 &
+PG_PID=$!
+PG_PORT=""
+for ((i = 0; i < 100; ++i)); do
+  PG_PORT="$(sed -n 's/^listening \([0-9]\+\)$/\1/p' "$LOG_DIR/fake_pg.log" | head -1)"
+  [[ -n "$PG_PORT" ]] && break
+  sleep 0.1
+done
+if [[ -z "$PG_PORT" ]]; then
+  echo "fake_pg 未启动" >&2
+  cat "$LOG_DIR/fake_pg.log" >&2
+  exit 1
+fi
+
+# 只替换端口、超时与数据库地址；其余配置原样保留。
 sed \
   -e "s/\"main_port\":[[:space:]]*[0-9]\+/\"main_port\": $MAIN_PORT/" \
   -e "s/\"port\":[[:space:]]*9000/\"port\": $JF_PORT/" \
   -e "s/\"port\":[[:space:]]*4533/\"port\": 14533/" \
   -e "s/\"storage_port\":[[:space:]]*[0-9]\+/\"storage_port\": $STORAGE_PORT/" \
   -e "s/\"storage_timeout_ms\":[[:space:]]*[0-9]\+/\"storage_timeout_ms\": 1200/" \
+  -e "s#postgresql://[^\"]*#postgresql://127.0.0.1:$PG_PORT/music#" \
   "$SOURCE_CONFIG" > "$TMP_CONFIG"
 
 FAKE_PID=""
@@ -67,9 +113,10 @@ cleanup() {
     kill "$FAKE_PID" 2>/dev/null
     wait "$FAKE_PID" 2>/dev/null
   fi
-  if [[ -x "$TEST_BIN_DIR/test_fixture" ]]; then
-    "$TEST_BIN_DIR/test_fixture" cleanup --config "$TMP_CONFIG" \
-      > "$LOG_DIR/cleanup.log" 2>&1 || true
+  # fake_pg 每连接一个子进程；父进程退出后子进程随客户端断开自行结束。
+  if [[ -n "$PG_PID" ]] && kill -0 "$PG_PID" 2>/dev/null; then
+    kill "$PG_PID" 2>/dev/null
+    wait "$PG_PID" 2>/dev/null
   fi
   if [[ $code -eq 0 ]]; then
     rm -rf "$TMP_DIR"
@@ -108,10 +155,10 @@ if ! port_ready "$STORAGE_PORT"; then
   exit 1
 fi
 
-echo "== 写入夹具 =="
+echo "== 夹具 id（fake_pg 内置数据）=="
 set -a
 # shellcheck disable=SC1090
-eval "$("$TEST_BIN_DIR/test_fixture" seed --config "$TMP_CONFIG")"
+eval "$("$TEST_BIN_DIR/test_fixture" env)"
 set +a
 
 echo "== 启动 musicd (:${MAIN_PORT}) =="

@@ -215,6 +215,13 @@ target_include_directories(fake_storage PRIVATE
 )
 musicd_test_target(fake_storage)
 
+# 假 PostgreSQL 服务端：纯 POSIX socket 实现最小 wire protocol，
+# 让集成测试在没有真实数据库的环境里也能跑。不链接 Drogon / SOCI。
+add_executable(fake_pg
+  ./test/fake_pg/fake_pg.cpp
+)
+musicd_test_target(fake_pg)
+
 # 夹具写入/清理：直接连中央库，复用 config/db/schema/storage。
 add_executable(test_fixture
   ./test/test_fixture.cpp
