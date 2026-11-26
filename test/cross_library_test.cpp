@@ -244,8 +244,8 @@ int main(int argc, char **argv) {
 
   std::cout << "\n== 本地有实体但存储读不到 ==\n";
   // 10 号曲目的 entity_id 非空，并挂在 2 号链接上（远端 186018）。
-  // 本地 resolve_playback 只查 DB、不探存储，所以它一定「解析成功」；
-  // 这里把存储打成 500，看路由会不会改用备份源。
+  // 本地 resolve_playback 会先探一次存储（Range 0-），所以这里把存储打成
+  // 500 后它报 ProviderUnavailable，路由按 should_fall_back 换网易云。
   const std::string entity_ref = requireEnv("FIXTURE_TRACK_ROLE_REF");
   const std::string entity_id = requireEnv("FIXTURE_TRACK_ROLE_ENTITY");
   const Response broke = controlStorage(cfg, entity_id, R"({"status":500})");
