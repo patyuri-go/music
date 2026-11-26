@@ -12,9 +12,13 @@ add_executable(unit_tests
   ./amll_ttml_test.cpp
   ./netease_client_numeric_test.cpp
   ./json_util_test.cpp
+  ./router_test.cpp
   ${PROJECT_SOURCE_DIR}/src/api/api-enhanced/client.cpp
   ${PROJECT_SOURCE_DIR}/src/json_util.cpp
   ${PROJECT_SOURCE_DIR}/src/media_library/source_ref.cpp
+  ${PROJECT_SOURCE_DIR}/src/media_library/aspect.cpp
+  ${PROJECT_SOURCE_DIR}/src/media_library/registry.cpp
+  ${PROJECT_SOURCE_DIR}/src/media_library/router.cpp
   ${PROJECT_SOURCE_DIR}/src/tools/amll_ttml.cpp
 )
 
