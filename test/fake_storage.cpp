@@ -1,6 +1,6 @@
 // 测试用存储服务：按实体 id 返回确定字节，验证 musicd 的代理行为。
 //
-//   ./fake_storage [port]        # 默认 15666
+//   build/bin/test/fake_storage [port]        # 默认 15666
 //
 // 端点：
 //   GET|HEAD /api/entities/{id}/content   单区间 Range；206/416 语义与上游一致

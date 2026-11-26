@@ -1,5 +1,6 @@
 // 存储代理验收测试：Range、封面类型、空实体、上游故障映射、路由兼容。
 //
+// 用法：build/bin/test/storage_test [host] [port] [storage_port]
 // 依赖 run_integration.sh 导出的夹具环境变量与假存储控制端点。
 // 退出码 0 表示全部通过。
 

@@ -1,6 +1,6 @@
 // 艺术家关系测试（夹具驱动）：曲目通过 track_artist 关联多个艺术家。
 //
-// 用法：./artists_test [host] [port]（默认 127.0.0.1:5667）
+// 用法：build/bin/test/artists_test [host] [port]（默认 127.0.0.1:5667）
 // 依赖 test_fixture seed 导出的环境变量。
 
 #include "test_http.h"

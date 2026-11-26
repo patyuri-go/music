@@ -12,5 +12,20 @@
         "VCPKG_TARGET_TRIPLET": "x64-linux-static"
       }
     }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
   ]
 }

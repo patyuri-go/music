@@ -20,7 +20,7 @@ target_link_libraries(unit_tests PRIVATE
 )
 
 set_target_properties(unit_tests PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  RUNTIME_OUTPUT_DIRECTORY "${MUSICD_TEST_BIN_DIR}"
 )
 
 include(GoogleTest)

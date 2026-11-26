@@ -5,7 +5,8 @@
 #
 #   ./test/run_integration.sh [config.json]
 #
-# 前置：cmake --build build 已生成 ./musicd ./fake_storage ./test_fixture 等。
+# 前置：cmake --build --preset default 已生成 build/bin/musicd 与
+#       build/bin/test/{fake_storage,test_fixture,playlist_test,...}。
 # 使用独立端口，不干扰正在运行的 musicd：
 #   musicd 15667 / Jellyfin 19000 / Subsonic 14533 / fake_storage 15666
 #
@@ -26,9 +27,14 @@ MAIN_PORT=15667
 JF_PORT=19000
 STORAGE_PORT=15666
 
-for bin in musicd fake_storage test_fixture playlist_test lyrics_test artists_test storage_test; do
-  if [[ ! -x "$ROOT/$bin" ]]; then
-    echo "缺少可执行文件 $ROOT/$bin（先构建）" >&2
+BIN_DIR="$ROOT/build/bin"
+TEST_BIN_DIR="$BIN_DIR/test"
+
+for bin in "$BIN_DIR/musicd" "$TEST_BIN_DIR/fake_storage" "$TEST_BIN_DIR/test_fixture" \
+           "$TEST_BIN_DIR/playlist_test" "$TEST_BIN_DIR/lyrics_test" \
+           "$TEST_BIN_DIR/artists_test" "$TEST_BIN_DIR/storage_test"; do
+  if [[ ! -x "$bin" ]]; then
+    echo "缺少可执行文件 $bin（先运行 cmake --build --preset default）" >&2
     exit 2
   fi
 done
@@ -60,8 +66,8 @@ cleanup() {
     kill "$FAKE_PID" 2>/dev/null
     wait "$FAKE_PID" 2>/dev/null
   fi
-  if [[ -x "$ROOT/test_fixture" ]]; then
-    "$ROOT/test_fixture" cleanup --config "$TMP_CONFIG" \
+  if [[ -x "$TEST_BIN_DIR/test_fixture" ]]; then
+    "$TEST_BIN_DIR/test_fixture" cleanup --config "$TMP_CONFIG" \
       > "$LOG_DIR/cleanup.log" 2>&1 || true
   fi
   if [[ $code -eq 0 ]]; then
@@ -88,7 +94,7 @@ wait_http() {
 }
 
 echo "== 启动 fake_storage (:${STORAGE_PORT}) =="
-"$ROOT/fake_storage" "$STORAGE_PORT" > "$LOG_DIR/fake_storage.log" 2>&1 &
+"$TEST_BIN_DIR/fake_storage" "$STORAGE_PORT" > "$LOG_DIR/fake_storage.log" 2>&1 &
 FAKE_PID=$!
 if ! port_ready "$STORAGE_PORT"; then
   for ((i = 0; i < 50; ++i)); do
@@ -104,11 +110,11 @@ fi
 echo "== 写入夹具 =="
 set -a
 # shellcheck disable=SC1090
-eval "$("$ROOT/test_fixture" seed --config "$TMP_CONFIG")"
+eval "$("$TEST_BIN_DIR/test_fixture" seed --config "$TMP_CONFIG")"
 set +a
 
 echo "== 启动 musicd (:${MAIN_PORT}) =="
-"$ROOT/musicd" --config "$TMP_CONFIG" > "$LOG_DIR/musicd.log" 2>&1 &
+"$BIN_DIR/musicd" --config "$TMP_CONFIG" > "$LOG_DIR/musicd.log" 2>&1 &
 MUSICD_PID=$!
 
 if ! wait_http "$MAIN_PORT" "http://127.0.0.1:${MAIN_PORT}/api/playlists"; then
@@ -133,10 +139,10 @@ run() {
   fi
 }
 
-run "播放列表" "$ROOT/playlist_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
-run "歌词" "$ROOT/lyrics_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
-run "艺术家" "$ROOT/artists_test" 127.0.0.1 "$MAIN_PORT"
-run "存储代理" "$ROOT/storage_test" 127.0.0.1 "$MAIN_PORT" "$STORAGE_PORT"
+run "播放列表" "$TEST_BIN_DIR/playlist_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
+run "歌词" "$TEST_BIN_DIR/lyrics_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
+run "艺术家" "$TEST_BIN_DIR/artists_test" 127.0.0.1 "$MAIN_PORT"
+run "存储代理" "$TEST_BIN_DIR/storage_test" 127.0.0.1 "$MAIN_PORT" "$STORAGE_PORT"
 
 echo
 if [[ $FAILED -eq 0 ]]; then

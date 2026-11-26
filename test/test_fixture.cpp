@@ -1,7 +1,7 @@
 // 集成测试夹具：直接向中央库写入固定数据，或按前缀清理。
 //
-//   ./test_fixture seed    [--config /path/to/config.json]
-//   ./test_fixture cleanup [--config /path/to/config.json]
+//   build/bin/test/test_fixture seed    [--config /path/to/config.json]
+//   build/bin/test/test_fixture cleanup [--config /path/to/config.json]
 //
 // seed 成功后向 stdout 输出 shell 可 eval 的 KEY='VALUE' 行；
 // 测试脚本据此拿到真实行 id。所有数据都带 __fixture__ 前缀，可重复执行。

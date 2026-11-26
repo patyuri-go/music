@@ -1,6 +1,6 @@
 // 播放列表接口测试（夹具驱动，走真实 HTTP）。
 //
-// 用法：./playlist_test [host] [port] [jellyfin_port]
+// 用法：build/bin/test/playlist_test [host] [port] [jellyfin_port]
 //       默认 127.0.0.1:5667 / :9000
 //
 // 退出码：0 表示全部通过，非 0 表示有失败。

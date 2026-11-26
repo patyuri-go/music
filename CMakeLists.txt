@@ -5,7 +5,29 @@ enable_testing()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_BUILD_TYPE Release)
+
+# 构建类型由 preset / 命令行决定；只有完全没指定时才回退 Release。
+# 不要无条件 set(CMAKE_BUILD_TYPE ...)，那会遮蔽 preset 里的缓存变量。
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "构建类型" FORCE)
+endif()
+
+# ---------------------------------------------------------------------------
+# 产物布局：生产二进制进 build/bin，测试相关可执行文件进 build/bin/test。
+#
+# 旧行为是全部输出到仓库根，导致根目录堆满二进制且 .gitignore 需要逐条列举。
+# 这里用全局默认值管生产 target，测试 target 用 musicd_test_target() 覆盖。
+# ---------------------------------------------------------------------------
+set(MUSICD_BIN_DIR "${CMAKE_BINARY_DIR}/bin")
+set(MUSICD_TEST_BIN_DIR "${MUSICD_BIN_DIR}/test")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${MUSICD_BIN_DIR}")
+
+# 测试/测试辅助程序统一输出目录。
+function(musicd_test_target target)
+  set_target_properties(${target} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${MUSICD_TEST_BIN_DIR}"
+  )
+endfunction()
 
 # ---------------------------------------------------------------------------
 # vcpkg manifest 模式
@@ -99,10 +121,6 @@ find_package(PostgreSQL REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
 
-set_target_properties(musicd PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
-
 target_compile_options(musicd PRIVATE -g)
 
 # sqlite3 直接用于 src/db/soci_session.cpp（#include <sqlite3.h>），
@@ -138,9 +156,7 @@ target_include_directories(playlist_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/test
 )
-set_target_properties(playlist_test PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
+musicd_test_target(playlist_test)
 
 add_executable(lyrics_test
   ./test/lyrics_test.cpp
@@ -151,9 +167,7 @@ target_include_directories(lyrics_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/test
 )
-set_target_properties(lyrics_test PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
+musicd_test_target(lyrics_test)
 
 add_executable(artists_test
   ./test/artists_test.cpp
@@ -164,9 +178,7 @@ target_include_directories(artists_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/test
 )
-set_target_properties(artists_test PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
+musicd_test_target(artists_test)
 
 add_executable(storage_test
   ./test/storage_test.cpp
@@ -177,9 +189,7 @@ target_include_directories(storage_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/test
 )
-set_target_properties(storage_test PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
+musicd_test_target(storage_test)
 
 # 假存储服务：按实体 id 返回确定字节，并带控制端点。
 add_executable(fake_storage
@@ -190,9 +200,7 @@ target_include_directories(fake_storage PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/test
 )
-set_target_properties(fake_storage PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
+musicd_test_target(fake_storage)
 
 # 夹具写入/清理：直接连中央库，复用 config/db/schema/storage。
 add_executable(test_fixture
@@ -217,9 +225,7 @@ target_include_directories(test_fixture PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/test
 )
-set_target_properties(test_fixture PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
+musicd_test_target(test_fixture)
 
 # AMLL TTML 单测已并入 unit_tests（见 test/unit/CMakeLists.txt）。
 

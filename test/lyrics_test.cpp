@@ -1,6 +1,7 @@
 // 歌词接口测试（夹具驱动）：track_lyrics 行直接决定 Jellyfin Lyrics 输出。
 //
-// 用法：./lyrics_test [host] [port] [jellyfin_port]（默认 127.0.0.1:5667/9000）
+// 用法：build/bin/test/lyrics_test [host] [port] [jellyfin_port]
+//       （默认 127.0.0.1:5667/9000）
 // 依赖 test_fixture seed 导出的环境变量。
 
 #include "test_http.h"
