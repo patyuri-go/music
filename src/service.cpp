@@ -1,6 +1,7 @@
 #include "service.h"
 
 #include "config.h"
+#include "json_util.h"
 #include "media_library/domain.h"
 #include "media_library/library_runtime.h"
 #include "media_library/snapshot.h"
@@ -117,7 +118,7 @@ std::optional<Json::Value> Service::query(const Json::Value &json) {
   if (json.isNull() || !json.isMember("type")) {
     return std::nullopt;
   }
-  const std::string &type = json["type"].asString();
+  const std::string type = json_util::string_or(json, "type");
   if (type == "home") {
     return home(json);
   }
@@ -227,15 +228,14 @@ std::optional<Json::Value> Service::artistById(int id) {
 }
 
 std::optional<Json::Value> Service::home(const Json::Value &json) {
-  int after_id = 0;
-  int pegcount = config::get().page_size;
-
-  if (json.isMember("afterid")) {
-    after_id = static_cast<int>(json["afterid"].asInt64());
-  }
-  if (json.isMember("pegcount")) {
-    pegcount = static_cast<int>(json["pegcount"].asInt64());
-  }
+  // 分页上限走配置，客户端只能在这个区间内收窄：传 0 或负数当 1 处理，
+  // 防止「pegcount > 0」漏判导致遍历整库；传极大值也不会把整库塞进一个响应。
+  const int page_size = std::max(1, config::get().page_size);
+  const int after_id =
+      std::max(0, static_cast<int>(json_util::int_or(json, "afterid")));
+  const int pegcount = std::clamp(
+      static_cast<int>(json_util::int_or(json, "pegcount", page_size)), 1,
+      page_size);
 
   const auto snap = media_library::library().snapshot();
   std::vector<int> ids;
@@ -255,7 +255,7 @@ std::optional<Json::Value> Service::tag(const Json::Value &json) {
   if (!json.isMember("tag")) {
     return Json::Value(Json::arrayValue);
   }
-  const std::string tag_name = json["tag"].asString();
+  const std::string tag_name = json_util::string_or(json, "tag");
   const int page_size = config::get().page_size;
 
   const auto snap = media_library::library().snapshot();
@@ -295,7 +295,7 @@ std::optional<Json::Value> Service::search(const Json::Value &json) {
   if (!json.isMember("q")) {
     return Json::Value(Json::arrayValue);
   }
-  const std::string query = lower(json["q"].asString());
+  const std::string query = lower(json_util::string_or(json, "q"));
   const int page_size = config::get().page_size;
 
   const auto snap = media_library::library().snapshot();

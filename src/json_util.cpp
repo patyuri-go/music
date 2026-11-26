@@ -1,8 +1,28 @@
 #include "json_util.h"
 
+#include <charconv>
 #include <memory>
+#include <system_error>
 
 namespace json_util {
+
+namespace {
+
+// 与 client.cpp 的 parse_int64 同口径：拒绝空串、尾部垃圾、前导空白与溢出。
+std::int64_t parse_int64(const std::string &text, std::int64_t fallback) {
+  if (text.empty()) {
+    return fallback;
+  }
+  std::int64_t value = 0;
+  const auto result =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (result.ec != std::errc() || result.ptr != text.data() + text.size()) {
+    return fallback;
+  }
+  return value;
+}
+
+} // namespace
 
 std::optional<Json::Value> parse(std::string_view text) {
   if (text.empty()) {
@@ -37,7 +57,14 @@ std::int64_t int_or(const Json::Value &object, const char *key,
   if (!object.isObject() || !object.isMember(key)) {
     return fallback;
   }
-  return static_cast<std::int64_t>(object[key].asInt64());
+  const Json::Value &value = object[key];
+  if (value.isInt64()) {
+    return value.asInt64();
+  }
+  if (value.isString()) {
+    return parse_int64(value.asString(), fallback);
+  }
+  return fallback;
 }
 
 std::string string_or(const Json::Value &object, const char *key,
@@ -45,7 +72,11 @@ std::string string_or(const Json::Value &object, const char *key,
   if (!object.isObject() || !object.isMember(key)) {
     return fallback;
   }
-  return object[key].asString();
+  const Json::Value &value = object[key];
+  if (!value.isString()) {
+    return fallback;
+  }
+  return value.asString();
 }
 
 } // namespace json_util
