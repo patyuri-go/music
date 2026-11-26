@@ -202,6 +202,31 @@ void seed(db::Session &session) {
            "local-main:track:" + std::to_string(track_null));
 }
 
+// 假 PG 模式：不连库，只导出与 fake_pg 内置夹具一致的固定 id。
+// 数值来自 fixture_ids.h，fake_pg 必须按同一组值返回行。
+void printFixedEnv() {
+  printEnv(fixture::kEnvRootPath, fixture::kRootPath);
+  printEnv(fixture::kEnvAlbumId, fixture::kFixedAlbumId);
+  printEnv(fixture::kEnvAlbumRef,
+           "local-main:album:" + std::to_string(fixture::kFixedAlbumId));
+  printEnv(fixture::kEnvAlbumEntity, fixture::kAlbumEntity);
+  printEnv(fixture::kEnvAlbumNullId, fixture::kFixedAlbumNullId);
+  printEnv(fixture::kEnvAlbumNullRef, "local-main:album:" +
+                                          std::to_string(
+                                              fixture::kFixedAlbumNullId));
+  printEnv(fixture::kEnvTrackRoleId, fixture::kFixedTrackRoleId);
+  printEnv(fixture::kEnvTrackRoleRef,
+           "local-main:track:" + std::to_string(fixture::kFixedTrackRoleId));
+  printEnv(fixture::kEnvTrackRoleEntity, fixture::kTrackRoleEntity);
+  printEnv(fixture::kEnvTrackPlainId, fixture::kFixedTrackPlainId);
+  printEnv(fixture::kEnvTrackPlainRef,
+           "local-main:track:" + std::to_string(fixture::kFixedTrackPlainId));
+  printEnv(fixture::kEnvTrackPlainEntity, fixture::kTrackPlainEntity);
+  printEnv(fixture::kEnvTrackNullId, fixture::kFixedTrackNullId);
+  printEnv(fixture::kEnvTrackNullRef,
+           "local-main:track:" + std::to_string(fixture::kFixedTrackNullId));
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -222,10 +247,15 @@ int main(int argc, char **argv) {
       return 2;
     }
   }
-  if (action != "seed" && action != "cleanup") {
+  if (action != "seed" && action != "cleanup" && action != "env") {
     std::cerr << "用法: " << argv[0]
-              << " seed|cleanup [--config PATH]\n";
+              << " seed|cleanup|env [--config PATH]\n";
     return 2;
+  }
+
+  if (action == "env") {
+    printFixedEnv();
+    return 0;
   }
 
   try {

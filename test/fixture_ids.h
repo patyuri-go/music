@@ -67,6 +67,19 @@ inline const std::string kFormat = "wav";
 // 内嵌同步歌词：Jellyfin 需要 Start=15000000。
 inline const std::string kSyncedLyrics = "[00:01.50]第一行\n[00:02.50]第二行\n";
 
+// ---- 假 PG 夹具的固定内部 id ----
+// fake_pg 按这些 id 返回数据；test_fixture env 按同样的值导出环境变量，
+// 两者必须保持一致，否则集成测试取到的 id 与假库里的行对不上。
+inline constexpr std::int64_t kFixedRootId = 1;
+inline constexpr std::int64_t kFixedAlbumId = 2;
+inline constexpr std::int64_t kFixedAlbumNullId = 3;
+inline constexpr std::int64_t kFixedRoleArtistBaseId = 4;  // 4,5,6,7
+inline constexpr std::int64_t kFixedPlainArtistBaseId = 8; // 8,9
+inline constexpr std::int64_t kFixedTrackRoleId = 10;
+inline constexpr std::int64_t kFixedTrackPlainId = 11;
+inline constexpr std::int64_t kFixedTrackNullId = 12;
+inline constexpr std::int64_t kFixedTrackAlbumNullId = 13;
+
 // ---- test_fixture 输出的环境变量名 ----
 inline const char *kEnvRootPath = "FIXTURE_ROOT_PATH";
 inline const char *kEnvAlbumId = "FIXTURE_ALBUM_ID";
