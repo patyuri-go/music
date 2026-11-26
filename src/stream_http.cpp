@@ -256,22 +256,15 @@ ResponsePtr serve_track(const RequestPtr &req,
     return error_response(Error::make(ErrorCode::ProviderUnavailable,
                                       "media runtime is not initialized"));
   }
-  Result<PlaybackSession> session =
-      service->open_playback(track, media_library::CallContext{});
-  if (!session.ok()) {
-    return error_response(session.error());
-  }
-  Result<std::unique_ptr<media_library::ByteStream>> opened =
-      service->open_stream(session.value().session_id,
-                           media_library::CallContext{});
+  // 无状态播放：每个请求在路由层选一次源，因此本地库的 locator（存储服务）
+  // 不可达时能换到同一链接里的其它库，而不是把 5xx 直接抛给客户端。
+  Result<media_library::OpenedStream> opened =
+      service->open_stream_for(track, media_library::CallContext{});
   if (!opened.ok()) {
     return error_response(opened.error());
   }
-  std::shared_ptr<media_library::ByteStream> stream(std::move(opened).value());
-  ResponsePtr res = serve(req, std::move(stream),
-                          session.value().stream.origin.library_id, head_only);
-  res->addHeader("X-Playback-Session", session.value().session_id);
-  return res;
+  media_library::OpenedStream value = std::move(opened).value();
+  return serve(req, std::move(value.stream), value.library_id, head_only);
 }
 
 ResponsePtr serve_artwork(const RequestPtr &req,
@@ -321,28 +314,9 @@ ResponsePtr serve_artwork(const RequestPtr &req,
 void serve_track_async(const RequestPtr &req,
                        const media_library::TrackRef &track, bool head_only,
                        AsyncCallback callback) {
-  const auto internal_id = media_library::compat_internal_id_of(track);
-  if (internal_id.has_value()) {
-    // 本地库：有实体时直接走存储服务（见 document/STORAGE_PROXY_DECISIONS.md）。
-    // entity_id 缺失时交给路由：跨库链接可能指向远端。没有链接时路由退化为
-    // 单源，LocalLibrary 同样报 NotFound，所以仍然是 404。
-    const auto entity_id = media_library::compat_entity_id(
-        media_library::EntityType::Track, *internal_id);
-    if (!entity_id.has_value()) {
-      run_off_loop([req, track, head_only] {
-        return serve_track(req, track, head_only);
-      }, std::move(callback));
-      return;
-    }
-    if (!storage_client::enabled()) {
-      callback(error_response(Error::make(
-          ErrorCode::ProviderUnavailable, "storage service is not configured")));
-      return;
-    }
-    storage_client::serve_content(req, *entity_id, false, head_only,
-                                  std::move(callback));
-    return;
-  }
+  // 本地库与远端库都在路由层选源：本地库的 locator 指向存储服务，
+  // 探测失败时由 Router 换到同一链接里的其它库（见
+  // document/STORAGE_PROXY_DECISIONS.md）。没有链接则退化为单源。
   run_off_loop([req, track, head_only] {
     return serve_track(req, track, head_only);
   }, std::move(callback));

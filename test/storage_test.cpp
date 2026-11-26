@@ -89,6 +89,7 @@ int main(int argc, char **argv) {
       fixture("FIXTURE_TRACK_UNLINKED_NULL_REF");
   const std::string track_entity = fixture("FIXTURE_TRACK_ROLE_ENTITY");
   const std::string plain_entity = fixture("FIXTURE_TRACK_PLAIN_ENTITY");
+  (void)track_entity; // 该曲目有跨库链接，不适合断言上游错误码
 
   const std::string stream_path =
       "/api/v1/tracks/" + track_ref + "/stream";
@@ -189,15 +190,16 @@ int main(int argc, char **argv) {
   check(null_cover.status == 404, "album.entity_id 为 NULL -> 404");
 
   std::cout << "\n== 上游状态映射 ==\n";
-  control(cfg, track_entity, "{\"status\":500}");
-  const Response upstream_500 = get(cfg, stream_path);
-  check(upstream_500.status == 502, "上游 500 -> 502（实际 " +
+  // 用没有跨库链接的曲目：有链接时路由会换到备份源，看不到上游错误。
+  control(cfg, plain_entity, "{\"status\":500}");
+  const Response upstream_500 =
+      get(cfg, "/api/v1/tracks/" + track_plain_ref + "/stream");
+  check(upstream_500.status == 503, "上游 500 -> 503（实际 " +
                                         std::to_string(upstream_500.status) +
                                         "）");
   resetStorage(cfg);
 
-  control(cfg, plain_entity,
-          "{\"delay_ms\":3000}");
+  control(cfg, plain_entity, "{\"delay_ms\":3000}");
   const Response delayed =
       get(cfg, "/api/v1/tracks/" + track_plain_ref + "/stream");
   check(delayed.status == 504, "上游超时 -> 504（实际 " +

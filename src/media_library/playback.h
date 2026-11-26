@@ -58,6 +58,12 @@ struct PlaybackSession {
 // 因为音频只是「可 seek 的字节流」。
 // ---------------------------------------------------------------------------
 
+// 无状态播放的一次结果：字节流 + 真正出流的库（用于 X-Musicd-Origin）。
+struct OpenedStream {
+  std::unique_ptr<AudioStream> stream;
+  std::string library_id;
+};
+
 class PlaybackService {
 public:
   virtual ~PlaybackService() = default;
@@ -67,6 +73,12 @@ public:
                                                 const CallContext &ctx) = 0;
   virtual Result<std::unique_ptr<AudioStream>>
   open_stream(const std::string &session_id, const CallContext &ctx) = 0;
+
+  // 为一个 HTTP 请求临时选源并打开字节流；不建会话。
+  // 无状态播放（/tracks/<ref>/stream 等）用它，免得为了拿 locator
+  // 多解析一次元数据。同一 ref 的每个请求都会重新选源。
+  virtual Result<OpenedStream> open_stream_for(const TrackRef &track,
+                                               const CallContext &ctx) = 0;
 
   // 只读查询：不刷新、不改 locator。
   virtual Result<PlaybackSession> session(const std::string &session_id) = 0;

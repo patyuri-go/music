@@ -58,7 +58,8 @@ Result<std::unique_ptr<AudioStream>> make_audio_stream(
   case PlaybackKind::WebDav:
   case PlaybackKind::RemoteStream: {
     return make_http_stream(source.internal_locator, source.mime_type,
-                            source.content_length, source.range_supported);
+                            source.content_length, source.range_supported,
+                            source.open_timeout_ms);
   }
   }
   return Result<std::unique_ptr<AudioStream>>::failure(
@@ -172,6 +173,26 @@ public:
       source = it->second.source;
     }
     return make_audio_stream(source);
+  }
+
+  // 无状态播放：只解析流、打开字节流，不建会话、不改会话表。
+  Result<OpenedStream>
+  open_stream_for(const TrackRef &track, const CallContext &ctx) override {
+    Result<Sourced<PlaybackSource>> resolved =
+        router_->resolve_stream(track, ctx);
+    if (!resolved.ok()) {
+      return Result<OpenedStream>::failure(resolved.error());
+    }
+    Sourced<PlaybackSource> sourced = std::move(resolved).value();
+    Result<std::unique_ptr<AudioStream>> opened =
+        make_audio_stream(sourced.value);
+    if (!opened.ok()) {
+      return Result<OpenedStream>::failure(opened.error());
+    }
+    OpenedStream out;
+    out.stream = std::move(opened).value();
+    out.library_id = std::move(sourced.origin.library_id);
+    return Result<OpenedStream>::success(std::move(out));
   }
 
   Result<PlaybackSession> session(const std::string &session_id) override {

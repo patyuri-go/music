@@ -835,12 +835,14 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
   source.range_supported = true;
   source.cacheable = false;
   source.access_mode = AccessMode::Proxy;
+  source.open_timeout_ms = storage_client::timeout_ms();
 
   // 只查表就宣布「可出流」是不诚实的：存储服务可能不可达。这里先探一次
-  // （Range 0- 只取响应头，不拉正文），失败按 ProviderUnavailable 上报，
-  // 让 Router 的回退链接手；成功后真正的流由会话按需再开。
+  // （Range 0- 只取响应头，不拉正文），失败按 Timeout/ProviderUnavailable
+  // 上报，让 Router 换库；成功后真正的流由会话按需再开。
   auto probe = make_http_stream(source.internal_locator, source.mime_type,
-                               source.content_length, source.range_supported);
+                               source.content_length, source.range_supported,
+                               source.open_timeout_ms);
   if (!probe.ok()) {
     return Result<PlaybackSource>::failure(probe.error());
   }

@@ -277,6 +277,17 @@ int main(int argc, char **argv) {
     }
   }
 
+  // 无状态入口（客户端最常用的 /tracks/<ref>/stream）也必须在同一次请求里换源。
+  const Response main_route =
+      get(cfg, "/api/v1/tracks/" + entity_ref + "/stream");
+  check(main_route.status == 200, "存储 500 时主路由 -> 200（实际 " +
+                                      std::to_string(main_route.status) + "）");
+  check(main_route.header("x-musicd-origin") == fixture::kNeteaseLibraryId,
+        "存储 500 时主路由的来源是网易云（实际 " +
+            main_route.header("x-musicd-origin") + "）");
+  check(main_route.body == fixture::kNeteaseEntityAudioBytes(),
+        "存储 500 时主路由拿到的是备份源的字节");
+
   // 复位，别影响后面的段。
   controlStorage(cfg, entity_id, R"({"status":200,"delay_ms":0})");
 
