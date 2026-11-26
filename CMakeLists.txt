@@ -191,6 +191,19 @@ target_include_directories(storage_test PRIVATE
 )
 musicd_test_target(storage_test)
 
+# /api/query 类型守卫回归测试：走真实 HTTP，需要活的 musicd 与数据库。
+# 由 run_integration.sh 驱动，**不**注册进 CTest（ctest 必须保持纯单元）。
+add_executable(query_api_test
+  ./test/query_api_test.cpp
+  ./src/json_util.cpp
+)
+target_link_libraries(query_api_test PRIVATE Drogon::Drogon GTest::gtest_main)
+target_include_directories(query_api_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
+musicd_test_target(query_api_test)
+
 # 假存储服务：按实体 id 返回确定字节，并带控制端点。
 add_executable(fake_storage
   ./test/fake_storage.cpp

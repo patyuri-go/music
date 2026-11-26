@@ -32,4 +32,20 @@ std::string dump(const Json::Value &value) {
   return Json::writeString(builder, value);
 }
 
+std::int64_t int_or(const Json::Value &object, const char *key,
+                    std::int64_t fallback) {
+  if (!object.isObject() || !object.isMember(key)) {
+    return fallback;
+  }
+  return static_cast<std::int64_t>(object[key].asInt64());
+}
+
+std::string string_or(const Json::Value &object, const char *key,
+                      std::string fallback) {
+  if (!object.isObject() || !object.isMember(key)) {
+    return fallback;
+  }
+  return object[key].asString();
+}
+
 } // namespace json_util

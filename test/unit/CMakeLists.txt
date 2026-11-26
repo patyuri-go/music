@@ -11,6 +11,7 @@ add_executable(unit_tests
   ./source_ref_test.cpp
   ./amll_ttml_test.cpp
   ./netease_client_numeric_test.cpp
+  ./json_util_test.cpp
   ${PROJECT_SOURCE_DIR}/src/api/api-enhanced/client.cpp
   ${PROJECT_SOURCE_DIR}/src/json_util.cpp
   ${PROJECT_SOURCE_DIR}/src/media_library/source_ref.cpp

@@ -32,7 +32,8 @@ TEST_BIN_DIR="$BIN_DIR/test"
 
 for bin in "$BIN_DIR/musicd" "$TEST_BIN_DIR/fake_storage" "$TEST_BIN_DIR/test_fixture" \
            "$TEST_BIN_DIR/playlist_test" "$TEST_BIN_DIR/lyrics_test" \
-           "$TEST_BIN_DIR/artists_test" "$TEST_BIN_DIR/storage_test"; do
+           "$TEST_BIN_DIR/artists_test" "$TEST_BIN_DIR/storage_test" \
+           "$TEST_BIN_DIR/query_api_test"; do
   if [[ ! -x "$bin" ]]; then
     echo "缺少可执行文件 $bin（先运行 cmake --build --preset default）" >&2
     exit 2
@@ -143,6 +144,10 @@ run "播放列表" "$TEST_BIN_DIR/playlist_test" 127.0.0.1 "$MAIN_PORT" "$JF_POR
 run "歌词" "$TEST_BIN_DIR/lyrics_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
 run "艺术家" "$TEST_BIN_DIR/artists_test" 127.0.0.1 "$MAIN_PORT"
 run "存储代理" "$TEST_BIN_DIR/storage_test" 127.0.0.1 "$MAIN_PORT" "$STORAGE_PORT"
+
+# GTest 自己解析命令行，地址走环境变量，避免与 --gtest_filter 之类的位置参数打架。
+MUSICD_HOST=127.0.0.1 MUSICD_PORT="$MAIN_PORT" \
+  run "查询接口" "$TEST_BIN_DIR/query_api_test"
 
 echo
 if [[ $FAILED -eq 0 ]]; then
