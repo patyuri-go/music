@@ -506,7 +506,8 @@ void handle_stream(const http_server::RequestPtr &req,
     callback(failure_response(Code::NotFound, "song not found: " + *raw));
     return;
   }
-  // 音频字节：本地库按实体 id 直连存储服务，远端库沿用同步路径。
+  // 音频字节：本地库与远端库都交给路由层选源，本地库的 locator 指向存储
+  // 服务，探测失败时同一个请求内换库（见 stream_http::serve_track_async）。
   stream_http::serve_track_async(req, track_ref_of(*ref),
                                  req->isHead(),
                                  std::move(callback));
