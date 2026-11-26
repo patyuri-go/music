@@ -21,9 +21,6 @@ namespace db {
 ///   sqlite3 后端会把无 decltype 的列一律当成 TEXT）。
 enum class SociBackend { Postgres, Sqlite };
 
-/// SQLite 打开参数。主库需要外键约束；图片缓存只需要 WAL 与宽松同步。
-enum class SqliteProfile { Main, ImageCache };
-
 struct SociOptions {
   SociBackend backend = SociBackend::Sqlite;
 
@@ -32,10 +29,9 @@ struct SociOptions {
 
   /// backend == Sqlite 时使用。
   std::filesystem::path sqlite_path;
-  SqliteProfile profile = SqliteProfile::Main;
 
   static SociOptions postgres(std::string conninfo);
-  static SociOptions sqlite(std::filesystem::path path, SqliteProfile profile);
+  static SociOptions sqlite(std::filesystem::path path);
 };
 
 /// 由 SOCI 同时支撑 PostgreSQL 与 SQLite 的 Session 实现。

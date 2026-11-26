@@ -86,9 +86,7 @@ struct LibraryPriorityConfig {
 };
 
 // 本地 SQLite 主库。
-struct DatabaseSqlConfig {
-  fs::path path{"./music.db"};
-};
+
 
 // 远端主库：直接连外部提供的 PostgreSQL 服务（SOCI + 系统 libpq）。
 //
@@ -109,18 +107,13 @@ struct DatabasePostgresConfig {
   int connect_timeout_seconds{5};
 };
 
-// 主库配置。同一二进制同时包含 sqlite 与 postgres 两种实现；
-// `postgres.url` 非空即走 PostgreSQL，否则走本地 SQLite。
+// 主库配置。主库只支持 PostgreSQL；SQLite 仅用于图片缓存索引
+// （见 db::openSqliteSession）。
 struct DatabaseConfig {
-  DatabaseSqlConfig sql;
   DatabasePostgresConfig postgres;
-
-  bool usePostgres() const { return !postgres.url.empty(); }
 };
 
 struct Config {
-  fs::path db_path{"./music.db"};
-  // 新的后端配置；未配置 database 段时 sqlite_path 继承 db_path。
   DatabaseConfig database;
   fs::path static_dir{"web"};
   // 主服务端口（配置文件键名 main_port）。

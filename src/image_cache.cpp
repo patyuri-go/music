@@ -182,7 +182,7 @@ db::Session &openDb(const fs::path &path) {
   if (it != connections.end()) {
     return *it->second;
   }
-  auto session = db::openSqliteSession(key, db::SqliteProfile::ImageCache);
+  auto session = db::openSqliteSession(key);
   db::Session &result = *session;
   connections.emplace(key, std::move(session));
   return result;

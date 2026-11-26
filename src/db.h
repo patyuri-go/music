@@ -21,10 +21,9 @@ void init(const config::DatabaseConfig &options);
 /// 当前线程的主库会话。每线程一个，不跨线程共享。
 Session &mainSession();
 
-/// 打开一个独立的本地 SQLite 会话（不参与主库后端选择），
-/// 例如 image_cache 的 index.db。
-std::unique_ptr<Session> openSqliteSession(const std::string &path,
-                                           SqliteProfile profile);
+/// 打开一个独立的本地 SQLite 会话（不参与主库后端选择）。
+/// 只用于图片缓存索引（image_cache 的 index.db）。
+std::unique_ptr<Session> openSqliteSession(const std::string &path);
 
 /// 打开一个独立的 PostgreSQL 会话（不参与主库后端选择），
 /// 例如云端实体库 entity。`url` 为空时返回 nullptr。

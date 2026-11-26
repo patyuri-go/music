@@ -148,19 +148,8 @@ const Config &load(const std::string &file) {
       throw std::runtime_error("配置文件不是合法 JSON: " + file);
     }
     const Json::Value &json = *parsed;
-    if (json.isMember("db_path")) {
-      loaded.db_path = json["db_path"].asString();
-    }
-    // 未配置 db 段时，sqlite 路径继续跟随旧键 db_path。
-    loaded.database.sql.path = loaded.db_path;
     if (json.isMember("db")) {
       const auto &dbc = json["db"];
-      if (dbc.isMember("sql")) {
-        const auto &sqc = dbc["sql"];
-        if (sqc.isMember("path")) {
-          loaded.database.sql.path = sqc["path"].asString();
-        }
-      }
       // 段名大小写不敏感：PostgreSQL / postgresql / postgres 都接受。
       const char *pgKey = nullptr;
       if (dbc.isMember("PostgreSQL")) {
@@ -196,8 +185,7 @@ const Config &load(const std::string &file) {
         }
       }
     }
-    // db_path 与 db.sql.path 始终同源，旧调用点无需改动。
-    loaded.db_path = loaded.database.sql.path;
+    
     if (json.isMember("static_dir")) {
       loaded.static_dir = json["static_dir"].asString();
     }
@@ -434,10 +422,7 @@ const Config &load(const std::string &file) {
   }
   // 文件不存在属正常情况：保留内置默认值，保证零配置可启动。
 
-  const std::string dbPath = envValue("MUSIC_DB");
-  if (!dbPath.empty()) {
-    loaded.db_path = dbPath;
-  }
+  
   const std::string staticDir = envValue("MUSIC_STATIC_DIR");
   if (!staticDir.empty()) {
     loaded.static_dir = staticDir;

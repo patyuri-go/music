@@ -96,19 +96,12 @@ void bootstrap(const std::string &config_file) {
   db::Session &session = db::mainSession();
   session.query("SELECT 1");
 
-  const bool use_postgres = session.dialect() == db::Dialect::Postgres;
-  if (use_postgres) {
-    // PostgreSQL 不做 schema 迁移，只建空库并校验版本。
-    schema::ensurePostgresSchema(session);
-    std::cout << "[boot] db=postgres://" << cfg.database.postgres.url
-              << " static_dir=" << cfg.static_dir
-              << " page_size=" << cfg.page_size << std::endl;
-  } else {
-    schema::migrate(session);
-    std::cout << "[boot] db=" << cfg.db_path
-              << " static_dir=" << cfg.static_dir
-              << " page_size=" << cfg.page_size << std::endl;
-  }
+  // 主库只支持 PostgreSQL，不再有 SQLite 回退分支。
+  // PostgreSQL 不做 schema 迁移，只建空库并校验版本。
+  schema::ensurePostgresSchema(session);
+  std::cout << "[boot] db=postgres://" << cfg.database.postgres.url
+            << " static_dir=" << cfg.static_dir
+            << " page_size=" << cfg.page_size << std::endl;
   std::cout << "[boot] schema 版本 " << schema::kVersion << "，就绪"
             << std::endl;
 

@@ -355,12 +355,10 @@ SociOptions SociOptions::postgres(std::string conninfo) {
   return options;
 }
 
-SociOptions SociOptions::sqlite(std::filesystem::path path,
-                               SqliteProfile profile) {
+SociOptions SociOptions::sqlite(std::filesystem::path path) {
   SociOptions options;
   options.backend = SociBackend::Sqlite;
   options.sqlite_path = std::move(path);
-  options.profile = profile;
   return options;
 }
 
@@ -373,16 +371,10 @@ SociSession::SociSession(SociOptions options)
     } else {
       session_ = std::make_unique<soci::session>(
           soci::sqlite3, sqliteConnectString(options_.sqlite_path));
-      // SQLite 默认 busy_timeout 是 0；WAL 与 synchronous 与旧实现保持一致。
-      if (options_.profile == SqliteProfile::Main) {
-        *session_ << "PRAGMA foreign_keys=ON";
-        *session_ << "PRAGMA journal_mode=WAL";
-        *session_ << "PRAGMA busy_timeout=5000";
-      } else {
-        *session_ << "PRAGMA journal_mode=WAL";
-        *session_ << "PRAGMA synchronous=NORMAL";
-        *session_ << "PRAGMA busy_timeout=5000";
-      }
+      // SQLite 只用于图片缓存索引：WAL + 宽松同步。
+      *session_ << "PRAGMA journal_mode=WAL";
+      *session_ << "PRAGMA synchronous=NORMAL";
+      *session_ << "PRAGMA busy_timeout=5000";
     }
 
     // SOCI 默认的 log_context::always 会让 statement_impl::pre_use() 调

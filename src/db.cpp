@@ -145,21 +145,18 @@ Session &mainSession() {
   if (!g_main_options.has_value()) {
     throw std::logic_error("db::init() 未调用，无法确定主库后端");
   }
-  // 配置了 db.PostgreSQL.url 就走远端 PostgreSQL，否则用本地 SQLite。
-  if (g_main_options->usePostgres()) {
-    t_session =
-        std::make_unique<SociSession>(makePgOptions(g_main_options->postgres));
-  } else {
-    t_session = std::make_unique<SociSession>(SociOptions::sqlite(
-        g_main_options->sql.path, SqliteProfile::Main));
+  // 主库只支持 PostgreSQL；SQLite 仅用于图片缓存索引，不参与主库选择。
+  if (g_main_options->postgres.url.empty()) {
+    throw std::logic_error(
+        "主库只支持 PostgreSQL：请在配置的 db.PostgreSQL.url 指向 PostgreSQL 服务");
   }
+  t_session =
+      std::make_unique<SociSession>(makePgOptions(g_main_options->postgres));
   return *t_session;
 }
 
-std::unique_ptr<Session> openSqliteSession(const std::string &path,
-                                           SqliteProfile profile) {
-  return std::make_unique<SociSession>(
-      SociOptions::sqlite(path, profile));
+std::unique_ptr<Session> openSqliteSession(const std::string &path) {
+  return std::make_unique<SociSession>(SociOptions::sqlite(path));
 }
 
 std::unique_ptr<Session> openPostgresSession(
