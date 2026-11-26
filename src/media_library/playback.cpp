@@ -59,7 +59,7 @@ Result<std::unique_ptr<AudioStream>> make_audio_stream(
   case PlaybackKind::RemoteStream: {
     return make_http_stream(source.internal_locator, source.mime_type,
                             source.content_length, source.range_supported,
-                            source.open_timeout_ms);
+                            source.open_timeout_ms, source.max_redirects);
   }
   }
   return Result<std::unique_ptr<AudioStream>>::failure(

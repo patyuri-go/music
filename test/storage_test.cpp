@@ -189,6 +189,22 @@ int main(int argc, char **argv) {
                                          "/cover");
   check(null_cover.status == 404, "album.entity_id 为 NULL -> 404");
 
+  std::cout << "\n== 存储 302 跳转 ==\n";
+  // 存储节点可以把上游直链以 302 交出来（实体位置的 redirect 开关）。
+  // 本地库声明跟随跳转，所以这里应当拿到真正的字节，而不是 302 本身。
+  control(cfg, plain_entity, "{\"redirect\":true}");
+  const Response redirected =
+      get(cfg, "/api/v1/tracks/" + track_plain_ref + "/stream");
+  check(redirected.status == 200, "302 跟随跳转 -> 200（实际 " +
+                                      std::to_string(redirected.status) + "）");
+  check(redirected.body.size() == 1048576, "跟随跳转后拿到完整字节");
+  const Response redirected_range =
+      get(cfg, "/api/v1/tracks/" + track_plain_ref + "/stream",
+          {"Range: bytes=0-1023"});
+  check(redirected_range.status == 206 && redirected_range.body.size() == 1024,
+        "跟随跳转后 Range 仍生效");
+  control(cfg, plain_entity, "{\"redirect\":false}");
+
   std::cout << "\n== 上游状态映射 ==\n";
   // 用没有跨库链接的曲目：有链接时路由会换到备份源，看不到上游错误。
   control(cfg, plain_entity, "{\"status\":500}");

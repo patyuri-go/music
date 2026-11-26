@@ -251,6 +251,20 @@ struct Probe {
   Sink sink;
 };
 
+// 存储节点可以把上游直链以 302 交出来（实体位置 redirect=true）。musicd 是
+// 唯一的字节出口，所以必须自己跟随后再代理；默认不跟随会把 302 的空 body
+// 当成 200 转发给客户端。
+void set_redirect_options(CURL *handle) {
+  curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(handle, CURLOPT_MAXREDIRS, 5L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+  curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+  curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS,
+                   CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+}
+
 Probe probe_once(const std::string &entity_id, const RequestHeaders &extra,
                  bool body_less, std::size_t limit) {
   Probe result;
@@ -263,7 +277,7 @@ Probe probe_once(const std::string &entity_id, const RequestHeaders &extra,
   curl_slist *headers = make_headers(extra);
   curl_easy_setopt(handle, CURLOPT_URL, url.c_str());
   curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L);
+  set_redirect_options(handle);
   curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS,
                    static_cast<long>(g_options.timeout_ms));
@@ -520,7 +534,7 @@ void pump_body(const std::string &entity_id, const RequestHeaders &extra,
   const std::string url = api_url(entity_id);
   curl_easy_setopt(handle, CURLOPT_URL, url.c_str());
   curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L);
+  set_redirect_options(handle);
   curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS,
                    static_cast<long>(g_options.timeout_ms));

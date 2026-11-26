@@ -106,6 +106,8 @@ struct SharedStream {
   std::map<std::string, std::string> headers;
   int error = 0;
   bool timed_out = false;
+  // 是否跟随 3xx：中间跳转的响应头不能当作最终响应头。
+  bool follow_redirects = false;
 
   void cancel() {
     {
@@ -174,7 +176,15 @@ std::size_t stream_header_cb(char *buffer, std::size_t size,
       }
     }
     if (blank) {
-      shared->headers_ready = true;
+      // 跟随重定向时，3xx 只是中间跳转：把它当最终响应头会让调用方提前
+      // 拿到 302 而误判失败。带 Location 的 3xx 继续等下一跳。
+      const bool interim = shared->follow_redirects && shared->status >= 300 &&
+                           shared->status < 400 && shared->status != 304 &&
+                           shared->headers.find("location") !=
+                               shared->headers.end();
+      if (!interim) {
+        shared->headers_ready = true;
+      }
     }
   }
   if (blank) {
@@ -327,10 +337,11 @@ Response Client::request(const std::string &method, const std::string &path,
 
 Stream openStream(const Url &base, const std::string &path,
                   const std::vector<std::string> &extra_headers,
-                  std::int64_t header_timeout_ms) {
+                  std::int64_t header_timeout_ms, int max_redirects) {
   static std::once_flag curl_once;
   std::call_once(curl_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
   auto shared = std::make_shared<SharedStream>();
+  shared->follow_redirects = max_redirects > 0;
   std::string path_value = path.empty() ? std::string("/") : path;
   if (path_value.front() != '/') {
     path_value.insert(path_value.begin(), '/');
@@ -339,7 +350,8 @@ Stream openStream(const Url &base, const std::string &path,
   const Url base_copy = base;
   const std::vector<std::string> headers_copy = extra_headers;
 
-  std::thread producer([shared, url, base_copy, headers_copy]() {
+  std::thread producer([shared, url, base_copy, headers_copy,
+                        max_redirects]() {
     CURL *handle = curl_easy_init();
     if (handle == nullptr) {
       std::lock_guard<std::mutex> lock(shared->mutex);
@@ -364,6 +376,17 @@ Stream openStream(const Url &base, const std::string &path,
     curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, progress_cb);
     curl_easy_setopt(handle, CURLOPT_XFERINFODATA, shared.get());
     setCommonOptions(handle, base_copy);
+    if (max_redirects > 0) {
+      curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1L);
+      curl_easy_setopt(handle, CURLOPT_MAXREDIRS,
+                       static_cast<long>(max_redirects));
+#if LIBCURL_VERSION_NUM >= 0x075500
+      curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+      curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS,
+                       CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+    }
 
     const CURLcode code = curl_easy_perform(handle);
     {

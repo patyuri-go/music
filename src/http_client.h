@@ -75,9 +75,14 @@ struct Stream {
 //
 // `header_timeout_ms` 只限制「响应头就绪」的等待：上游连上了却不回包时，
 // 不能让调用方无限挂着。正文不设总时长上限，否则长音频会被截断。
+//
+// `max_redirects > 0` 时跟随 3xx（只允许 http/https）。中间跳转的响应头
+// 不算「就绪」，返回的 status / headers 是最终一跳的。默认 0 = 不跟随，
+// 与旧的直连语义一致。
 Stream openStream(const Url &base, const std::string &path,
                   const std::vector<std::string> &extra_headers,
-                  std::int64_t header_timeout_ms = 0);
+                  std::int64_t header_timeout_ms = 0,
+                  int max_redirects = 0);
 
 } // namespace http_client
 

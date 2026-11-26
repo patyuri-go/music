@@ -108,7 +108,7 @@ public:
   static Result<std::unique_ptr<ByteStream>>
   open(std::string locator, std::string mime_type,
        std::optional<std::int64_t> size, bool seekable,
-       std::int64_t open_timeout_ms) {
+       std::int64_t open_timeout_ms, int max_redirects) {
     if (locator.empty()) {
       return Result<std::unique_ptr<ByteStream>>::failure(
           internal_error("byte stream has no locator"));
@@ -118,7 +118,7 @@ public:
     info.size_bytes = size.value_or(-1);
     info.seekable = seekable;
     std::unique_ptr<ByteStream> stream(new HttpByteStream(
-        std::move(locator), std::move(info), open_timeout_ms));
+        std::move(locator), std::move(info), open_timeout_ms, max_redirects));
     return Result<std::unique_ptr<ByteStream>>::success(std::move(stream));
   }
 
@@ -183,9 +183,9 @@ public:
 
 private:
   HttpByteStream(std::string locator, StreamInfo info,
-                 std::int64_t open_timeout_ms)
+                 std::int64_t open_timeout_ms, int max_redirects)
       : locator_(std::move(locator)), info_(std::move(info)),
-        open_timeout_ms_(open_timeout_ms) {}
+        open_timeout_ms_(open_timeout_ms), max_redirects_(max_redirects) {}
 
   bool ensure_open() {
     if (open_) {
@@ -201,8 +201,8 @@ private:
     if (info_.seekable) {
       extra.push_back("Range: bytes=" + std::to_string(offset_) + "-");
     }
-    http_client::Stream stream =
-        http_client::openStream(base, base.path, extra, open_timeout_ms_);
+    http_client::Stream stream = http_client::openStream(
+        base, base.path, extra, open_timeout_ms_, max_redirects_);
     if (stream.status != 200 && stream.status != 206) {
       if (stream.close) {
         stream.close();
@@ -256,6 +256,8 @@ private:
   StreamInfo info_;
   std::int64_t offset_ = 0;
   std::int64_t open_timeout_ms_ = 0;
+  // > 0 时跟随 3xx：存储节点可以把直链以 302 交出来。
+  int max_redirects_ = 0;
   http_client::Stream handle_;
   bool open_ = false;
   Error open_error_;
@@ -271,9 +273,9 @@ Result<std::unique_ptr<ByteStream>> make_file_stream(std::string path,
 Result<std::unique_ptr<ByteStream>>
 make_http_stream(std::string locator, std::string mime_type,
                  std::optional<std::int64_t> size, bool seekable,
-                 std::int64_t open_timeout_ms) {
+                 std::int64_t open_timeout_ms, int max_redirects) {
   return HttpByteStream::open(std::move(locator), std::move(mime_type), size,
-                              seekable, open_timeout_ms);
+                              seekable, open_timeout_ms, max_redirects);
 }
 
 } // namespace media_library

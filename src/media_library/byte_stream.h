@@ -56,10 +56,12 @@ Result<std::unique_ptr<ByteStream>> make_file_stream(std::string path,
 // `size` 未知时传 nullopt 或 -1，运行时从响应头补齐。
 // `seekable=false` 表示源明确不支持 Range（此时拒绝非零 seek）。
 // `open_timeout_ms > 0` 时限制等待响应头的时间；超时按 ErrorCode::Timeout 上报。
+// `max_redirects > 0` 时跟随 3xx（只允许 http/https）：存储节点可以把
+// 上游直链以 302 交出来，由本进程跟随后再读字节。
 Result<std::unique_ptr<ByteStream>> make_http_stream(
     std::string locator, std::string mime_type,
     std::optional<std::int64_t> size = std::nullopt, bool seekable = true,
-    std::int64_t open_timeout_ms = 0);
+    std::int64_t open_timeout_ms = 0, int max_redirects = 0);
 
 } // namespace media_library
 

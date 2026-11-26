@@ -288,6 +288,9 @@ struct PlaybackSource {
   std::string internal_locator;
   // 打开远端流时等待响应头的上限；0 表示除 libcurl 自身超时外不额外限制。
   std::int64_t open_timeout_ms = 0;
+  // 允许跟随的 3xx 跳转次数；0 表示不跟随（直连语义）。存储节点可以把
+  // 上游直链以 302 交出来，此时由本地库声明需要跟随。
+  int max_redirects = 0;
 };
 
 struct PageRequest {

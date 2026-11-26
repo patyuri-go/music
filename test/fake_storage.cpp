@@ -5,7 +5,7 @@
 // 端点：
 //   GET|HEAD /api/entities/{id}/content   单区间 Range；206/416 语义与上游一致
 //   POST     /__control/reset             恢复到内置默认实体
-//   POST     /__control/entity/{id}       覆盖状态/延迟/内容类型/字节
+//   POST     /__control/entity/{id}       覆盖状态/延迟/内容类型/字节/302 跳转
 //
 // 所有内容都在内存里；不依赖数据库或真实存储服务。
 
@@ -34,6 +34,8 @@ struct Entity {
   std::string content_type{"application/octet-stream"};
   int status = 200;
   int delay_ms = 0;
+  // true：先回 302 指向自己（带 ?direct=1），用来验证客户端会跟随跳转。
+  bool redirect = false;
 };
 
 std::mutex g_mutex;
@@ -246,17 +248,30 @@ int main(int argc, char **argv) {
   // 内容端点：延迟请求放到独立线程，避免阻塞事件循环。
   app.registerHandler(
       "/api/entities/{1}/content",
-      [](const drogon::HttpRequestPtr &req,
+      [port](const drogon::HttpRequestPtr &req,
          std::function<void(const drogon::HttpResponsePtr &)> &&callback,
          const std::string &id) {
         const bool head_only = req->isHead();
         int delay_ms = 0;
+        bool redirect = false;
         {
           std::lock_guard<std::mutex> lock(g_mutex);
           const auto it = g_entities.find(id);
           if (it != g_entities.end()) {
             delay_ms = it->second.delay_ms;
+            redirect = it->second.redirect;
           }
+        }
+        if (redirect && req->getParameter("direct") != "1") {
+          auto resp = drogon::HttpResponse::newHttpResponse();
+          resp->setStatusCode(drogon::k302Found);
+          resp->addHeader("Location", "http://127.0.0.1:" +
+                                          std::to_string(port) +
+                                          "/api/entities/" + id +
+                                          "/content?direct=1");
+          resp->setBody("");
+          callback(resp);
+          return;
         }
         auto resp = buildContent(
             id, std::string(req->getHeader("range")),
@@ -304,6 +319,9 @@ int main(int argc, char **argv) {
         }
         if (body.isMember("delay_ms")) {
           entity.delay_ms = body["delay_ms"].asInt();
+        }
+        if (body.isMember("redirect")) {
+          entity.redirect = body["redirect"].asBool();
         }
         if (body.isMember("content_type")) {
           entity.content_type = body["content_type"].asString();
