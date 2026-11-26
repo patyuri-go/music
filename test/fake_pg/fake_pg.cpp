@@ -214,8 +214,61 @@ constexpr int kTrackRole = 10;
 constexpr int kTrackPlain = 11;
 constexpr int kTrackNull = 12;
 constexpr int kTrackAlbumNull = 13;
+constexpr int kTrackUnlinkedNull = 14;
 constexpr int kRoleArtistBase = 4;   // 4..7
 constexpr int kPlainArtistBase = 8;  // 8..9
+
+// 夹具的两条跨库链接。
+//   1 号：本地 12 号曲目（entity_id 为 NULL）↔ 网易云 186016
+//          ——「本地缺实体 → 用链接换源」。
+//   2 号：本地 10 号曲目（entity_id 非空）↔ 网易云 186018
+//          ——「本地能解析、但存储读不到字节」时是否换源。
+// 一条链接每个库最多一个成员（UNIQUE(link_id, library_id)），
+// 所以两条链接必须用不同的远端 id。
+constexpr int kLinkId = 1;
+inline const std::string kLinkLocalRef = "12";
+inline const std::string kLinkRemoteRef = fixture::kNeteaseSongId;
+constexpr int kLinkIdWithEntity = 2;
+inline const std::string kLinkLocalEntityRef = "10";
+inline const std::string kLinkRemoteEntityRef = fixture::kNeteaseEntitySongId;
+inline const std::string kLinkCreatedAt = "2024-01-01 00:00:00";
+
+struct LinkRow {
+  int id;
+  const std::string &local_entity;
+  const std::string &remote_entity;
+};
+
+inline const std::vector<LinkRow> &links() {
+  static const std::vector<LinkRow> rows = {
+      {kLinkId, kLinkLocalRef, kLinkRemoteRef},
+      {kLinkIdWithEntity, kLinkLocalEntityRef, kLinkRemoteEntityRef},
+  };
+  return rows;
+}
+
+inline const LinkRow *link(int id) {
+  for (const auto &row : links()) {
+    if (row.id == id) {
+      return &row;
+    }
+  }
+  return nullptr;
+}
+
+// 由任一成员定位链接：locate_link 的查询条件。
+inline const LinkRow *link_by_member(const std::string &library,
+                                     const std::string &entity_id) {
+  for (const auto &row : links()) {
+    if (library == "local-main" && entity_id == row.local_entity) {
+      return &row;
+    }
+    if (library == "netease-main" && entity_id == row.remote_entity) {
+      return &row;
+    }
+  }
+  return nullptr;
+}
 
 inline const std::string kAddedAt = "2024-01-01 00:00:00";
 
@@ -317,6 +370,10 @@ inline const std::vector<TrackRow> &tracks() {
        fixture::kTrackAlbumNullTitle, kAlbumNull, 1, 1, fixture::kDurationMs,
        1411200, 44100, 2, fixture::kFormat, fixture::kSizeBytes, 0, kAddedAt, 0,
        std::nullopt, 0, fixture::kTrackAlbumNullEntity},
+      {kTrackUnlinkedNull, kRootId, fixture::kTrackUnlinkedNullPath,
+       fixture::kTrackUnlinkedNullTitle, kAlbumOne, 1, 4, fixture::kDurationMs,
+       1411200, 44100, 2, fixture::kFormat, fixture::kSizeBytes, 0, kAddedAt, 0,
+       std::nullopt, 0, std::nullopt},
   };
   return rows;
 }
@@ -440,6 +497,60 @@ Result resolve(const std::string &sql, const Params &params) {
       const auto name = fx::artist_name(artist_id);
       if (name.has_value()) {
         rows.push_back({*name});
+      }
+    }
+    return Result{columns, rows, "SELECT " + std::to_string(rows.size())};
+  }
+
+  // ---- 批量补充查询：曲风 / 艺术家 / 歌词 / 专辑艺术家 ----
+  // 参数是 IN (...) 里的 id 列表，按夹具数据逐 id 展开；没数据的 id 不出行。
+  if (startsWith(norm, "SELECT TG.TRACK_ID, G.NAME FROM TRACK_GENRE")) {
+    // 夹具没有曲风数据：列要对，行数为 0 才是正确语义。
+    return Result{{{"track_id", kInt8}, {"name", kText}}, {}, "SELECT 0"};
+  }
+  if (startsWith(norm,
+                 "SELECT TA.TRACK_ID, A.ID, A.NAME FROM TRACK_ARTIST")) {
+    const std::vector<Column> columns = {
+        {"track_id", kInt8}, {"id", kInt8}, {"name", kText}};
+    std::vector<std::vector<std::string>> rows;
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      const int track_id = param_int(params, i);
+      for (const int artist_id : fx::track_artist_ids(track_id)) {
+        const auto name = fx::artist_name(artist_id);
+        if (name.has_value()) {
+          rows.push_back({to_text(static_cast<std::int64_t>(track_id)),
+                          to_text(static_cast<std::int64_t>(artist_id)),
+                          *name});
+        }
+      }
+    }
+    return Result{columns, rows, "SELECT " + std::to_string(rows.size())};
+  }
+  if (startsWith(norm, "SELECT TRACK_ID FROM TRACK_LYRICS WHERE TRACK_ID IN")) {
+    const std::vector<Column> columns = {{"track_id", kInt8}};
+    std::vector<std::vector<std::string>> rows;
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      const int track_id = param_int(params, i);
+      if (fx::has_lyrics(track_id)) {
+        rows.push_back({to_text(static_cast<std::int64_t>(track_id))});
+      }
+    }
+    return Result{columns, rows, "SELECT " + std::to_string(rows.size())};
+  }
+  if (startsWith(norm,
+                 "SELECT AA.ALBUM_ID, A.ID, A.NAME FROM ALBUM_ARTIST AA")) {
+    const std::vector<Column> columns = {
+        {"album_id", kInt8}, {"id", kInt8}, {"name", kText}};
+    std::vector<std::vector<std::string>> rows;
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      const int album_id = param_int(params, i);
+      for (const int artist_id : fx::album_artist_ids(album_id)) {
+        const auto name = fx::artist_name(artist_id);
+        if (name.has_value()) {
+          rows.push_back({to_text(static_cast<std::int64_t>(album_id)),
+                          to_text(static_cast<std::int64_t>(artist_id)),
+                          *name});
+        }
       }
     }
     return Result{columns, rows, "SELECT " + std::to_string(rows.size())};
@@ -620,10 +731,85 @@ Result resolve(const std::string &sql, const Params &params) {
     return single(columns, {std::string(fixture::kSyncedLyrics), "1"},
                   "SELECT 1");
   }
+  // ---- 跨库链接：两条（本地 12→186016、本地 10→186018）----
   if (startsWith(norm,
                  "SELECT L.LINK_ID, L.ENTITY_TYPE FROM ENTITY_LINK_MEMBER")) {
-    // 夹具没有实体链接：空结果是正确语义，不是未实现。
-    return Result{{{"link_id", kInt8}, {"entity_type", kText}}, {}, "SELECT 0"};
+    const std::vector<Column> columns = {{"link_id", kInt8},
+                                         {"entity_type", kText}};
+    // 参数顺序：library_id, entity_type, entity_id。
+    const std::string library = param(params, 0);
+    const std::string entity_type = param(params, 1);
+    const std::string entity_id = param(params, 2);
+    const fx::LinkRow *row = entity_type == "track"
+                                 ? fx::link_by_member(library, entity_id)
+                                 : nullptr;
+    if (row == nullptr) {
+      return Result{columns, {}, "SELECT 0"};
+    }
+    return single(columns,
+                  {to_text(static_cast<std::int64_t>(row->id)), "track"},
+                  "SELECT 1");
+  }
+  if (startsWith(
+          norm,
+          "SELECT CREATED_AT, UPDATED_AT FROM ENTITY_LINK WHERE LINK_ID")) {
+    const std::vector<Column> columns = {{"created_at", kText},
+                                         {"updated_at", kText}};
+    if (fx::link(param_int(params, 0)) == nullptr) {
+      return Result{columns, {}, "SELECT 0"};
+    }
+    return single(columns, {fx::kLinkCreatedAt, fx::kLinkCreatedAt}, "SELECT 1");
+  }
+  if (startsWith(norm, "SELECT LIBRARY_ID, ENTITY_TYPE, ENTITY_ID, CONFIDENCE, "
+                       "VERIFIED FROM ENTITY_LINK_MEMBER WHERE LINK_ID")) {
+    const std::vector<Column> columns = {{"library_id", kText},
+                                         {"entity_type", kText},
+                                         {"entity_id", kText},
+                                         {"confidence", kText},
+                                         {"verified", kBool}};
+    const fx::LinkRow *row = fx::link(param_int(params, 0));
+    if (row == nullptr) {
+      return Result{columns, {}, "SELECT 0"};
+    }
+    // 一条链接每个库最多一个成员（UNIQUE(link_id, library_id)）。
+    return Result{columns,
+                  {{"local-main", "track", row->local_entity, "manual", "t"},
+                   {"netease-main", "track", row->remote_entity, "manual", "t"}},
+                  "SELECT 2"};
+  }
+  if (startsWith(norm,
+                 "SELECT LIBRARY_ID FROM ENTITY_LINK_MEMBER WHERE LINK_ID")) {
+    const std::vector<Column> columns = {{"library_id", kText}};
+    if (fx::link(param_int(params, 0)) == nullptr) {
+      return Result{columns, {}, "SELECT 0"};
+    }
+    return Result{columns, {{"local-main"}, {"netease-main"}}, "SELECT 2"};
+  }
+  if (startsWith(norm, "SELECT ASPECT, LIBRARY_ID FROM ENTITY_LINK_OVERRIDE "
+                       "WHERE LINK_ID")) {
+    const std::vector<Column> columns = {{"aspect", kText},
+                                         {"library_id", kText}};
+    if (fx::link(param_int(params, 0)) == nullptr) {
+      return Result{columns, {}, "SELECT 0"};
+    }
+    // 只有 stream 有 override，并且故意排成「本地优先」：临时配置里
+    // library_priority 把 netease 排前面，所以这条断言能证明 override 生效。
+    // metadata 没有 override，落到内建顺序，仍走本地。
+    return Result{columns,
+                  {{"stream", "local-main"}, {"stream", "netease-main"}},
+                  "SELECT 2"};
+  }
+  if (startsWith(norm, "SELECT LIBRARY_ID FROM ENTITY_LINK_OVERRIDE WHERE "
+                       "LINK_ID")) {
+    const std::vector<Column> columns = {{"library_id", kText}};
+    if (fx::link(param_int(params, 0)) == nullptr) {
+      return Result{columns, {}, "SELECT 0"};
+    }
+    const std::string aspect = param(params, 1);
+    if (aspect != "stream") {
+      return Result{columns, {}, "SELECT 0"};
+    }
+    return Result{columns, {{"local-main"}, {"netease-main"}}, "SELECT 2"};
   }
 
   // ---- 单条曲目路径：get_track / build_track / track_transport ----

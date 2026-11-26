@@ -48,10 +48,18 @@ inline const std::string kTrackPlainPath =
 inline const std::string kTrackPlainEntity =
     "22222222-0000-4000-8000-000000000002";
 
+// 本地没有实体、但连到网易云的多来源链接上（跨库取流的主用例）。
 inline const std::string kTrackNullTitle = "__fixture__ Track No Entity";
 inline const std::string kTrackNullPath =
     "/tmp/opencode/musicd-fixture-root/track-null.wav";
 inline const std::string kTrackNullEntity; // empty => NULL
+
+// 本地没有实体、也没有任何链接的曲目：流请求必须 404。
+inline const std::string kTrackUnlinkedNullTitle =
+    "__fixture__ Track Unlinked Null";
+inline const std::string kTrackUnlinkedNullPath =
+    "/tmp/opencode/musicd-fixture-root/track-unlinked-null.wav";
+inline const std::string kTrackUnlinkedNullEntity; // empty => NULL
 
 // 属于「无封面实体」专辑的曲目，用于专辑封面 404 场景。
 inline const std::string kTrackAlbumNullTitle = "__fixture__ Track Album Null";
@@ -79,6 +87,7 @@ inline constexpr std::int64_t kFixedTrackRoleId = 10;
 inline constexpr std::int64_t kFixedTrackPlainId = 11;
 inline constexpr std::int64_t kFixedTrackNullId = 12;
 inline constexpr std::int64_t kFixedTrackAlbumNullId = 13;
+inline constexpr std::int64_t kFixedTrackUnlinkedNullId = 14;
 
 // ---- test_fixture 输出的环境变量名 ----
 inline const char *kEnvRootPath = "FIXTURE_ROOT_PATH";
@@ -95,6 +104,41 @@ inline const char *kEnvTrackPlainRef = "FIXTURE_TRACK_PLAIN_REF";
 inline const char *kEnvTrackPlainEntity = "FIXTURE_TRACK_PLAIN_ENTITY";
 inline const char *kEnvTrackNullId = "FIXTURE_TRACK_NULL_ID";
 inline const char *kEnvTrackNullRef = "FIXTURE_TRACK_NULL_REF";
+inline const char *kEnvTrackUnlinkedNullId = "FIXTURE_TRACK_UNLINKED_NULL_ID";
+inline const char *kEnvTrackUnlinkedNullRef = "FIXTURE_TRACK_UNLINKED_NULL_REF";
+
+// ---- 假网易云 API 的固定 id ----
+// fake_netease 与 cross_library_test 共用，避免两侧对不上。
+inline const std::string kNeteaseLibraryId = "netease-main";
+inline const std::string kNeteaseSongId = "186016";        // 正常可播放（12 号的链接）
+inline const std::string kNeteaseBlockedSongId = "186017"; // fee == 4，版权不可用
+// 10 号（本地有实体）那条链接指向的 id：用来验证「本地解析成功但存储读不到
+// 字节」时会不会换源。长度与另外两份都不同，测试据此判断拿到的是哪一份。
+inline const std::string kNeteaseEntitySongId = "186018";
+
+// 假网易云返回的音频字节：长度刻意避开本地 wav 的 1 MiB，
+// 前 4 字节是 magic，其余按固定公式填充，测试端用同一个函数核对。
+inline std::string neteaseAudioBytes(std::int64_t size, unsigned seed,
+                                    const char *magic) {
+  std::string out(static_cast<std::size_t>(size), '\0');
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    out[i] = static_cast<char>((i * 31 + seed * 17 + 7) % 251);
+  }
+  for (std::size_t i = 0; i < 4 && i < out.size(); ++i) {
+    out[i] = magic[i];
+  }
+  return out;
+}
+
+inline constexpr std::int64_t kNeteaseAudioSize = 131072;
+inline std::string kNeteaseAudioBytes() {
+  return neteaseAudioBytes(kNeteaseAudioSize, 5, "FNE1");
+}
+
+inline constexpr std::int64_t kNeteaseEntityAudioSize = 131079;
+inline std::string kNeteaseEntityAudioBytes() {
+  return neteaseAudioBytes(kNeteaseEntityAudioSize, 6, "FNE2");
+}
 
 } // namespace fixture
 

@@ -181,6 +181,11 @@ void seed(db::Session &session) {
               fixture::kTrackAlbumNullTitle, album_null_id, 1,
               fixture::kTrackAlbumNullEntity);
 
+  const std::int64_t track_unlinked_null =
+      insertTrack(session, root_id, fixture::kTrackUnlinkedNullPath,
+                  fixture::kTrackUnlinkedNullTitle, album_id, 4,
+                  fixture::kTrackUnlinkedNullEntity);
+
   printEnv(fixture::kEnvRootPath, fixture::kRootPath);
   printEnv(fixture::kEnvAlbumId, album_id);
   printEnv(fixture::kEnvAlbumRef,
@@ -200,6 +205,9 @@ void seed(db::Session &session) {
   printEnv(fixture::kEnvTrackNullId, track_null);
   printEnv(fixture::kEnvTrackNullRef,
            "local-main:track:" + std::to_string(track_null));
+  printEnv(fixture::kEnvTrackUnlinkedNullId, track_unlinked_null);
+  printEnv(fixture::kEnvTrackUnlinkedNullRef,
+           "local-main:track:" + std::to_string(track_unlinked_null));
 }
 
 // 假 PG 模式：不连库，只导出与 fake_pg 内置夹具一致的固定 id。
@@ -225,6 +233,11 @@ void printFixedEnv() {
   printEnv(fixture::kEnvTrackNullId, fixture::kFixedTrackNullId);
   printEnv(fixture::kEnvTrackNullRef,
            "local-main:track:" + std::to_string(fixture::kFixedTrackNullId));
+  printEnv(fixture::kEnvTrackUnlinkedNullId,
+           fixture::kFixedTrackUnlinkedNullId);
+  printEnv(fixture::kEnvTrackUnlinkedNullRef,
+           "local-main:track:" +
+               std::to_string(fixture::kFixedTrackUnlinkedNullId));
 }
 
 } // namespace
