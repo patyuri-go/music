@@ -15,66 +15,7 @@
 
 namespace media_library {
 
-std::string_view aspect_name(Aspect aspect) noexcept {
-  switch (aspect) {
-  case Aspect::Metadata:
-    return "metadata";
-  case Aspect::Lyrics:
-    return "lyrics";
-  case Aspect::Stream:
-    return "stream";
-  case Aspect::Artwork:
-    return "artwork";
-  }
-  return "metadata";
-}
-
-std::optional<Aspect> parse_aspect(std::string_view text) noexcept {
-  if (text == "metadata") {
-    return Aspect::Metadata;
-  }
-  if (text == "lyrics") {
-    return Aspect::Lyrics;
-  }
-  if (text == "stream") {
-    return Aspect::Stream;
-  }
-  if (text == "artwork") {
-    return Aspect::Artwork;
-  }
-  return std::nullopt;
-}
-
-CapabilityId capability_for(Aspect aspect) noexcept {
-  switch (aspect) {
-  case Aspect::Metadata:
-    return CapabilityId::CatalogRead;
-  case Aspect::Lyrics:
-    return CapabilityId::LyricsRead;
-  case Aspect::Stream:
-    return CapabilityId::StreamResolve;
-  case Aspect::Artwork:
-    return CapabilityId::ArtworkRead;
-  }
-  return CapabilityId::CatalogRead;
-}
-
-bool aspect_accepts(Aspect aspect, EntityType type) noexcept {
-  switch (aspect) {
-  case Aspect::Metadata:
-    return type == EntityType::Track || type == EntityType::Album ||
-           type == EntityType::Artist || type == EntityType::AlbumArtist ||
-           type == EntityType::Playlist;
-  case Aspect::Lyrics:
-    return type == EntityType::Track;
-  case Aspect::Stream:
-    return type == EntityType::Track;
-  case Aspect::Artwork:
-    // 封面挂在任意 owner 上（曲目、专辑、艺术家、歌单）。
-    return true;
-  }
-  return false;
-}
+// Aspect 的纯映射在 aspect.cpp；这里只留 EntityLink 的 DB 实现。
 
 namespace {
 

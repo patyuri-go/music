@@ -79,6 +79,7 @@ add_executable(musicd
   ./src/media_library/local_library.cpp
   ./src/media_library/library_runtime.cpp
   ./src/media_library/registry.cpp
+  ./src/media_library/aspect.cpp
   ./src/media_library/entity_link.cpp
   ./src/media_library/router.cpp
   ./src/media_library/media_router.cpp
