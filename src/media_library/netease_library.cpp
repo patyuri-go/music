@@ -956,7 +956,7 @@ NeteaseLibrary::resolve_playback(const TrackRef &ref, const CallContext &ctx) {
   }
 
   PlaybackSource source;
-  source.track = ref;
+  source.owner = ref;
   source.kind = PlaybackKind::RemoteStream;
   source.quality = url.value().level_name.empty()
                        ? std::optional<std::string>(level)
@@ -1101,6 +1101,9 @@ NeteaseLibrary::artwork_location(const ArtworkRef &ref,
   // 留空（远端没有本地缓存键）。
   location.locator = *picture;
   location.mime_type = "image/jpeg";
+  // 网易云封面本轮保持直连语义（不跟随 302），与音频侧的已知缺口一致。
+  location.open_timeout_ms = 0;
+  location.max_redirects = 0;
   return Result<ArtworkLocation>::success(std::move(location));
 }
 

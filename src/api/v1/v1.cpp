@@ -288,7 +288,7 @@ Json::Value lyrics_json(const Lyrics &lyrics) {
 // internal_locator 是进程内定位符，绝不写进响应（5.4.4）。
 Json::Value stream_json(const PlaybackSource &source) {
   Json::Value out;
-  out["track"] = ref_json(source.track);
+  out["track"] = ref_json(source.owner);
   switch (source.kind) {
   case PlaybackKind::LocalFile:
     out["kind"] = "local_file";

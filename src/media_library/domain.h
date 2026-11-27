@@ -274,7 +274,8 @@ enum class PlaybackKind { LocalFile, WebDav, RemoteStream, Cache };
 enum class AccessMode { Proxy, Redirect };
 
 struct PlaybackSource {
-  TrackRef track;
+  // 音频是曲目，封面是专辑/艺术家；两者都是 SourceRef，所以统一叫 owner。
+  SourceRef owner;
   PlaybackKind kind = PlaybackKind::LocalFile;
   std::optional<std::string> quality;
   std::optional<int> bitrate_kbps;
@@ -286,6 +287,10 @@ struct PlaybackSource {
   bool cacheable = false;
   std::vector<Restriction> restrictions;
   std::string internal_locator;
+  // 封面等资源的缓存标签；音频留空。用于 HTTP ETag 与客户端缓存校验。
+  std::string cache_tag;
+  // 本地库专有：封面缩放/转码产物的虚拟路径。远端库留空。
+  std::optional<std::string> cache_virtual_path;
   // 打开远端流时等待响应头的上限；0 表示除 libcurl 自身超时外不额外限制。
   std::int64_t open_timeout_ms = 0;
   // 允许跟随的 3xx 跳转次数；0 表示不跟随（直连语义）。存储节点可以把

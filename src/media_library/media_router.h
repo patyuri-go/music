@@ -94,6 +94,9 @@ public:
   resolve_stream(const TrackRef &ref, const CallContext &ctx) = 0;
   virtual Result<Sourced<ArtworkRef>> resolve_artwork(const SourceRef &owner,
                                                       const CallContext &ctx) = 0;
+  // 封面的“描述 + 字节位置”：与 resolve_stream 对称，失败可按优先级回退。
+  virtual Result<Sourced<PlaybackSource>>
+  resolve_artwork_source(const SourceRef &owner, const CallContext &ctx) = 0;
   // 信息（描述）也属 metadata 方面：顺序与 resolve_track 同一套。
   virtual Result<Sourced<AlbumInfo>> resolve_album_info(const AlbumRef &ref,
                                                         const CallContext &ctx) = 0;
@@ -143,6 +146,9 @@ public:
   resolve_stream(const TrackRef &ref, const CallContext &ctx) override;
   Result<Sourced<ArtworkRef>> resolve_artwork(const SourceRef &owner,
                                               const CallContext &ctx) override;
+  Result<Sourced<PlaybackSource>>
+  resolve_artwork_source(const SourceRef &owner,
+                         const CallContext &ctx) override;
   Result<Sourced<AlbumInfo>> resolve_album_info(const AlbumRef &ref,
                                                 const CallContext &ctx) override;
   Result<Sourced<ArtistInfo>>

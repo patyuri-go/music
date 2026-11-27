@@ -202,6 +202,12 @@ struct ArtworkLocation {
   // 本地库专有：虚拟路径，用于命中 image_cache 的缩放/转码产物。
   // 远端库留空。只被 ArtworkService 使用，不出进程。
   std::optional<std::string> cache_virtual_path;
+  // 字节来自 image_cache 的产物（locator 为缓存文件路径），对应
+  // PlaybackKind::Cache；为假时 locator 是原始来源。
+  bool from_cache = false;
+  // 与 PlaybackSource 对齐：打开远端字节流时的等待上限与 3xx 跟随策略。
+  std::int64_t open_timeout_ms = 0;
+  int max_redirects = 0;
 };
 
 // 可选能力：把封面描述变成可打开的字节位置。

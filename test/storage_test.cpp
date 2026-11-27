@@ -167,8 +167,10 @@ int main(int argc, char **argv) {
   check(cover.header("cache-control").find("max-age") != std::string::npos,
         "封面带 Cache-Control");
 
-  const std::string album_entity = fixture("FIXTURE_ALBUM_ENTITY");
-  const std::string cover_etag = "\"" + album_entity + "\"";
+  // ETag 来源已从存储上游改为路由层的 ArtworkRef.cache_tag（见决策文档
+  // 第 16 节），所以这里先取首次响应的 ETag，再用它做条件请求。
+  const std::string cover_etag = cover.header("etag");
+  check(!cover_etag.empty(), "封面带 ETag");
   const Response cached = get(cfg, "/api/album/" + album_ref + "/cover",
                               {"If-None-Match: " + cover_etag});
   check(cached.status == 304, "If-None-Match 命中 -> 304（实际 " +

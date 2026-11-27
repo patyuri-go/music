@@ -848,6 +848,58 @@ Result<AspectResult<ArtworkRef>> Router::resolve_artwork(const SourceRef &owner,
       });
 }
 
+Result<AspectResult<PlaybackSource>>
+Router::resolve_artwork_source(const SourceRef &owner, const CallContext &ctx) {
+  return run_aspect<PlaybackSource>(
+      owner, Aspect::Artwork, ctx,
+      [](Library &library, const SourceRef &candidate,
+         const CallContext &call_ctx) -> Result<PlaybackSource> {
+        auto provider = library.capability<ArtworkProvider>();
+        if (!provider.has_value()) {
+          // 缺能力必须按可回退错误上报：库声明了 ArtworkRead 但没注册
+          // provider 属于配置问题，不应让整条链接直接失败。
+          return Result<PlaybackSource>::failure(
+              Error::make(ErrorCode::ProviderUnavailable,
+                          "no artwork provider"));
+        }
+        Result<ArtworkRef> artwork =
+            provider->get().get_artwork(candidate, call_ctx);
+        if (!artwork.ok()) {
+          return Result<PlaybackSource>::failure(artwork.error());
+        }
+
+        auto bytes = library.capability<ArtworkBytes>();
+        if (!bytes.has_value()) {
+          return Result<PlaybackSource>::failure(
+              Error::make(ErrorCode::ProviderUnavailable,
+                          "no artwork bytes"));
+        }
+        Result<ArtworkLocation> located =
+            bytes->get().artwork_location(artwork.value(), call_ctx);
+        if (!located.ok()) {
+          return Result<PlaybackSource>::failure(located.error());
+        }
+
+        const ArtworkLocation &location = located.value();
+        PlaybackSource source;
+        source.owner = candidate;
+        source.internal_locator = location.locator;
+        source.kind = location.from_cache
+                          ? PlaybackKind::Cache
+                          : ((location.locator.rfind("http://", 0) == 0 ||
+                              location.locator.rfind("https://", 0) == 0)
+                                 ? PlaybackKind::RemoteStream
+                                 : PlaybackKind::LocalFile);
+        source.mime_type = location.mime_type;
+        source.content_length = location.size_bytes;
+        source.cache_tag = artwork.value().cache_tag;
+        source.cache_virtual_path = location.cache_virtual_path;
+        source.open_timeout_ms = location.open_timeout_ms;
+        source.max_redirects = location.max_redirects;
+        return Result<PlaybackSource>::success(std::move(source));
+      });
+}
+
 Result<AspectResult<AlbumInfo>>
 Router::resolve_album_info(const AlbumRef &ref, const CallContext &ctx) {
   return run_aspect<AlbumInfo>(

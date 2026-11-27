@@ -41,31 +41,6 @@ Error internal_error(std::string message) {
   return Error::make(ErrorCode::Internal, std::move(message));
 }
 
-// 把 PlaybackSource 变成字节流。音频与图片共用 byte_stream 的两个适配器。
-Result<std::unique_ptr<AudioStream>> make_audio_stream(
-    const PlaybackSource &source) {
-  if (source.internal_locator.empty()) {
-    return Result<std::unique_ptr<AudioStream>>::failure(
-        internal_error("playback source has no locator"));
-  }
-  switch (source.kind) {
-  case PlaybackKind::LocalFile: {
-    return make_file_stream(source.internal_locator, source.mime_type);
-  }
-  case PlaybackKind::Cache: {
-    return make_file_stream(source.internal_locator, source.mime_type);
-  }
-  case PlaybackKind::WebDav:
-  case PlaybackKind::RemoteStream: {
-    return make_http_stream(source.internal_locator, source.mime_type,
-                            source.content_length, source.range_supported,
-                            source.open_timeout_ms, source.max_redirects);
-  }
-  }
-  return Result<std::unique_ptr<AudioStream>>::failure(
-      Error::make(ErrorCode::Unsupported, "unsupported playback kind"));
-}
-
 // ---------------------------------------------------------------------------
 // 会话实现
 // ---------------------------------------------------------------------------
@@ -266,6 +241,28 @@ private:
 };
 
 } // namespace
+
+// 把 PlaybackSource 变成字节流。音频与封面共用同一层：kind 决定是
+// 本地文件还是 HTTP 取流。
+Result<std::unique_ptr<AudioStream>>
+make_audio_stream(const PlaybackSource &source) {
+  if (source.internal_locator.empty()) {
+    return Result<std::unique_ptr<AudioStream>>::failure(
+        internal_error("playback source has no locator"));
+  }
+  switch (source.kind) {
+  case PlaybackKind::LocalFile:
+  case PlaybackKind::Cache:
+    return make_file_stream(source.internal_locator, source.mime_type);
+  case PlaybackKind::WebDav:
+  case PlaybackKind::RemoteStream:
+    return make_http_stream(source.internal_locator, source.mime_type,
+                            source.content_length, source.range_supported,
+                            source.open_timeout_ms, source.max_redirects);
+  }
+  return Result<std::unique_ptr<AudioStream>>::failure(
+      Error::make(ErrorCode::Unsupported, "unsupported playback kind"));
+}
 
 std::shared_ptr<Clock> make_system_clock() {
   return std::make_shared<SystemClock>();

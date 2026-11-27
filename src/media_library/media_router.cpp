@@ -248,6 +248,19 @@ MediaRouterImpl::resolve_artwork(const SourceRef &owner,
       sourced_resolved(std::move(resolved.value), resolved, Aspect::Artwork));
 }
 
+Result<Sourced<PlaybackSource>>
+MediaRouterImpl::resolve_artwork_source(const SourceRef &owner,
+                                        const CallContext &ctx) {
+  Result<AspectResult<PlaybackSource>> result =
+      router_->resolve_artwork_source(owner, ctx);
+  if (!result.ok()) {
+    return Result<Sourced<PlaybackSource>>::failure(result.error());
+  }
+  AspectResult<PlaybackSource> resolved = std::move(result).value();
+  return Result<Sourced<PlaybackSource>>::success(sourced_resolved(
+      std::move(resolved.value), resolved, Aspect::Artwork));
+}
+
 Result<Sourced<AlbumInfo>>
 MediaRouterImpl::resolve_album_info(const AlbumRef &ref,
                                     const CallContext &ctx) {

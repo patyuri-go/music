@@ -325,25 +325,7 @@ void serve_track_async(const RequestPtr &req,
 void serve_artwork_async(const RequestPtr &req,
                          const media_library::ArtworkRef &artwork,
                          bool head_only, AsyncCallback callback) {
-  const auto internal_id =
-      media_library::compat_internal_id_of(artwork.owner);
-  if (internal_id.has_value()) {
-    const auto entity_id =
-        media_library::compat_artwork_entity_id(artwork.owner);
-    if (!entity_id.has_value()) {
-      callback(error_response(Error::make(
-          ErrorCode::NotFound, "album has no entity id")));
-      return;
-    }
-    if (!storage_client::enabled()) {
-      callback(error_response(Error::make(
-          ErrorCode::ProviderUnavailable, "storage service is not configured")));
-      return;
-    }
-    storage_client::serve_content(req, *entity_id, true, head_only,
-                                  std::move(callback));
-    return;
-  }
+  // 封面与音频同一条出口：统一交给 ArtworkService 路由选源，失败可回退。
   run_off_loop([req, artwork, head_only] {
     return serve_artwork(req, artwork, head_only);
   }, std::move(callback));

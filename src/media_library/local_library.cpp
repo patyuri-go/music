@@ -3,6 +3,7 @@
 #include "config.h"
 #include "db.h"
 #include "http_util.h"
+#include "image_cache.h"
 #include "storage_client.h"
 #include "schema.h"
 #include "storage.h"
@@ -826,7 +827,7 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
   }
 
   PlaybackSource source;
-  source.track = ref;
+  source.owner = ref;
   // 本地库不再读本地文件/WebDAV：字节统一由存储服务按实体 id 提供。
   source.internal_locator = storage_client::content_url(row->entity_id);
   source.kind = PlaybackKind::RemoteStream;
@@ -980,13 +981,42 @@ Result<ArtworkLocation> LocalLibrary::artwork_location(const ArtworkRef &ref,
         Error::make(ErrorCode::NotFound, "artwork not found"));
   }
 
+  // 缓存优先：库自己知道封面有没有本地缓存产物，命中时直接把缓存文件
+  // 交给路由层，由 PlaybackKind::Cache 表达，ArtworkService 不再判断。
+  if (!cover.path.empty()) {
+    if (auto cache = image_cache::get()) {
+      std::string error;
+      if (const auto hit = cache->ensure(cover.path, "original", error)) {
+        ArtworkLocation location;
+        location.locator = hit->string();
+        location.from_cache = true;
+        location.cache_virtual_path = cover.path;
+        std::error_code ec;
+        const std::uintmax_t size = std::filesystem::file_size(*hit, ec);
+        if (!ec) {
+          location.size_bytes = static_cast<std::int64_t>(size);
+        }
+        return Result<ArtworkLocation>::success(std::move(location));
+      }
+      // 缓存生成失败不影响出图：回退到存储服务的原始封面。
+    }
+  }
+
   if (cover.entity_id.empty()) {
     return Result<ArtworkLocation>::failure(
         Error::make(ErrorCode::NotFound, "album has no entity id"));
   }
 
+  if (!storage_client::enabled()) {
+    return Result<ArtworkLocation>::failure(Error::make(
+        ErrorCode::ProviderUnavailable, "storage service is not configured"));
+  }
+
   ArtworkLocation location;
   location.locator = storage_client::content_url(cover.entity_id);
+  location.open_timeout_ms = storage_client::timeout_ms();
+  // 存储节点可以把上游直链以 302 交出来，和本地库音频保持一致。
+  location.max_redirects = 5;
   return Result<ArtworkLocation>::success(std::move(location));
 }
 

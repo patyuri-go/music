@@ -141,6 +141,10 @@ public:
   resolve_playback(const TrackRef &ref, const CallContext &ctx);
   Result<AspectResult<ArtworkRef>> resolve_artwork(const SourceRef &owner,
                                                    const CallContext &ctx);
+  // 与 resolve_playback 对称：把封面描述和字节位置放在同一个候选循环里，
+  // 任一库失败都能按方面优先级回退。
+  Result<AspectResult<PlaybackSource>>
+  resolve_artwork_source(const SourceRef &owner, const CallContext &ctx);
   Result<AspectResult<AlbumInfo>> resolve_album_info(const AlbumRef &ref,
                                                      const CallContext &ctx);
   Result<AspectResult<ArtistInfo>> resolve_artist_info(const SourceRef &ref,

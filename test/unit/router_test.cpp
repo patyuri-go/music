@@ -23,6 +23,10 @@
 namespace {
 
 using media_library::AccessMode;
+using media_library::ArtworkBytes;
+using media_library::ArtworkLocation;
+using media_library::ArtworkProvider;
+using media_library::ArtworkRef;
 using media_library::Aspect;
 using media_library::AspectPriority;
 using media_library::CallContext;
@@ -73,9 +77,42 @@ public:
   }
 };
 
+class FakeArtworkProvider final : public ArtworkProvider {
+public:
+  std::function<Result<ArtworkRef>(const SourceRef &)> handler;
+  std::vector<std::string> calls;
+
+  Result<ArtworkRef> get_artwork(const SourceRef &owner,
+                                 const CallContext &) override {
+    calls.push_back(owner.library_id);
+    if (!handler) {
+      return Result<ArtworkRef>::failure(
+          Error::make(ErrorCode::NotFound, "no artwork handler"));
+    }
+    return handler(owner);
+  }
+};
+
+class FakeArtworkBytes final : public ArtworkBytes {
+public:
+  std::function<Result<ArtworkLocation>(const ArtworkRef &)> handler;
+  std::vector<std::string> calls;
+
+  Result<ArtworkLocation> artwork_location(const ArtworkRef &ref,
+                                           const CallContext &) override {
+    calls.push_back(ref.owner.library_id);
+    if (!handler) {
+      return Result<ArtworkLocation>::failure(
+          Error::make(ErrorCode::NotFound, "no artwork bytes handler"));
+    }
+    return handler(ref);
+  }
+};
+
 class FakeLibrary final : public Library {
 public:
-  FakeLibrary(std::string id, std::vector<CapabilityId> supported)
+  FakeLibrary(std::string id, std::vector<CapabilityId> supported,
+              bool with_artwork = true)
       : id_(std::move(id)) {
     for (const CapabilityId id : supported) {
       CapabilityState state;
@@ -86,6 +123,12 @@ public:
     }
     resolver_ = std::make_shared<FakeStreamResolver>();
     register_capability<StreamResolver>(resolver_);
+    if (with_artwork) {
+      artwork_provider_ = std::make_shared<FakeArtworkProvider>();
+      artwork_bytes_ = std::make_shared<FakeArtworkBytes>();
+      register_capability<ArtworkProvider>(artwork_provider_);
+      register_capability<ArtworkBytes>(artwork_bytes_);
+    }
   }
 
   LibraryIdentity identity() const override {
@@ -95,11 +138,15 @@ public:
   void close() noexcept override {}
 
   FakeStreamResolver &resolver() { return *resolver_; }
+  FakeArtworkProvider &artwork_provider() { return *artwork_provider_; }
+  FakeArtworkBytes &artwork_bytes() { return *artwork_bytes_; }
 
 private:
   std::string id_;
   CapabilitySet caps_;
   std::shared_ptr<FakeStreamResolver> resolver_;
+  std::shared_ptr<FakeArtworkProvider> artwork_provider_;
+  std::shared_ptr<FakeArtworkBytes> artwork_bytes_;
 };
 
 // 默认「有链接」：成员与排序都由测试填。has_link=false 模拟查不到映射，
@@ -186,7 +233,7 @@ TrackRef trackRef(const std::string &library_id, const std::string &entity_id) {
 
 Result<PlaybackSource> playable(const TrackRef &ref) {
   PlaybackSource source;
-  source.track = ref;
+  source.owner = ref;
   source.kind = PlaybackKind::RemoteStream;
   source.mime_type = "audio/wav";
   source.access_mode = AccessMode::Proxy;
@@ -201,8 +248,9 @@ Result<PlaybackSource> failWith(ErrorCode code) {
 std::shared_ptr<FakeLibrary> addLibrary(
     const std::shared_ptr<LibraryRegistry> &registry, const std::string &id,
     bool enabled = true,
-    const std::vector<CapabilityId> &supported = {CapabilityId::StreamResolve}) {
-  auto library = std::make_shared<FakeLibrary>(id, supported);
+    const std::vector<CapabilityId> &supported = {CapabilityId::StreamResolve},
+    bool with_artwork = true) {
+  auto library = std::make_shared<FakeLibrary>(id, supported, with_artwork);
   LibraryRegistration registration;
   registration.library_id = id;
   registration.display_name = id;
@@ -451,6 +499,202 @@ TEST(RouterTest, CandidatesAreCappedAtThree) {
     EXPECT_EQ(libraries[i]->resolver().calls.size(), 1u) << "lib " << i;
   }
   EXPECT_EQ(libraries[3]->resolver().calls.size(), 0u);
+}
+
+// ---- 封面：get_artwork + artwork_location 合成 PlaybackSource --------------
+
+Result<ArtworkRef> artworkFor(const SourceRef &owner, std::string cache_tag = {}) {
+  ArtworkRef ref;
+  ref.owner = owner;
+  ref.cache_tag = std::move(cache_tag);
+  return Result<ArtworkRef>::success(std::move(ref));
+}
+
+Result<ArtworkLocation> locationFor(std::string locator, std::string mime,
+                                    std::optional<std::int64_t> size) {
+  ArtworkLocation location;
+  location.locator = std::move(locator);
+  location.mime_type = std::move(mime);
+  location.size_bytes = size;
+  return Result<ArtworkLocation>::success(std::move(location));
+}
+
+// 12. 封面解析成功：owner、mime、长度、ETag、image_cache 键与打开策略都要
+//     原样带进 PlaybackSource；文件 locator 推断为 LocalFile。
+TEST(RouterTest, ArtworkSourceCarriesLocationFields) {
+  Env env;
+  const auto local =
+      addLibrary(env.registry, "local-main", true, {CapabilityId::ArtworkRead});
+  local->artwork_provider().handler = [](const SourceRef &owner) {
+    return artworkFor(owner, "etag-local");
+  };
+  local->artwork_bytes().handler = [](const ArtworkRef &) {
+    ArtworkLocation location;
+    location.locator = "/tmp/cover.jpg";
+    location.mime_type = "image/jpeg";
+    location.size_bytes = 1234;
+    location.cache_virtual_path = "local/cover.jpg";
+    location.open_timeout_ms = 1500;
+    location.max_redirects = 5;
+    return Result<ArtworkLocation>::success(std::move(location));
+  };
+  const SourceRef owner{"local-main", EntityType::Album, "2"};
+  env.links->members = {owner};
+  env.links->order = {"local-main"};
+  env.build();
+
+  const auto result = env.router->resolve_artwork_source(owner, CallContext{});
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().source.library_id, "local-main");
+  EXPECT_FALSE(result.value().substituted);
+
+  const PlaybackSource &source = result.value().value;
+  EXPECT_EQ(source.owner, owner);
+  EXPECT_EQ(source.kind, PlaybackKind::LocalFile);
+  EXPECT_EQ(source.internal_locator, "/tmp/cover.jpg");
+  EXPECT_EQ(source.mime_type, "image/jpeg");
+  ASSERT_TRUE(source.content_length.has_value());
+  EXPECT_EQ(*source.content_length, 1234);
+  EXPECT_EQ(source.cache_tag, "etag-local");
+  ASSERT_TRUE(source.cache_virtual_path.has_value());
+  EXPECT_EQ(*source.cache_virtual_path, "local/cover.jpg");
+  EXPECT_EQ(source.open_timeout_ms, 1500);
+  EXPECT_EQ(source.max_redirects, 5);
+}
+
+// 16. 库返回的字节来自 image_cache 产物时用 kind=Cache 表达，
+//     路由层不再关心缓存如何命中。
+TEST(RouterTest, ArtworkSourceFromCacheUsesCacheKind) {
+  Env env;
+  const auto local =
+      addLibrary(env.registry, "local-main", true, {CapabilityId::ArtworkRead});
+  local->artwork_provider().handler = [](const SourceRef &owner) {
+    return artworkFor(owner, "etag-cache");
+  };
+  local->artwork_bytes().handler = [](const ArtworkRef &) {
+    ArtworkLocation location;
+    location.locator = "/tmp/cache/cover.jpg";
+    location.from_cache = true;
+    return Result<ArtworkLocation>::success(std::move(location));
+  };
+  const SourceRef owner{"local-main", EntityType::Album, "2"};
+  env.links->members = {owner};
+  env.links->order = {"local-main"};
+  env.build();
+
+  const auto result = env.router->resolve_artwork_source(owner, CallContext{});
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const PlaybackSource &source = result.value().value;
+  EXPECT_EQ(source.kind, PlaybackKind::Cache);
+  EXPECT_EQ(source.internal_locator, "/tmp/cache/cover.jpg");
+  EXPECT_FALSE(result.value().substituted);
+}
+
+// 13. 本地 artwork_location 返回 NotFound（典型：专辑有封面路径但没有
+//     entity id）时换下一个库；远端 http locator 推断为 RemoteStream。
+TEST(RouterTest, ArtworkLocationNotFoundFallsBackToNextCandidate) {
+  Env env;
+  const auto local =
+      addLibrary(env.registry, "local-main", true, {CapabilityId::ArtworkRead});
+  const auto remote =
+      addLibrary(env.registry, "netease-main", true, {CapabilityId::ArtworkRead});
+  local->artwork_provider().handler = [](const SourceRef &owner) {
+    return artworkFor(owner);
+  };
+  local->artwork_bytes().handler = [](const ArtworkRef &) {
+    return Result<ArtworkLocation>::failure(
+        Error::make(ErrorCode::NotFound, "album has no entity id"));
+  };
+  remote->artwork_provider().handler = [](const SourceRef &owner) {
+    return artworkFor(owner, "etag-remote");
+  };
+  remote->artwork_bytes().handler = [](const ArtworkRef &) {
+    return locationFor("https://cdn.example.com/cover.jpg", "image/jpeg", 4321);
+  };
+  const SourceRef owner{"local-main", EntityType::Album, "2"};
+  const SourceRef remote_owner{"netease-main", EntityType::Album, "b-2"};
+  env.links->members = {owner, remote_owner};
+  env.links->order = {"local-main", "netease-main"};
+  env.build();
+
+  const auto result = env.router->resolve_artwork_source(owner, CallContext{});
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().source.library_id, "netease-main");
+  EXPECT_TRUE(result.value().substituted);
+  ASSERT_EQ(result.value().attempts.size(), 2u);
+  EXPECT_EQ(result.value().attempts[0].library_id, "local-main");
+  ASSERT_TRUE(result.value().attempts[0].error.has_value());
+  EXPECT_EQ(*result.value().attempts[0].error, ErrorCode::NotFound);
+
+  const PlaybackSource &source = result.value().value;
+  EXPECT_EQ(source.owner, remote_owner);
+  EXPECT_EQ(source.kind, PlaybackKind::RemoteStream);
+  EXPECT_EQ(source.internal_locator, "https://cdn.example.com/cover.jpg");
+  EXPECT_EQ(source.mime_type, "image/jpeg");
+  EXPECT_EQ(source.cache_tag, "etag-remote");
+  EXPECT_EQ(source.open_timeout_ms, 0);
+  EXPECT_EQ(source.max_redirects, 0);
+}
+
+// 14. get_artwork 返回 ProviderUnavailable 时同样换源。
+TEST(RouterTest, ArtworkProviderUnavailableFallsBackToNextCandidate) {
+  Env env;
+  const auto local =
+      addLibrary(env.registry, "local-main", true, {CapabilityId::ArtworkRead});
+  const auto remote =
+      addLibrary(env.registry, "netease-main", true, {CapabilityId::ArtworkRead});
+  local->artwork_provider().handler = [](const SourceRef &) {
+    return Result<ArtworkRef>::failure(
+        Error::make(ErrorCode::ProviderUnavailable, "storage down"));
+  };
+  remote->artwork_provider().handler = [](const SourceRef &owner) {
+    return artworkFor(owner);
+  };
+  remote->artwork_bytes().handler = [](const ArtworkRef &) {
+    return locationFor("https://cdn.example.com/cover.jpg", "image/jpeg", 10);
+  };
+  const SourceRef owner{"local-main", EntityType::Album, "2"};
+  const SourceRef remote_owner{"netease-main", EntityType::Album, "b-2"};
+  env.links->members = {owner, remote_owner};
+  env.links->order = {"local-main", "netease-main"};
+  env.build();
+
+  const auto result = env.router->resolve_artwork_source(owner, CallContext{});
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().source.library_id, "netease-main");
+  EXPECT_TRUE(result.value().substituted);
+  ASSERT_EQ(result.value().attempts.size(), 2u);
+  EXPECT_EQ(local->artwork_provider().calls.size(), 1u);
+  EXPECT_EQ(remote->artwork_provider().calls.size(), 1u);
+  EXPECT_EQ(remote->artwork_bytes().calls.size(), 1u);
+}
+
+// 15. 库声明了 ArtworkRead 但没注册 ArtworkProvider：按可回退的
+//     ProviderUnavailable 上报，不能报 Unsupported（后者不会触发换源）。
+TEST(RouterTest, MissingArtworkCapabilityFallsBackAsProviderUnavailable) {
+  Env env;
+  addLibrary(env.registry, "local-main", true, {CapabilityId::ArtworkRead},
+             /*with_artwork=*/false);
+  const auto remote =
+      addLibrary(env.registry, "netease-main", true, {CapabilityId::ArtworkRead});
+  remote->artwork_provider().handler = [](const SourceRef &owner) {
+    return artworkFor(owner);
+  };
+  remote->artwork_bytes().handler = [](const ArtworkRef &) {
+    return locationFor("https://cdn.example.com/cover.jpg", "image/jpeg", 10);
+  };
+  const SourceRef owner{"local-main", EntityType::Album, "2"};
+  const SourceRef remote_owner{"netease-main", EntityType::Album, "b-2"};
+  env.links->members = {owner, remote_owner};
+  env.links->order = {"local-main", "netease-main"};
+  env.build();
+
+  const auto result = env.router->resolve_artwork_source(owner, CallContext{});
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().source.library_id, "netease-main");
+  ASSERT_EQ(result.value().attempts.size(), 2u);
+  ASSERT_TRUE(result.value().attempts[0].error.has_value());
+  EXPECT_EQ(*result.value().attempts[0].error, ErrorCode::ProviderUnavailable);
 }
 
 } // namespace

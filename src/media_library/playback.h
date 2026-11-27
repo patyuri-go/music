@@ -64,6 +64,11 @@ struct OpenedStream {
   std::string library_id;
 };
 
+// 把 PlaybackSource 变成字节流：LocalFile/Cache 走文件，WebDav/RemoteStream
+// 走 HTTP。音频与封面共用这一层，封面只需要 kind + locator 描述。
+Result<std::unique_ptr<AudioStream>>
+make_audio_stream(const PlaybackSource &source);
+
 class PlaybackService {
 public:
   virtual ~PlaybackService() = default;

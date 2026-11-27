@@ -37,19 +37,6 @@ std::string content_url(const std::string &entity_id);
 // 配置里的超时（毫秒）。多来源路由拿它约束「探测响应头」的等待时间。
 int timeout_ms();
 
-// 异步代理一次内容请求。
-//
-// - entity_id：track.entity_id（音频）或 album.entity_id（封面）的 UUID。
-// - image：true 时用魔数识别封面类型，false 时用 TagLib 识别音频类型。
-// - head_only：只回响应头，不建立流。
-//
-// callback 可能在工作线程上被调用。成功时返回的响应是
-// newAsyncStreamResponse（chunked）；失败时是普通 JSON 响应。
-using Callback = std::function<void(const http_server::ResponsePtr &)>;
-void serve_content(const http_server::RequestPtr &req,
-                   const std::string &entity_id, bool image, bool head_only,
-                   Callback callback);
-
 } // namespace storage_client
 
 #endif // MUSICD_STORAGE_CLIENT_H
