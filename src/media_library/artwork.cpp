@@ -68,32 +68,30 @@ public:
     }
   }
 
-  Result<ArtworkInfo> info(const ArtworkRef &ref,
-                           const CallContext &ctx) override {
+  Result<OpenedArtwork> open(const ArtworkRef &ref, const CallContext &ctx,
+                             bool want_stream) override {
     Result<Resolved> resolved = resolve_location(ref, ctx, *router_);
     if (!resolved.ok()) {
-      return Result<ArtworkInfo>::failure(resolved.error());
+      return Result<OpenedArtwork>::failure(resolved.error());
     }
 
     Resolved value = std::move(resolved).value();
-    ArtworkInfo result;
-    result.mime_type = guess_mime(value.source);
-    result.size_bytes = value.source.content_length.value_or(-1);
-    result.etag = value.source.cache_tag;
-    result.library_id = value.library_id;
-    return Result<ArtworkInfo>::success(std::move(result));
-  }
+    OpenedArtwork out;
+    out.info.mime_type = guess_mime(value.source);
+    out.info.size_bytes = value.source.content_length.value_or(-1);
+    out.info.etag = value.source.cache_tag;
+    out.info.library_id = value.library_id;
 
-  Result<std::unique_ptr<ByteStream>>
-  open(const ArtworkRef &ref, const CallContext &ctx) override {
-    Result<Resolved> resolved = resolve_location(ref, ctx, *router_);
-    if (!resolved.ok()) {
-      return Result<std::unique_ptr<ByteStream>>::failure(resolved.error());
+    if (want_stream) {
+      // 缓存命中/生成由库层决定并用 kind=Cache 表达；这里只按 kind 建流。
+      Result<std::unique_ptr<ByteStream>> stream =
+          make_audio_stream(value.source);
+      if (!stream.ok()) {
+        return Result<OpenedArtwork>::failure(stream.error());
+      }
+      out.stream = std::move(stream).value();
     }
-
-    Resolved value = std::move(resolved).value();
-    // 缓存命中/生成由库层决定并用 kind=Cache 表达；这里只负责按 kind 建流。
-    return make_audio_stream(value.source);
+    return Result<OpenedArtwork>::success(std::move(out));
   }
 
 private:

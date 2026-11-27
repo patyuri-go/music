@@ -65,6 +65,20 @@ parse_path_ref(const std::string &text) {
   return parseItemId(http_util::urlDecode(text));
 }
 
+// 门面错误体：Jellyfin 用 ProblemDetails（不引第三方，按 OpenAPI 的
+// components.schemas.ProblemDetails 手拼）。状态码仍是真实 HTTP 状态。
+http_server::ResponsePtr problem_response(int status, const std::string &title,
+                                         const std::string &detail = {}) {
+  Json::Value problem;
+  problem["type"] = "about:blank";
+  problem["title"] = title;
+  problem["status"] = status;
+  if (!detail.empty()) {
+    problem["detail"] = detail;
+  }
+  return http_util::jsonResponse(status, json_util::dump(problem));
+}
+
 std::string lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(),
                  [](unsigned char c) { return std::tolower(c); });
@@ -656,7 +670,7 @@ http_server::ResponsePtr handleItem(const std::string &idstr) {
   }
 
   // 流派不是路由器实体（没有 SourceRef，int id 也无远端对应），不做特例实现。
-  return http_util::jsonResponse(404, "{}");
+  return problem_response(404, "not_found");
 }
 
 // 封面字节统一从 ArtworkService 出：选源交给 MediaRouter，locator 不外泄。
@@ -672,7 +686,7 @@ void handleImage(const http_server::RequestPtr &req, const std::string &idstr,
        ref->entity_type != media_library::EntityType::Album &&
        ref->entity_type != media_library::EntityType::Artist &&
        ref->entity_type != media_library::EntityType::AlbumArtist)) {
-    callback(http_util::jsonResponse(404, "{}"));
+    callback(problem_response(404, "not_found"));
     return;
   }
   media_library::ArtworkRef artwork;
@@ -680,6 +694,7 @@ void handleImage(const http_server::RequestPtr &req, const std::string &idstr,
                       ? media_library::as_artist_ref(*ref)
                       : *ref;
   stream_http::serve_artwork_async(req, artwork, head_only,
+                                   stream_http::Protocol::Jellyfin,
                                    std::move(callback));
 }
 
@@ -688,11 +703,12 @@ void handleStream(const http_server::RequestPtr &req, const std::string &idstr,
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
       ref->entity_type != media_library::EntityType::Track) {
-    callback(http_util::jsonResponse(404, "{}"));
+    callback(problem_response(404, "not_found"));
     return;
   }
   // 音频字节：本地库按实体 id 直连存储服务，远端库沿用同步路径。
   stream_http::serve_track_async(req, *ref, req->isHead(),
+                                 stream_http::Protocol::Jellyfin,
                                  std::move(callback));
 }
 
@@ -856,18 +872,18 @@ http_server::ResponsePtr handleLyrics(const std::string &idstr,
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
       ref->entity_type != media_library::EntityType::Track) {
-    return http_util::jsonResponse(404, "{}");
+    return problem_response(404, "not_found");
   }
   const auto lyricsResult =
       media_library::media_router().resolve_lyrics(*ref, {});
   const auto trackResult =
       media_library::media_router().resolve_track(*ref, {});
   if (!lyricsResult.ok() || !trackResult.ok()) {
-    return http_util::jsonResponse(404, "{}");
+    return problem_response(404, "not_found");
   }
   const auto &lyrics = lyricsResult.value().value;
   if (lyrics.lines.empty()) {
-    return http_util::jsonResponse(404, "{}");
+    return problem_response(404, "not_found");
   }
   const auto &track = trackResult.value().value;
   const std::string artist =
@@ -900,7 +916,7 @@ http_server::ResponsePtr handleGenres(const http_server::RequestPtr &req) {
 http_server::ResponsePtr handleMusicGenreByName(const std::string &name) {
   // 同上：按名字取流派依赖本地流派的 int id，路由器不提供。
   (void)name;
-  return http_util::jsonResponse(404, "{}");
+  return problem_response(404, "not_found");
 }
 
 // ------------------------------------------------------------ 只读扩展接口
@@ -911,18 +927,20 @@ http_server::ResponsePtr handlePlaybackInfo(const http_server::RequestPtr &,
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
       ref->entity_type != media_library::EntityType::Track) {
-    return http_util::jsonResponse(404, "{}");
+    return problem_response(404, "not_found");
   }
   const auto service = media_library::playback_service_ptr();
   if (service == nullptr) {
-    return stream_http::error_response(media_library::Error::make(
-        media_library::ErrorCode::ProviderUnavailable,
-        "media runtime is not initialized"));
+    return stream_http::error_response_for(
+        stream_http::Protocol::Jellyfin,
+        media_library::Error::make(media_library::ErrorCode::ProviderUnavailable,
+                                   "media runtime is not initialized"));
   }
   // 用会话拿一次摘要，随后立刻关闭：这里只需要「能不能播、多大、多久」。
   auto session = service->open_playback(*ref, media_library::CallContext{});
   if (!session.ok()) {
-    return stream_http::error_response(session.error());
+    return stream_http::error_response_for(stream_http::Protocol::Jellyfin,
+                                          session.error());
   }
   const media_library::Track &t = session.value().track.value;
   const media_library::PlaybackSourceSummary &summary =
@@ -976,7 +994,7 @@ void handleImageType(const http_server::RequestPtr &req,
                      const std::string &idstr, const std::string &imageType,
                      const std::string &, AsyncCallback callback) {
   if (lower(imageType) != "primary") {
-    callback(http_util::jsonResponse(404, "{}"));
+    callback(problem_response(404, "not_found"));
     return;
   }
   handleImage(req, idstr, std::move(callback));
@@ -995,11 +1013,12 @@ void handleDownload(const http_server::RequestPtr &req,
   const auto ref = parse_path_ref(idstr);
   if (!ref.has_value() ||
       ref->entity_type != media_library::EntityType::Track) {
-    callback(http_util::jsonResponse(404, "{}"));
+    callback(problem_response(404, "not_found"));
     return;
   }
   // 下载与在线播放走同一条路径：字节来源一致，Range 语义一致。
   stream_http::serve_track_async(req, *ref, req->isHead(),
+                                 stream_http::Protocol::Jellyfin,
                                  std::move(callback));
 }
 
@@ -1026,7 +1045,7 @@ http_server::ResponsePtr handleFilters(const http_server::RequestPtr &) {
 http_server::ResponsePtr handleArtistByName(const std::string &raw) {
   // 按名字精确取艺术家不是路由器能力（SearchQuery 只有包含匹配）。
   (void)raw;
-  return http_util::jsonResponse(404, "{}");
+  return problem_response(404, "not_found");
 }
 
 // 相似艺术家：与本艺术家共享流派的其它艺术家。
@@ -1106,11 +1125,11 @@ http_server::ResponsePtr handlePlaylistById(const std::string &idstr) {
   const auto ref = parse_path_ref(idstr);
   if (directory == nullptr || !ref.has_value() ||
       ref->entity_type != media_library::EntityType::Playlist) {
-    return http_util::jsonResponse(404, "{}");
+    return problem_response(404, "not_found");
   }
   const auto result = directory->get_playlist(*ref, {});
   if (!result.ok()) {
-    return http_util::jsonResponse(404, "{}");
+    return problem_response(404, "not_found");
   }
   return json(200, playlistDto(result.value().value, itemId(*ref)));
 }
@@ -1143,7 +1162,7 @@ http_server::ResponsePtr handleCreatePlaylist(const http_server::RequestPtr &req
   // 歌单写入没有路由器能力（PlaylistWriter 不存在，PlaylistWrite
   // 能力从未注册）。
   (void)req;
-  return http_util::jsonResponse(501, "{}");
+  return problem_response(501, "not_implemented");
 }
 
 // 向歌单添加曲目（ids 可来自 query 或 JSON body）。
@@ -1151,7 +1170,7 @@ http_server::ResponsePtr handleAddToPlaylist(const http_server::RequestPtr &req,
                                    const std::string &idstr) {
   (void)req;
   (void)idstr;
-  return http_util::jsonResponse(501, "{}");
+  return problem_response(501, "not_implemented");
 }
 
 // 从歌单移除曲目（entryIds / ids 均按曲目 GUID 处理，可来自 query 或 body）。
@@ -1159,7 +1178,7 @@ http_server::ResponsePtr handleRemoveFromPlaylist(const http_server::RequestPtr 
                                         const std::string &idstr) {
   (void)req;
   (void)idstr;
-  return http_util::jsonResponse(501, "{}");
+  return problem_response(501, "not_implemented");
 }
 
 // 更新歌单：改名与/或替换曲目（name/ids 可来自 query 或 body）。
@@ -1167,13 +1186,13 @@ http_server::ResponsePtr handleUpdatePlaylist(const http_server::RequestPtr &req
                                     const std::string &idstr) {
   (void)req;
   (void)idstr;
-  return http_util::jsonResponse(501, "{}");
+  return problem_response(501, "not_implemented");
 }
 
 // 删除歌单。
 http_server::ResponsePtr handleDeletePlaylist(const std::string &idstr) {
   (void)idstr;
-  return http_util::jsonResponse(501, "{}");
+  return problem_response(501, "not_implemented");
 }
 
 } // namespace

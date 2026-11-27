@@ -1,5 +1,7 @@
 #include "http_client.h"
 
+#include "http_stream_buffer.h"
+
 #include <curl/curl.h>
 
 #include <algorithm>
@@ -93,14 +95,15 @@ std::size_t append_cb(char *buffer, std::size_t size, std::size_t count,
 }
 
 // 一次流式连接的共享状态。生产者是 libcurl，消费者是 ByteStream。
+//
+// 正文不在这里排队，而是进 StreamBuffer：它有字节水位，写满就挡住生产者，
+// 从而把背压一路传回上游 socket。这里只保留「响应头 + 终态」这点小状态。
 struct SharedStream {
   std::mutex mutex;
   std::condition_variable cv;
-  std::deque<std::string> chunks;
+  std::shared_ptr<StreamBuffer> buffer;
+  std::atomic<bool> cancelled{false};
   bool headers_ready = false;
-  bool finished = false;
-  bool cancelled = false;
-  bool failed = false;
   long status = 0;
   long long length = -1;
   std::map<std::string, std::string> headers;
@@ -110,9 +113,9 @@ struct SharedStream {
   bool follow_redirects = false;
 
   void cancel() {
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      cancelled = true;
+    cancelled.store(true);
+    if (buffer) {
+      buffer->cancel();
     }
     cv.notify_all();
   }
@@ -122,14 +125,11 @@ std::size_t stream_appendix_cb(char *buffer, std::size_t size,
                                std::size_t count, void *user) {
   auto *shared = static_cast<SharedStream *>(user);
   const std::size_t total = size * count;
-  {
-    std::lock_guard<std::mutex> lock(shared->mutex);
-    if (shared->cancelled) {
-      return 0;
-    }
-    shared->chunks.emplace_back(buffer, total);
+  // 这里可能阻塞：水位满了要等消费者腾地方，这正是背压的落点。
+  // 绝不能持有 shared->mutex 再等，否则 cancel() 拿不到锁会死锁。
+  if (!shared->buffer->push(buffer, total)) {
+    return 0; // 已取消：让 curl 中止上游传输。
   }
-  shared->cv.notify_all();
   return total;
 }
 
@@ -195,7 +195,7 @@ std::size_t stream_header_cb(char *buffer, std::size_t size,
 
 int progress_cb(void *user, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
   auto *shared = static_cast<SharedStream *>(user);
-  return shared->cancelled ? 1 : 0;
+  return shared->cancelled.load() ? 1 : 0;
 }
 
 } // namespace
@@ -337,11 +337,16 @@ Response Client::request(const std::string &method, const std::string &path,
 
 Stream openStream(const Url &base, const std::string &path,
                   const std::vector<std::string> &extra_headers,
-                  std::int64_t header_timeout_ms, int max_redirects) {
+                  std::int64_t header_timeout_ms, int max_redirects,
+                  std::size_t buffer_bytes) {
   static std::once_flag curl_once;
   std::call_once(curl_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
   auto shared = std::make_shared<SharedStream>();
   shared->follow_redirects = max_redirects > 0;
+  // 0 表示用默认水位（1 MiB）。水位是「不缓存整段」的唯一保障。
+  constexpr std::size_t kDefaultBufferBytes = 1024 * 1024;
+  shared->buffer = std::make_shared<StreamBuffer>(
+      buffer_bytes == 0 ? kDefaultBufferBytes : buffer_bytes);
   std::string path_value = path.empty() ? std::string("/") : path;
   if (path_value.front() != '/') {
     path_value.insert(path_value.begin(), '/');
@@ -354,11 +359,12 @@ Stream openStream(const Url &base, const std::string &path,
                         max_redirects]() {
     CURL *handle = curl_easy_init();
     if (handle == nullptr) {
-      std::lock_guard<std::mutex> lock(shared->mutex);
-      shared->failed = true;
-      shared->error = static_cast<int>(CURLE_FAILED_INIT);
-      shared->finished = true;
-      shared->headers_ready = true;
+      {
+        std::lock_guard<std::mutex> lock(shared->mutex);
+        shared->error = static_cast<int>(CURLE_FAILED_INIT);
+        shared->headers_ready = true;
+      }
+      shared->buffer->finish(/*failed=*/true);
       shared->cv.notify_all();
       return;
     }
@@ -391,10 +397,8 @@ Stream openStream(const Url &base, const std::string &path,
     const CURLcode code = curl_easy_perform(handle);
     {
       std::lock_guard<std::mutex> lock(shared->mutex);
-      shared->finished = true;
       shared->headers_ready = true;
       if (code != CURLE_OK) {
-        shared->failed = true;
         shared->error = static_cast<int>(code);
       }
       if (shared->status == 0 && code == CURLE_OK) {
@@ -403,6 +407,11 @@ Stream openStream(const Url &base, const std::string &path,
         shared->status = status;
       }
     }
+    // 用 CURLE_WRITE_ERROR 单独判断：那是我们主动挡住生产者的结果，不是故障。
+    const bool transport_failed =
+        code != CURLE_OK && code != CURLE_WRITE_ERROR &&
+        !shared->cancelled.load();
+    shared->buffer->finish(transport_failed);
     shared->cv.notify_all();
 
     if (headers != nullptr) {
@@ -420,10 +429,8 @@ Stream openStream(const Url &base, const std::string &path,
               lock, std::chrono::milliseconds(header_timeout_ms), ready)) {
         // 响应头迟迟不来：让生产者尽快收手，并把这次失败标成超时。
         shared->timed_out = true;
-        shared->failed = true;
-        shared->cancelled = true;
         lock.unlock();
-        shared->cv.notify_all();
+        shared->cancel();
         lock.lock();
       }
     } else {
@@ -444,24 +451,9 @@ Stream openStream(const Url &base, const std::string &path,
     if (n == 0) {
       return 0;
     }
-    std::unique_lock<std::mutex> lock(shared->mutex);
-    shared->cv.wait(lock, [&shared] {
-      return !shared->chunks.empty() || shared->finished || shared->cancelled;
-    });
-    if (shared->cancelled) {
-      return -1;
-    }
-    if (shared->chunks.empty()) {
-      return shared->failed ? -1 : 0;
-    }
-    std::string chunk = std::move(shared->chunks.front());
-    shared->chunks.pop_front();
-    const std::size_t take = std::min<std::size_t>(n, chunk.size());
-    std::memcpy(buf, chunk.data(), take);
-    if (take < chunk.size()) {
-      shared->chunks.emplace_front(chunk.substr(take));
-    }
-    return static_cast<long long>(take);
+    // 语义：>0 字节数，0 正常结束，-1 取消或上游传输出错。
+    // 三者必须区分 —— 把错误当 EOF 会让客户端把截断的音频当完整文件。
+    return shared->buffer->pop(buf, n);
   };
   stream.close = [shared] { shared->cancel(); };
   return stream;

@@ -832,7 +832,11 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
   source.internal_locator = storage_client::content_url(row->entity_id);
   source.kind = PlaybackKind::RemoteStream;
   source.mime_type = mime_for(row->format);
-  source.content_length = row->size_bytes;
+  // DB 未填 size_bytes 时是 0，不能当成「零字节文件」：那会产出
+  // `Content-Range: bytes 0--1/0`。<= 0 一律视为未知，交给探测补齐。
+  source.content_length =
+      row->size_bytes > 0 ? std::optional<std::int64_t>(row->size_bytes)
+                          : std::nullopt;
   source.range_supported = true;
   source.cacheable = false;
   source.access_mode = AccessMode::Proxy;
@@ -853,6 +857,16 @@ Result<PlaybackSource> LocalLibrary::resolve_playback(const TrackRef &ref,
   const Status ready = probe.value()->prepare();
   if (!ready.ok()) {
     return Result<PlaybackSource>::failure(ready.error());
+  }
+
+  // 探测结果写回：存储服务才知道真实长度与类型，让上层少一次猜。
+  // 只在值可信时覆盖，绝不把已知值改成未知。
+  const media_library::StreamInfo probed = probe.value()->info();
+  if (probed.size_bytes > 0) {
+    source.content_length = probed.size_bytes;
+  }
+  if (!probed.mime_type.empty()) {
+    source.mime_type = probed.mime_type;
   }
 
   return Result<PlaybackSource>::success(std::move(source));

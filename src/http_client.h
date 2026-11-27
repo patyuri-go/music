@@ -79,10 +79,15 @@ struct Stream {
 // `max_redirects > 0` 时跟随 3xx（只允许 http/https）。中间跳转的响应头
 // 不算「就绪」，返回的 status / headers 是最终一跳的。默认 0 = 不跟随，
 // 与旧的直连语义一致。
+//
+// `buffer_bytes` 是生产者与消费者之间的字节水位：curl 写回调攒到这个量就
+// 阻塞，直到读侧消费。没有它，慢消费者会让整个远端文件堆进内存。
+// 传 0 使用默认值（1 MiB）。
 Stream openStream(const Url &base, const std::string &path,
                   const std::vector<std::string> &extra_headers,
                   std::int64_t header_timeout_ms = 0,
-                  int max_redirects = 0);
+                  int max_redirects = 0,
+                  std::size_t buffer_bytes = 0);
 
 } // namespace http_client
 

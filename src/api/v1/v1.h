@@ -55,8 +55,9 @@ http_server::ResponsePtr playback_refresh(const http_server::RequestPtr &req,
                                 const std::string &session_id);
 http_server::ResponsePtr playback_close(const http_server::RequestPtr &req,
                               const std::string &session_id);
-http_server::ResponsePtr playback_stream(const http_server::RequestPtr &req,
-                               const std::string &session_id);
+void playback_stream(const http_server::RequestPtr &req,
+                     const std::string &session_id,
+                     std::function<void(const http_server::ResponsePtr &)> callback);
 
 } // namespace api_v1
 

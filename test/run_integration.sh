@@ -41,6 +41,7 @@ for bin in "$BIN_DIR/musicd" "$TEST_BIN_DIR/fake_pg" \
            "$TEST_BIN_DIR/playlist_test" "$TEST_BIN_DIR/lyrics_test" \
            "$TEST_BIN_DIR/artists_test" "$TEST_BIN_DIR/storage_test" \
            "$TEST_BIN_DIR/cross_library_test" \
+           "$TEST_BIN_DIR/third_party_test" \
            "$TEST_BIN_DIR/query_api_test"; do
   if [[ ! -x "$bin" ]]; then
     echo "缺少可执行文件 $bin（先运行 cmake --build --preset default）" >&2
@@ -222,6 +223,8 @@ run "歌词" "$TEST_BIN_DIR/lyrics_test" 127.0.0.1 "$MAIN_PORT" "$JF_PORT"
 run "艺术家" "$TEST_BIN_DIR/artists_test" 127.0.0.1 "$MAIN_PORT"
 run "存储代理" "$TEST_BIN_DIR/storage_test" 127.0.0.1 "$MAIN_PORT" "$STORAGE_PORT"
 run "跨库取流" "$TEST_BIN_DIR/cross_library_test" 127.0.0.1 "$MAIN_PORT" "$STORAGE_PORT"
+run "第三方门面" "$TEST_BIN_DIR/third_party_test" 127.0.0.1 "$MAIN_PORT" \
+  "$JF_PORT" 14533 "$STORAGE_PORT"
 
 # fake_pg 遇到没实现的 SQL 会打 "unhandled query"。有命中就说明夹具缺 handler，
 # 测试可能靠空结果集“假过”，必须判失败。

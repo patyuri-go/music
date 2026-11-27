@@ -13,12 +13,21 @@ add_executable(unit_tests
   ./netease_client_numeric_test.cpp
   ./json_util_test.cpp
   ./router_test.cpp
+  ./byte_stream_test.cpp
+  ./http_stream_buffer_test.cpp
+  ./stream_plan_test.cpp
+  ./stream_scheduler_test.cpp
   ${PROJECT_SOURCE_DIR}/src/api/api-enhanced/client.cpp
   ${PROJECT_SOURCE_DIR}/src/json_util.cpp
   ${PROJECT_SOURCE_DIR}/src/media_library/source_ref.cpp
   ${PROJECT_SOURCE_DIR}/src/media_library/aspect.cpp
   ${PROJECT_SOURCE_DIR}/src/media_library/registry.cpp
   ${PROJECT_SOURCE_DIR}/src/media_library/router.cpp
+  ${PROJECT_SOURCE_DIR}/src/media_library/byte_stream.cpp
+  ${PROJECT_SOURCE_DIR}/src/http_client.cpp
+  ${PROJECT_SOURCE_DIR}/src/http_stream_buffer.cpp
+  ${PROJECT_SOURCE_DIR}/src/stream_plan.cpp
+  ${PROJECT_SOURCE_DIR}/src/stream_scheduler.cpp
   ${PROJECT_SOURCE_DIR}/src/tools/amll_ttml.cpp
 )
 
@@ -30,6 +39,7 @@ target_link_libraries(unit_tests PRIVATE
   GTest::gtest_main
   JsonCpp::JsonCpp
   pugixml::pugixml
+  CURL::libcurl
 )
 
 set_target_properties(unit_tests PROPERTIES

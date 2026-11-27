@@ -210,10 +210,16 @@ int main(int argc, char **argv) {
     check(media.header("x-musicd-origin") == fixture::kNeteaseLibraryId,
           "X-Musicd-Origin 指向网易云（实际 " +
               media.header("x-musicd-origin") + "）");
-    check(media.header("content-length") ==
-              std::to_string(fixture::kNeteaseAudioSize),
-          "Content-Length = " + std::to_string(fixture::kNeteaseAudioSize) +
-              "（实际 " + media.header("content-length") + "）");
+    // 远端字节走 chunked 推送：不承诺 Content-Length（整段也不攒内存），
+    // 但必须声明 Transfer-Encoding 与 Accept-Ranges。
+    check(media.header("content-length").empty(),
+          "远端流不得带 Content-Length（实际 " +
+              media.header("content-length") + "）");
+    check(media.header("transfer-encoding") == "chunked",
+          "远端流是 chunked（实际 " + media.header("transfer-encoding") + "）");
+    check(media.header("accept-ranges") == "bytes",
+          "远端流声明 Accept-Ranges: bytes（实际 " +
+              media.header("accept-ranges") + "）");
     check(media.body == fixture::kNeteaseAudioBytes(), "字节与假 API 一致");
   } else {
     check(false, "会话没有 stream_url，后续字节断言跳过");

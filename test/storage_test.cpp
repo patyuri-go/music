@@ -100,6 +100,12 @@ int main(int argc, char **argv) {
   const Response full = get(cfg, stream_path);
   check(full.status == 200, "GET stream -> 200");
   check(full.header("accept-ranges") == "bytes", "Accept-Ranges: bytes");
+  // 远端字节走 chunked 推送：绝不带 Content-Length（否则头与分帧正文矛盾）。
+  check(full.header("content-length").empty(),
+        "GET stream 不带 Content-Length（实际 " + full.header("content-length") +
+            "）");
+  check(full.header("transfer-encoding") == "chunked",
+        "GET stream 是 chunked（实际 " + full.header("transfer-encoding") + "）");
   check(full.body.size() == 1048576,
         "完整响应体长度 = 1048576（实际 " +
             std::to_string(full.body.size()) + "）");

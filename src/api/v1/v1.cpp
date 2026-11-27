@@ -757,8 +757,9 @@ void track_stream(const http_server::RequestPtr &req, const std::string &ref,
     return;
   }
   // 出字节：本地库按实体 id 直连存储服务，远端库沿用同步路径。
-  stream_http::serve_track_async(
-      req, *parsed, req && req->isHead(), std::move(callback));
+  stream_http::serve_track_async(req, *parsed, req && req->isHead(),
+                                 stream_http::Protocol::Native,
+                                 std::move(callback));
 }
 
 http_server::ResponsePtr track_lyrics(const http_server::RequestPtr &req, const std::string &ref) {
@@ -780,7 +781,8 @@ void track_artwork(const http_server::RequestPtr &req, const std::string &ref,
   media_library::ArtworkRef artwork;
   artwork.owner = *parsed;
   stream_http::serve_artwork_async(
-      req, artwork, req && req->isHead(), std::move(callback));
+      req, artwork, req && req->isHead(), stream_http::Protocol::Native,
+      std::move(callback));
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,9 +1326,10 @@ http_server::ResponsePtr playback_close(const http_server::RequestPtr &,
   return http_server::textResponse(204, "");
 }
 
-http_server::ResponsePtr playback_stream(const http_server::RequestPtr &req,
-                               const std::string &session_id) {
-  return stream_http::serve_session(req, session_id, req && req->isHead());
+void playback_stream(const http_server::RequestPtr &req,
+                     const std::string &session_id,
+                     std::function<void(const http_server::ResponsePtr &)> callback) {
+  stream_http::serve_session_async(req, session_id, req && req->isHead(),
+                                   std::move(callback));
 }
-
 } // namespace api_v1

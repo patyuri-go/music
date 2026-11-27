@@ -270,6 +270,33 @@ const Config &load(const std::string &file) {
             static_cast<int>(cache["revalidate_seconds"].asInt64());
       }
     }
+    if (json.isMember("http_stream")) {
+      const auto &stream = json["http_stream"];
+      if (stream.isMember("audio_workers")) {
+        loaded.http_stream.audio_workers =
+            static_cast<int>(stream["audio_workers"].asInt64());
+      }
+      if (stream.isMember("audio_queue")) {
+        loaded.http_stream.audio_queue =
+            static_cast<int>(stream["audio_queue"].asInt64());
+      }
+      if (stream.isMember("image_workers")) {
+        loaded.http_stream.image_workers =
+            static_cast<int>(stream["image_workers"].asInt64());
+      }
+      if (stream.isMember("image_queue")) {
+        loaded.http_stream.image_queue =
+            static_cast<int>(stream["image_queue"].asInt64());
+      }
+      if (stream.isMember("send_timeout_ms")) {
+        loaded.http_stream.send_timeout_ms =
+            static_cast<int>(stream["send_timeout_ms"].asInt64());
+      }
+      if (stream.isMember("upstream_buffer_bytes")) {
+        loaded.http_stream.upstream_buffer_bytes =
+            static_cast<int>(stream["upstream_buffer_bytes"].asInt64());
+      }
+    }
 
     // 媒体库：本地库只允许一个；网易云库最多一个；出现未知 type 直接报错。
     if (json.isMember("libraries")) {
@@ -550,6 +577,42 @@ const Config &load(const std::string &file) {
   }
   if (loaded.image_cache.revalidate_seconds < 0) {
     throw std::runtime_error("image_cache.revalidate_seconds 不能为负数");
+  }
+  if (loaded.http_stream.audio_workers < 1 ||
+      loaded.http_stream.audio_workers > 64) {
+    throw std::runtime_error(
+        "http_stream.audio_workers 超出范围 (1-64): " +
+        std::to_string(loaded.http_stream.audio_workers));
+  }
+  if (loaded.http_stream.audio_queue < 1 ||
+      loaded.http_stream.audio_queue > 10000) {
+    throw std::runtime_error(
+        "http_stream.audio_queue 超出范围 (1-10000): " +
+        std::to_string(loaded.http_stream.audio_queue));
+  }
+  if (loaded.http_stream.image_workers < 1 ||
+      loaded.http_stream.image_workers > 32) {
+    throw std::runtime_error(
+        "http_stream.image_workers 超出范围 (1-32): " +
+        std::to_string(loaded.http_stream.image_workers));
+  }
+  if (loaded.http_stream.image_queue < 1 ||
+      loaded.http_stream.image_queue > 10000) {
+    throw std::runtime_error(
+        "http_stream.image_queue 超出范围 (1-10000): " +
+        std::to_string(loaded.http_stream.image_queue));
+  }
+  if (loaded.http_stream.send_timeout_ms < 1 ||
+      loaded.http_stream.send_timeout_ms > 600000) {
+    throw std::runtime_error(
+        "http_stream.send_timeout_ms 超出范围 (1-600000): " +
+        std::to_string(loaded.http_stream.send_timeout_ms));
+  }
+  if (loaded.http_stream.upstream_buffer_bytes < 64 * 1024 ||
+      loaded.http_stream.upstream_buffer_bytes > 256 * 1024 * 1024) {
+    throw std::runtime_error(
+        "http_stream.upstream_buffer_bytes 超出范围 (65536-268435456): " +
+        std::to_string(loaded.http_stream.upstream_buffer_bytes));
   }
   if (loaded.netease.id != kNeteaseLibraryId) {
     throw std::runtime_error(

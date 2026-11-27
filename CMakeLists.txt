@@ -71,6 +71,7 @@ add_executable(musicd
   ./src/service.cpp
   ./src/metadata.cpp
   ./src/http_client.cpp
+  ./src/http_stream_buffer.cpp
   ./src/http_util.cpp
   ./src/http_server.cpp
   ./src/storage_client.cpp
@@ -94,6 +95,8 @@ add_executable(musicd
   ./src/media_library/playlist_directory.cpp
   ./src/tools/amll_ttml.cpp
   ./src/stream_http.cpp
+  ./src/stream_plan.cpp
+  ./src/stream_scheduler.cpp
   ./src/api/subsonic/subsonic.cpp
   ./src/api/subsonic/access_log.cpp
   ./src/api/subsonic/envelope.cpp
@@ -217,6 +220,19 @@ target_include_directories(query_api_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/test
 )
 musicd_test_target(query_api_test)
+
+# 第三方门面（Subsonic / Jellyfin）字节出口：push/chunked 契约与协议信封。
+# 由 run_integration.sh 驱动，**不**注册进 CTest。
+add_executable(third_party_test
+  ./test/third_party_test.cpp
+  ./src/json_util.cpp
+)
+target_link_libraries(third_party_test PRIVATE Drogon::Drogon JsonCpp::JsonCpp)
+target_include_directories(third_party_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/test
+)
+musicd_test_target(third_party_test)
 
 # 假存储服务：按实体 id 返回确定字节，并带控制端点。
 add_executable(fake_storage

@@ -510,6 +510,7 @@ void handle_stream(const http_server::RequestPtr &req,
   // 服务，探测失败时同一个请求内换库（见 stream_http::serve_track_async）。
   stream_http::serve_track_async(req, track_ref_of(*ref),
                                  req->isHead(),
+                                 stream_http::Protocol::Subsonic,
                                  std::move(callback));
 }
 
@@ -536,6 +537,7 @@ void handle_cover_art(const http_server::RequestPtr &req,
                       : *ref;
   stream_http::serve_artwork_async(req, artwork,
                                    req->isHead(),
+                                   stream_http::Protocol::Subsonic,
                                    std::move(callback));
 }
 

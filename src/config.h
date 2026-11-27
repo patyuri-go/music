@@ -107,6 +107,27 @@ struct DatabasePostgresConfig {
   int connect_timeout_seconds{5};
 };
 
+// 字节出口的线程池与超时。
+//
+// 音频与封面各自的阻塞任务池：打开上游、探总长、逐块读都在这里做，
+// 避免以前「每请求 detach 一个线程」把线程数和内存撑爆。
+// 队列满时同步回 503 + Retry-After，让客户端稍后重试。
+struct HttpStreamConfig {
+  // 音频池：同时读上游音频流的线程数。
+  int audio_workers{4};
+  // 音频等待队列。满了直接 503。
+  int audio_queue{100};
+  // 图片池：封面可能是远端大图，单独隔离，避免拖慢音频。
+  int image_workers{2};
+  int image_queue{100};
+  // 单次等待上限：等 Drogon 交回 ResponseStream，以及等慢客户端腾出
+  // 发送缓冲。超时即中止上游并断连。
+  int send_timeout_ms{30000};
+  // 上游生产者与消费者之间的字节水位。写满就阻塞 curl，把背压传回上游。
+  // 这是「不把整个文件读进内存」的唯一保障。
+  int upstream_buffer_bytes{1024 * 1024};
+};
+
 // 主库配置。主库只支持 PostgreSQL；SQLite 仅用于图片缓存索引
 // （见 db::openSqliteSession）。
 struct DatabaseConfig {
@@ -125,6 +146,7 @@ struct Config {
   std::string jellyfin_server_name{"musicd"};
   SubsonicConfig subsonic;
   ImageCacheConfig image_cache;
+  HttpStreamConfig http_stream;
   LocalLibraryConfig local;
   NeteaseConfig netease;
   // 每个方面一条顺序；数组顺序无意义。未配置的方面走内建顺序。

@@ -22,6 +22,17 @@ struct ArtworkInfo {
   std::string library_id;         // 仅用于 X-Musicd-Origin 归因，不属于领域模型
 };
 
+// 一次解析的结果：封面元信息 + （按需）字节流。
+//
+// 之前 info() 与 open() 各解析一遍路由，一次请求要跑两遍
+// resolve_artwork_source、哈希两遍缓存键（设计稿 Q12）。现在合并成一次：
+// 调用方要么只要元信息（HEAD / 304 判定），要么连字节流一起拿。
+struct OpenedArtwork {
+  ArtworkInfo info;
+  // want_stream=false 时为空。
+  std::unique_ptr<ByteStream> stream;
+};
+
 struct ArtworkServiceOptions {
   // 目前没有可调项；保留结构以便后续加超时/并发上限。
 };
@@ -37,12 +48,11 @@ class ArtworkService {
 public:
   virtual ~ArtworkService() = default;
 
-  virtual Result<ArtworkInfo> info(const ArtworkRef &ref,
-                                   const CallContext &ctx) = 0;
-
-  // 所有权交给调用方。不做进程内字节缓存。
-  virtual Result<std::unique_ptr<ByteStream>>
-  open(const ArtworkRef &ref, const CallContext &ctx) = 0;
+  // 解析一次源，返回元信息；`want_stream` 为真时同时建好字节流。
+  // 所有权交给调用方；不做进程内字节缓存。
+  virtual Result<OpenedArtwork> open(const ArtworkRef &ref,
+                                     const CallContext &ctx,
+                                     bool want_stream) = 0;
 };
 
 std::shared_ptr<ArtworkService>

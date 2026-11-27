@@ -17,6 +17,7 @@
 #include "media_library/netease_library.h"
 #include "storage_client.h"
 #include "stream_http.h"
+#include "stream_scheduler.h"
 #include "api/v1/v1.h"
 #include "api/api-enhanced/ids.h"
 #include "metadata.h"
@@ -459,6 +460,23 @@ int main(int argc, char *argv[]) {
 
   const auto &cfg = config::get();
 
+  // 字节出口的运行时参数：音频/封面两个阻塞池 + 超时 + 上游水位。
+  // 池必须在 app().run() 之前启动，否则入站请求找不到 worker。
+  stream_http::configure({cfg.http_stream.send_timeout_ms});
+  media_library::set_upstream_buffer_bytes(
+      static_cast<std::size_t>(cfg.http_stream.upstream_buffer_bytes));
+  {
+    stream_http::SchedulerOptions options;
+    options.audio_workers = cfg.http_stream.audio_workers;
+    options.audio_queue = cfg.http_stream.audio_queue;
+    options.image_workers = cfg.http_stream.image_workers;
+    options.image_queue = cfg.http_stream.image_queue;
+    stream_http::Scheduler::instance().start(options);
+    std::cout << "[boot] stream audio=" << options.audio_workers << "/"
+              << options.audio_queue << " image=" << options.image_workers
+              << "/" << options.image_queue << std::endl;
+  }
+
   // 本地库的字节来源：外部存储服务。其余库（网易云等）不走这条链路。
   {
     storage_client::Options storage;
@@ -700,10 +718,12 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
     return api_v1::playback_refresh(req, session_id);
   });
   MUSICD_ROUTE(app, "/api/v1/playback/<string>/stream")
-      .methods(drogon::Get, drogon::Head)(
-          [](const http_server::RequestPtr &req, std::string session_id) {
-            return api_v1::playback_stream(req, session_id);
-          });
+      .methods(drogon::Get, drogon::Head)
+      .async([](const http_server::RequestPtr &req,
+                std::function<void(const http_server::ResponsePtr &)> callback,
+                std::string session_id) {
+        api_v1::playback_stream(req, session_id, std::move(callback));
+      });
 
   MUSICD_ROUTE(app, "/api/query")
       .methods(drogon::Post)([](const http_server::RequestPtr &req) {
@@ -1092,7 +1112,8 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
         media_library::ArtworkRef artwork;
         artwork.owner = *ref;
         stream_http::serve_artwork_async(
-            req, artwork, req->isHead(), std::move(callback));
+            req, artwork, req->isHead(), stream_http::Protocol::Native,
+            std::move(callback));
       });
 
   MUSICD_ROUTE(app, "/api/track/<int>/file")
@@ -1107,8 +1128,9 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
           callback(jsonResponse(404, "{\"erro\":true}"));
           return;
         }
-        stream_http::serve_track_async(
-            req, *ref, req->isHead(), std::move(callback));
+        stream_http::serve_track_async(req, *ref, req->isHead(),
+                                       stream_http::Protocol::Native,
+                                       std::move(callback));
       });
 
   MUSICD_ROUTE(app, "/api/track/<int>/play")
@@ -1325,6 +1347,9 @@ transport.min_request_interval_ms = cfg.netease.min_request_interval_ms;
 
   drogon::app().run();
 
+  // 关停顺序：先停入站（run 已返回），再关字节出口的池，最后关下游依赖；
+  // 否则 worker 会在存储/媒体库已经拆掉之后继续写响应。
+  stream_http::Scheduler::instance().stop();
   storage_client::shutdown();
   media_library::shutdown_media_runtime();
   media_library::shutdown_library();
